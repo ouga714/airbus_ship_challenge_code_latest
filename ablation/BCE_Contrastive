@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ablation_bce_dice_supcon_tta_es_momo.py
+
+Ablation (momos) for Airbus Ship Detection:
+- DeepLabV3-ResNet50 binary segmentation
+- Seg loss: BCE + Dice (default)
+- + Supervised Contrastive loss (SupCon) on pixel embeddings
+    * instance labels derived from per-instance RLE (background=0, ships=1..K)
+    * compute embeddings from backbone 'out' features + projection head
+    * downsample instance-id map to feature resolution (nearest) and sample pixels
+- TTA mandatory for val/pseudo-test/test inference
+- Early stopping (max_epochs=50)
+- train/val/pseudo-test stratified from population (train_v2 directory listing)
+  with fixed pos_frac (default 0.40 => pos:neg=4:6) for ALL splits
+- Output:
+    run.log (epoch-level)
+    run_detail.log (iter-level + NaN diagnostics)
+    summary.json
+    submission.csv (variable rows, instance-per-row, ImageId duplicates allowed)
+"""
+
+import os, sys, csv, json, time, math, random
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.transforms import functional as TF
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except Exception:
+    CV2_AVAILABLE = False
+
+
+# -------------------------
+# Utils
+# -------------------------
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+class DualLogger:
+    def __init__(self, log_path: str, detail_path: str):
+        self.log_path = log_path
+        self.detail_path = detail_path
+        self.f = open(log_path, "a", buffering=1, encoding="utf-8")
+        self.d = open(detail_path, "a", buffering=1, encoding="utf-8")
+
+    def info(self, msg: str) -> None:
+        line = f"{now_str()} {msg}"
+        print(line, flush=True)
+        self.f.write(line + "\n")
+
+    def detail(self, msg: str) -> None:
+        line = f"{now_str()} {msg}"
+        self.d.write(line + "\n")
+
+    def close(self) -> None:
+        try: self.f.close()
+        except: pass
+        try: self.d.close()
+        except: pass
+
+
+# -------------------------
+# RLE (Fortran order) + roundtrip selftest
+# -------------------------
+def rle_encode(mask: np.ndarray) -> str:
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    pixels = mask.flatten(order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return " ".join(str(x) for x in runs)
+
+def rle_decode(rle: str, shape: Tuple[int,int]) -> np.ndarray:
+    h, w = shape
+    flat = np.zeros(h*w, dtype=np.uint8)
+    if rle is None or rle == "":
+        return flat.reshape((h,w), order="F")
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    for lo, hi in zip(starts, ends):
+        flat[lo:hi] = 1
+    return flat.reshape((h,w), order="F")
+
+def rle_roundtrip_selftest() -> None:
+    rng = np.random.default_rng(0)
+    h, w = 64, 80
+    m = (rng.random((h,w)) > 0.92).astype(np.uint8)
+    r = rle_encode(m)
+    m2 = rle_decode(r, (h,w))
+    if not np.array_equal(m, m2):
+        raise RuntimeError("RLE roundtrip test FAILED (Fortran order mismatch).")
+
+
+# -------------------------
+# CSV helpers (no pandas)
+# -------------------------
+def read_csv_rows(path: str) -> List[Dict[str,str]]:
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+# -------------------------
+# Image I/O
+# -------------------------
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+def load_image_rgb(path: str) -> np.ndarray:
+    if CV2_AVAILABLE:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+    from PIL import Image
+    return np.array(Image.open(path).convert("RGB"))
+
+def resize_img(img: np.ndarray, size: int) -> np.ndarray:
+    if img.shape[0] == size and img.shape[1] == size:
+        return img
+    if CV2_AVAILABLE:
+        return cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
+    from PIL import Image
+    return np.array(Image.fromarray(img).resize((size, size)))
+
+def resize_mask_nearest(mask: np.ndarray, size: int) -> np.ndarray:
+    if mask.shape[0] == size and mask.shape[1] == size:
+        return mask
+    if CV2_AVAILABLE:
+        return cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
+    from PIL import Image
+    return np.array(Image.fromarray(mask).resize((size, size), resample=0))
+
+
+# -------------------------
+# Build instance-id map from per-instance RLEs
+# background=0, ships=1..K
+# Also provide binary mask (ship vs bg)
+# -------------------------
+def build_instance_map_from_rles(rles: List[str], shape_hw: Tuple[int,int]) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = shape_hw
+    inst = np.zeros((h,w), dtype=np.int32)
+    if rles is None:
+        rles = []
+    k = 0
+    for rr in rles:
+        if rr is None or rr == "":
+            continue
+        m = rle_decode(rr, (h,w))
+        if m.sum() == 0:
+            continue
+        k += 1
+        # if overlaps exist, later instances overwrite; acceptable for our purpose
+        inst[m.astype(bool)] = k
+    binmask = (inst > 0).astype(np.uint8)
+    return inst, binmask
+
+
+# -------------------------
+# Datasets
+# -------------------------
+class AirbusTrainDataset(Dataset):
+    def __init__(self, img_dir: str, ids: List[str], id2rles: Dict[str,List[str]], size: int):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.size = size
+
+    def __len__(self): return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = load_image_rgb(path)
+        h, w = img.shape[:2]
+        rles = self.id2rles.get(img_id, [])
+
+        inst, binmask = build_instance_map_from_rles(rles, (h,w))
+
+        img = resize_img(img, self.size)
+        binmask = resize_mask_nearest(binmask, self.size)
+        inst = resize_mask_nearest(inst.astype(np.int32), self.size).astype(np.int64)
+
+        x = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+        x = TF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+        y = torch.from_numpy(binmask).unsqueeze(0).float()
+        inst_t = torch.from_numpy(inst).long()
+        return x, y, inst_t, img_id, path
+
+class AirbusTestDataset(Dataset):
+    def __init__(self, img_dir: str, ids: List[str], size: int):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.size = size
+
+    def __len__(self): return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = load_image_rgb(path)
+        img = resize_img(img, self.size)
+        x = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+        x = TF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+        return x, img_id, path
+
+
+# -------------------------
+# Model: DeepLabV3-ResNet50 binary + projection head
+# Embeddings from backbone feature map (low-res).
+# -------------------------
+class DeepLabBinaryWithEmb(nn.Module):
+    def __init__(self, proj_dim: int = 64):
+        super().__init__()
+        try:
+            from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+            weights = DeepLabV3_ResNet50_Weights.DEFAULT
+            base = deeplabv3_resnet50(weights=weights)
+        except Exception:
+            from torchvision.models.segmentation import deeplabv3_resnet50
+            base = deeplabv3_resnet50(pretrained=True)
+
+        # replace classifier last conv -> 1ch
+        replaced = False
+        if hasattr(base, "classifier") and isinstance(base.classifier, nn.Module):
+            children = list(base.classifier.children())
+            for i in range(len(children)-1, -1, -1):
+                if isinstance(children[i], nn.Conv2d):
+                    in_ch = children[i].in_channels
+                    children[i] = nn.Conv2d(in_ch, 1, kernel_size=1)
+                    base.classifier = nn.Sequential(*children)
+                    replaced = True
+                    break
+        if not replaced:
+            raise RuntimeError("Failed to replace DeepLabV3 classifier head to 1 channel.")
+
+        # disable aux classifier for simplicity/stability
+        if hasattr(base, "aux_classifier"):
+            base.aux_classifier = None
+
+        self.backbone = base.backbone
+        self.classifier = base.classifier
+
+        # projection head on backbone 'out' feature map
+        # (B,C,Hf,Wf) -> (B,proj_dim,Hf,Wf)
+        # use 1x1 conv + GN + ReLU + 1x1 conv
+        # keep it light (FP32 stable)
+        # we infer C by running a dummy forward once lazily (below) if needed
+        self.proj_dim = proj_dim
+        self.proj = None  # initialized lazily
+
+    def _init_proj_if_needed(self, feat: torch.Tensor):
+        if self.proj is not None:
+            return
+        c = feat.shape[1]
+        self.proj = nn.Sequential(
+            nn.Conv2d(c, 128, kernel_size=1, bias=False),
+            nn.GroupNorm(8, 128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, self.proj_dim, kernel_size=1, bias=True),
+        ).to(feat.device)
+
+    def forward(self, x: torch.Tensor):
+        input_shape = x.shape[-2:]
+        feats = self.backbone(x)
+        f = feats["out"]  # (B,C,Hf,Wf)
+        self._init_proj_if_needed(f)
+        emb = self.proj(f)  # (B,D,Hf,Wf)
+
+        logits_low = self.classifier(f)  # (B,1,Hf,Wf) or similar
+        logits = F.interpolate(logits_low, size=input_shape, mode="bilinear", align_corners=False)
+        return logits, emb
+
+
+# -------------------------
+# Losses: BCE + Dice, + SupCon on sampled pixels
+# -------------------------
+def dice_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    inter = (probs * targets).sum(dim=(1,2,3))
+    denom = probs.sum(dim=(1,2,3)) + targets.sum(dim=(1,2,3))
+    dice = (2.0 * inter + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
+def dice_each_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    inter = (probs * targets).sum(dim=(1,2,3))
+    denom = probs.sum(dim=(1,2,3)) + targets.sum(dim=(1,2,3))
+    dice = (2.0 * inter + eps) / (denom + eps)
+    return 1.0 - dice  # (B,)
+
+def normalize_emb(z: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return z / (z.norm(dim=1, keepdim=True) + eps)
+
+def supervised_contrastive_loss(z: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1, eps: float = 1e-12) -> torch.Tensor:
+    """
+    z: (N,D) normalized embeddings
+    labels: (N,) int64
+    SupCon:
+      loss_i = - 1/|P(i)| sum_{p in P(i)} log exp(sim(i,p)/T) / sum_{a!=i} exp(sim(i,a)/T)
+    Only anchors with at least one positive contribute.
+    """
+    if z.shape[0] < 2:
+        return z.new_tensor(0.0)
+
+    z = normalize_emb(z)
+    sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)  # (N,N)
+
+    # mask self
+    N = sim.shape[0]
+    self_mask = torch.eye(N, device=sim.device, dtype=torch.bool)
+    sim = sim.masked_fill(self_mask, -1e9)
+
+    labels = labels.view(-1)
+    eq = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~self_mask)  # positives mask
+
+    # denom: logsumexp over all non-self
+    denom = torch.logsumexp(sim, dim=1)  # (N,)
+
+    # For each anchor i, average log-prob over positives
+    # log_prob(i,j) = sim(i,j) - denom(i)
+    log_prob = sim - denom.unsqueeze(1)
+    pos_counts = eq.sum(dim=1)  # (N,)
+
+    valid = pos_counts > 0
+    if valid.sum().item() == 0:
+        return z.new_tensor(0.0)
+
+    # sum log_prob over positives
+    sum_pos = (log_prob * eq.float()).sum(dim=1)  # (N,)
+    loss_i = - sum_pos[valid] / (pos_counts[valid].float() + eps)
+    return loss_i.mean()
+
+def sample_pixels_for_contrastive(inst_low: torch.Tensor, max_total: int, max_bg: int, rng: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    inst_low: (B,Hf,Wf) int64
+    returns:
+      idx_flat: (N,) int64 indices into flattened (B*Hf*Wf)
+      labels:  (N,) int64 (instance id, background=0)
+    Sampling strategy:
+      - sample up to max_bg from background
+      - sample remaining from ship instances, distributing per-instance
+      - enforce at least 2 pixels for some labels when possible (best-effort)
+    """
+    B, H, W = inst_low.shape
+    flat = inst_low.view(-1)  # (B*H*W)
+    device = inst_low.device
+
+    # indices for bg and fg
+    bg_idx = torch.where(flat == 0)[0]
+    fg_idx = torch.where(flat > 0)[0]
+
+    # if no fg or too few, still can do bg-only but SupCon will be 0 (no positives)
+    # We'll include fg if exists.
+    picked = []
+
+    # background
+    if bg_idx.numel() > 0 and max_bg > 0:
+        n_bg = min(max_bg, bg_idx.numel())
+        perm = torch.randperm(bg_idx.numel(), generator=rng, device=device)[:n_bg]
+        picked.append(bg_idx[perm])
+
+    # foreground: try per-instance sampling
+    if fg_idx.numel() > 0:
+        # unique instance ids > 0
+        fg_labels = flat[fg_idx]
+        uniq = torch.unique(fg_labels)
+        # allocate remaining budget
+        rem = max(0, max_total - (picked[0].numel() if len(picked) > 0 else 0))
+        if rem > 0:
+            # base per instance
+            K = int(uniq.numel())
+            if K > 0:
+                # aim at ~ rem/K per instance, but at least 2 when possible
+                base = max(1, rem // K)
+                per = base
+
+                # for each instance id, pick up to per pixels
+                # (not guaranteeing >=2, but we try)
+                for k in uniq.tolist():
+                    k = int(k)
+                    k_idx = fg_idx[torch.where(fg_labels == k)[0]]
+                    if k_idx.numel() == 0:
+                        continue
+                    n_k = min(per, k_idx.numel())
+                    permk = torch.randperm(k_idx.numel(), generator=rng, device=device)[:n_k]
+                    picked.append(k_idx[permk])
+
+                    if sum([p.numel() for p in picked]) >= max_total:
+                        break
+
+    if len(picked) == 0:
+        return torch.zeros((0,), device=device, dtype=torch.long), torch.zeros((0,), device=device, dtype=torch.long)
+
+    idx_flat = torch.cat(picked, dim=0)
+    if idx_flat.numel() > max_total:
+        # trim
+        perm = torch.randperm(idx_flat.numel(), generator=rng, device=device)[:max_total]
+        idx_flat = idx_flat[perm]
+
+    labels = flat[idx_flat].long()
+    return idx_flat.long(), labels.long()
+
+
+# -------------------------
+# TTA (mandatory) for logits
+# -------------------------
+@torch.no_grad()
+def tta_predict_logits_and_prob(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    # average logits across flips
+    logits_list = []
+    logits, _ = model(x); logits_list.append(logits)
+
+    xh = torch.flip(x, dims=[3]); lh, _ = model(xh); lh = torch.flip(lh, dims=[3]); logits_list.append(lh)
+    xv = torch.flip(x, dims=[2]); lv, _ = model(xv); lv = torch.flip(lv, dims=[2]); logits_list.append(lv)
+    xhv = torch.flip(x, dims=[2,3]); lhv, _ = model(xhv); lhv = torch.flip(lhv, dims=[2,3]); logits_list.append(lhv)
+
+    return torch.stack(logits_list, dim=0).mean(dim=0)
+
+@torch.no_grad()
+def predict_logits(model: nn.Module, x: torch.Tensor, use_tta: bool = True) -> torch.Tensor:
+    if use_tta:
+        return tta_predict_logits_and_prob(model, x)
+    logits, _ = model(x)
+    return logits
+
+
+# -------------------------
+# Metrics / threshold tuning
+# -------------------------
+def metrics_from_counts(tp: int, fp: int, fn: int, tn: int, beta: float = 2.0, eps: float = 1e-9):
+    prec = tp / (tp + fp + eps)
+    rec  = tp / (tp + fn + eps)
+    f1 = (2*prec*rec) / (prec + rec + eps)
+    b2 = beta*beta
+    fbeta = (1+b2)*prec*rec / (b2*prec + rec + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return prec, rec, f1, fbeta, iou
+
+@torch.no_grad()
+def eval_val_soft_dice(model: nn.Module, loader: DataLoader, eps: float, use_tta: bool = True, device: str = "cuda") -> float:
+    model.eval()
+    tot = 0.0
+    n = 0
+    for x, y, _, _, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = predict_logits(model, x, use_tta=use_tta)
+        probs = torch.sigmoid(logits)
+        inter = (probs * y).sum(dim=(1,2,3))
+        denom = probs.sum(dim=(1,2,3)) + y.sum(dim=(1,2,3))
+        dice = ((2*inter + eps) / (denom + eps)).detach().cpu().numpy()
+        tot += float(dice.sum())
+        n += dice.shape[0]
+    return tot / max(1, n)
+
+@torch.no_grad()
+def collect_probs_targets(model: nn.Module, loader: DataLoader, device: str, use_tta: bool, limit_images: Optional[int] = None):
+    probs_all = []
+    tgt_all = []
+    seen = 0
+    for x, y, _, _, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = predict_logits(model, x, use_tta=use_tta)
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        tg = y.detach().cpu().numpy()
+        probs_all.append(probs)
+        tgt_all.append(tg)
+        seen += probs.shape[0]
+        if limit_images is not None and seen >= limit_images:
+            break
+    probs_all = np.concatenate(probs_all, axis=0)
+    tgt_all = np.concatenate(tgt_all, axis=0)
+    return probs_all, tgt_all
+
+def tune_threshold_by_metric(val_probs: np.ndarray, val_tgt: np.ndarray, thr_grid_n: int, metric: str = "iou"):
+    thr_grid = np.linspace(0.0, 1.0, thr_grid_n, dtype=np.float32)
+    tgtb = (val_tgt >= 0.5).astype(np.uint8)
+    best_thr = 0.5
+    best_val = -1e18
+
+    for thr in thr_grid:
+        pred = (val_probs >= float(thr)).astype(np.uint8)
+        tp = int((pred & tgtb).sum())
+        fp = int((pred & (1-tgtb)).sum())
+        fn = int(((1-pred) & tgtb).sum())
+        tn = int(((1-pred) & (1-tgtb)).sum())
+        prec, rec, f1, f2, iou = metrics_from_counts(tp, fp, fn, tn, beta=2.0)
+
+        if metric == "iou":
+            v = iou
+        elif metric == "f2":
+            v = f2
+        elif metric == "f1":
+            v = f1
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+
+        if v > best_val:
+            best_val = float(v)
+            best_thr = float(thr)
+
+    return best_thr, best_val
+
+
+# -------------------------
+# Postprocess: connected components instances
+# -------------------------
+def connected_components_instances(binmask: np.ndarray, min_area: int) -> List[np.ndarray]:
+    if binmask.sum() == 0:
+        return []
+    if CV2_AVAILABLE:
+        num, lab, stats, _ = cv2.connectedComponentsWithStats(binmask.astype(np.uint8), connectivity=8)
+        insts = []
+        for k in range(1, num):
+            area = int(stats[k, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            insts.append((lab == k).astype(np.uint8))
+        return insts
+    # fallback: single instance
+    return [binmask.astype(np.uint8)]
+
+
+# -------------------------
+# Argparse
+# -------------------------
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--train_n", type=int, default=20000)
+    ap.add_argument("--val_n", type=int, default=3000)
+    ap.add_argument("--pseudo_test_n", type=int, default=3000)
+    ap.add_argument("--pos_frac", type=float, default=0.40)
+
+    ap.add_argument("--train_size", type=int, default=256)
+    ap.add_argument("--infer_size", type=int, default=768)
+
+    ap.add_argument("--batch_train", type=int, default=4)
+    ap.add_argument("--batch_eval", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--max_epochs", type=int, default=50)
+    ap.add_argument("--patience", type=int, default=6)
+
+    ap.add_argument("--use_pos_weight", type=int, default=1)
+
+    # seg loss weights
+    ap.add_argument("--w_bce", type=float, default=1.0)
+    ap.add_argument("--w_dice", type=float, default=1.0)
+
+    # contrastive
+    ap.add_argument("--lambda_cl", type=float, default=0.10)
+    ap.add_argument("--cl_start_epoch", type=int, default=1)
+    ap.add_argument("--cl_temp", type=float, default=0.10)
+    ap.add_argument("--cl_max_pixels", type=int, default=2048)
+    ap.add_argument("--cl_max_bg", type=int, default=1024)
+    ap.add_argument("--proj_dim", type=int, default=64)
+
+    # threshold tuning
+    ap.add_argument("--thr_tune_limit", type=int, default=1200)
+    ap.add_argument("--thr_grid_n", type=int, default=41)
+    ap.add_argument("--thr_metric", type=str, default="iou", choices=["iou","f2","f1"])
+
+    # postprocess
+    ap.add_argument("--min_area", type=int, default=50)
+
+    # logging
+    ap.add_argument("--log_every", type=int, default=50)
+    ap.add_argument("--eps", type=float, default=1e-6)
+
+    # mandatory TTA (keep flag for safety but default ON)
+    ap.add_argument("--tta", type=int, default=1)
+
+    return ap.parse_args()
+
+
+# -------------------------
+# Early stopper
+# -------------------------
+class EarlyStopper:
+    def __init__(self, patience: int):
+        self.patience = patience
+        self.best = -1e18
+        self.best_epoch = -1
+        self.bad = 0
+
+    def step(self, value: float, epoch: int) -> bool:
+        if value > self.best:
+            self.best = value
+            self.best_epoch = epoch
+            self.bad = 0
+            return False
+        self.bad += 1
+        return self.bad >= self.patience
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    args = parse_args()
+
+    rle_roundtrip_selftest()
+
+    set_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # paths
+    train_csv = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(args.data_dir, "sample_submission_v2.csv")
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    test_img_dir  = os.path.join(args.data_dir, "test_v2")
+
+    if not os.path.exists(train_csv):
+        raise FileNotFoundError(train_csv)
+    if not os.path.exists(sample_sub):
+        raise FileNotFoundError(sample_sub)
+    if not os.path.isdir(train_img_dir):
+        raise FileNotFoundError(train_img_dir)
+    if not os.path.isdir(test_img_dir):
+        raise FileNotFoundError(test_img_dir)
+
+    # build id2rles (pos only)
+    rows = read_csv_rows(train_csv)
+    id2rles: Dict[str, List[str]] = {}
+    for r in rows:
+        img_id = r["ImageId"]
+        ep = r.get("EncodedPixels", "")
+        if ep is None:
+            ep = ""
+        if img_id not in id2rles:
+            id2rles[img_id] = []
+        if ep != "":
+            id2rles[img_id].append(ep)
+
+    # population from directory listing (IMPORTANT)
+    all_ids = sorted([fn for fn in os.listdir(train_img_dir) if fn.lower().endswith(".jpg")])
+    pos_ids = [i for i in all_ids if len(id2rles.get(i, [])) > 0]
+    neg_ids = [i for i in all_ids if len(id2rles.get(i, [])) == 0]
+
+    # run dir
+    run_name = (
+        f"run__bce_dice_supcon__seed{args.seed}"
+        f"__train{args.train_n}__val{args.val_n}__ptest{args.pseudo_test_n}"
+        f"__pos{int(args.pos_frac*100)}"
+        f"__lamcl{args.lambda_cl:.3f}__t{args.cl_temp:.2f}"
+    )
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+
+    run_log = os.path.join(run_dir, "run.log")
+    detail_log = os.path.join(run_dir, "run_detail.log")
+    summary_json = os.path.join(run_dir, "summary.json")
+    submission_csv = os.path.join(run_dir, "submission.csv")
+    ckpt_path = os.path.join(run_dir, "best_model.pt")
+
+    logger = DualLogger(run_log, detail_log)
+    logger.info(f"==== START momos Ablation: BCE+Dice + SupCon ====")
+    logger.info(f"data_dir={args.data_dir}")
+    logger.info(f"run_dir={run_dir}")
+    logger.info(f"device={device}")
+    logger.info(f"cv2_available={CV2_AVAILABLE}")
+    logger.info(f"config={json.dumps(vars(args), ensure_ascii=False)}")
+    logger.info(f"[POP] total={len(all_ids)} pos={len(pos_ids)} neg={len(neg_ids)} pos_rate={len(pos_ids)/max(1,len(all_ids)):.6f}")
+
+    # stratified disjoint splits
+    rng = random.Random(args.seed)
+
+    def stratified_sample(pos_pool: List[str], neg_pool: List[str], n_total: int, pos_frac: float):
+        n_pos = int(round(n_total * pos_frac))
+        n_neg = n_total - n_pos
+        if n_pos > len(pos_pool) or n_neg > len(neg_pool):
+            raise ValueError(f"Not enough pool for sampling: need pos={n_pos}/{len(pos_pool)}, neg={n_neg}/{len(neg_pool)}")
+        pos = rng.sample(pos_pool, n_pos)
+        neg = rng.sample(neg_pool, n_neg)
+        ids = pos + neg
+        rng.shuffle(ids)
+        return ids, n_pos, n_neg
+
+    train_ids, train_pos, train_neg = stratified_sample(pos_ids, neg_ids, args.train_n, args.pos_frac)
+    used = set(train_ids)
+
+    pos_rem = [x for x in pos_ids if x not in used]
+    neg_rem = [x for x in neg_ids if x not in used]
+    val_ids, val_pos, val_neg = stratified_sample(pos_rem, neg_rem, args.val_n, args.pos_frac)
+    used |= set(val_ids)
+
+    pos_rem2 = [x for x in pos_ids if x not in used]
+    neg_rem2 = [x for x in neg_ids if x not in used]
+    ptest_ids, ptest_pos, ptest_neg = stratified_sample(pos_rem2, neg_rem2, args.pseudo_test_n, args.pos_frac)
+
+    assert len(set(train_ids) & set(val_ids)) == 0
+    assert len(set(train_ids) & set(ptest_ids)) == 0
+    assert len(set(val_ids) & set(ptest_ids)) == 0
+
+    logger.info(f"[SPLIT] train n={len(train_ids)} pos={train_pos} neg={train_neg} pos_frac={train_pos/len(train_ids):.3f}")
+    logger.info(f"[SPLIT] val   n={len(val_ids)} pos={val_pos} neg={val_neg} pos_frac={val_pos/len(val_ids):.3f}")
+    logger.info(f"[SPLIT] ptest n={len(ptest_ids)} pos={ptest_pos} neg={ptest_neg} pos_frac={ptest_pos/len(ptest_ids):.3f}")
+
+    # save initial summary
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump({
+            "started_at": now_str(),
+            "run_dir": run_dir,
+            "args": vars(args),
+            "population": {"total": len(all_ids), "pos": len(pos_ids), "neg": len(neg_ids)},
+            "splits": {
+                "train": {"n": len(train_ids), "pos": train_pos, "neg": train_neg},
+                "val": {"n": len(val_ids), "pos": val_pos, "neg": val_neg},
+                "ptest": {"n": len(ptest_ids), "pos": ptest_pos, "neg": ptest_neg},
+            }
+        }, f, ensure_ascii=False, indent=2)
+
+    # loaders (train_size for training, eval at train_size for ES metric)
+    train_ds = AirbusTrainDataset(train_img_dir, train_ids, id2rles, args.train_size)
+    val_ds   = AirbusTrainDataset(train_img_dir, val_ids,   id2rles, args.train_size)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_train, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_eval, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
+
+    # model
+    model = DeepLabBinaryWithEmb(proj_dim=args.proj_dim).to(device)
+
+    # optimizer
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # pos_weight for BCE (based on sampled ratio)
+    pos_weight_value = (1.0 - args.pos_frac) / max(args.pos_frac, 1e-12)  # neg/pos
+    pos_weight_tensor = torch.tensor([pos_weight_value], device=device) if (args.use_pos_weight == 1) else None
+    logger.info(f"[LOSS] pos_weight_for_BCE={pos_weight_value:.6f} use_pos_weight={bool(args.use_pos_weight)}")
+    logger.info(f"[LOSS] seg=BCE(w={args.w_bce}) + Dice(w={args.w_dice}), CL lambda={args.lambda_cl} start_epoch={args.cl_start_epoch} temp={args.cl_temp}")
+
+    # RNG for pixel sampling (torch generator on device)
+    tg = torch.Generator(device=device)
+    tg.manual_seed(args.seed + 12345)
+
+    # training loop
+    stopper = EarlyStopper(args.patience)
+    best_val_softdice = -1.0
+    best_epoch = -1
+    global_step = 0
+    use_tta = (args.tta == 1)
+
+    logger.info("[INFO] Training begins... (best by VAL soft-Dice, TTA mandatory for eval/infer)")
+
+    for epoch in range(1, args.max_epochs + 1):
+        model.train()
+        t0 = time.time()
+
+        running = {
+            "loss": 0.0,
+            "bce": 0.0,
+            "diceL": 0.0,
+            "cl": 0.0,
+        }
+        iters = 0
+
+        for x, y, inst, img_ids, paths in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            inst = inst.to(device, non_blocking=True)  # (B,H,W)
+
+            logits, emb = model(x)  # logits: (B,1,H,W), emb: (B,D,Hf,Wf)
+
+            # seg losses
+            bce_each = F.binary_cross_entropy_with_logits(logits, y, reduction="none").mean(dim=(1,2,3))  # (B,)
+            if pos_weight_tensor is None:
+                bce = F.binary_cross_entropy_with_logits(logits, y)
+            else:
+                bce = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_tensor)
+
+            dice_each = dice_each_from_logits(logits, y, eps=args.eps)  # (B,)
+            diceL = dice_each.mean()
+
+            seg_loss = args.w_bce * bce + args.w_dice * diceL
+
+            # contrastive (only if enabled and epoch >= cl_start_epoch)
+            cl_loss = logits.new_tensor(0.0)
+            if args.lambda_cl > 0.0 and epoch >= args.cl_start_epoch:
+                # downsample inst to feature size (nearest)
+                B, D, Hf, Wf = emb.shape
+                inst_low = F.interpolate(inst.unsqueeze(1).float(), size=(Hf, Wf), mode="nearest").long().squeeze(1)  # (B,Hf,Wf)
+
+                # flatten embeddings to (B*Hf*Wf, D)
+                z = emb.permute(0,2,3,1).contiguous().view(-1, D)  # (N,D)
+                idx_flat, labels = sample_pixels_for_contrastive(inst_low, args.cl_max_pixels, args.cl_max_bg, tg)
+                if idx_flat.numel() >= 2:
+                    z_s = z[idx_flat]  # (Ns,D)
+                    lbl_s = labels
+                    cl_loss = supervised_contrastive_loss(z_s, lbl_s, temperature=args.cl_temp, eps=1e-12)
+
+            loss = seg_loss + args.lambda_cl * cl_loss
+
+            # NaN diagnostics
+            bad = (
+                torch.isnan(bce_each) |
+                torch.isnan(dice_each) |
+                torch.isnan(loss) |
+                torch.isnan(logits).any(dim=(1,2,3)) |
+                torch.isnan(emb).any(dim=(1,2,3))
+            )
+            if bad.any().item():
+                bad_idx = torch.where(bad)[0].detach().cpu().numpy().tolist()
+                for bi in bad_idx:
+                    logger.detail(f"[NaN] epoch={epoch} step={global_step} idx={bi} img_id={img_ids[bi]} path={paths[bi]}")
+                    yt = y[bi].detach().float()
+                    lg = logits[bi].detach().float()
+                    pr = torch.sigmoid(lg)
+                    logger.detail(f"[NaN] target_sum={float(yt.sum().item())} logits_minmax=({float(lg.min().item()):.4g},{float(lg.max().item()):.4g}) prob_minmax=({float(pr.min().item()):.4g},{float(pr.max().item()):.4g})")
+                raise RuntimeError("NaN detected. See run_detail.log")
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            running["loss"] += float(loss.item())
+            running["bce"] += float(bce.item())
+            running["diceL"] += float(diceL.item())
+            running["cl"] += float(cl_loss.item())
+            iters += 1
+            global_step += 1
+
+            if (global_step % args.log_every) == 0:
+                logger.detail(
+                    f"[iter] epoch={epoch} step={global_step} "
+                    f"loss={loss.item():.6f} seg={seg_loss.item():.6f} bce={bce.item():.6f} diceL={diceL.item():.6f} "
+                    f"cl={cl_loss.item():.6f} lam={args.lambda_cl:.4f}"
+                )
+
+        # epoch end: evaluate val soft dice with TTA mandatory
+        val_softdice = eval_val_soft_dice(model, val_loader, eps=args.eps, use_tta=use_tta, device=device)
+        dt = time.time() - t0
+
+        train_loss = running["loss"] / max(1, iters)
+        train_bce = running["bce"] / max(1, iters)
+        train_diceL = running["diceL"] / max(1, iters)
+        train_cl = running["cl"] / max(1, iters)
+
+        logger.info(
+            f"[epoch] {epoch:03d} "
+            f"train_loss={train_loss:.6f} (bce={train_bce:.6f}, diceL={train_diceL:.6f}, cl={train_cl:.6f}) "
+            f"val_softDice(TTA)={val_softdice:.6f} time={dt:.1f}s"
+        )
+
+        if val_softdice > best_val_softdice:
+            best_val_softdice = val_softdice
+            best_epoch = epoch
+            torch.save(model.state_dict(), ckpt_path)
+            logger.info(f"[ckpt] updated best_model.pt at epoch={epoch} best_val_softDice={best_val_softdice:.6f}")
+
+        if stopper.step(val_softdice, epoch):
+            logger.info(f"[ES] early stop at epoch={epoch} (best_epoch={stopper.best_epoch}, best_val_softDice={stopper.best:.6f})")
+            break
+
+    logger.info(f"[TRAIN DONE] best_epoch={best_epoch} best_val_softDice={best_val_softdice:.6f}")
+
+    # load best
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+
+    # build infer-size loaders for thr tuning / ptest / submission
+    val_infer_ds = AirbusTrainDataset(train_img_dir, val_ids, id2rles, args.infer_size)
+    val_infer_loader = DataLoader(val_infer_ds, batch_size=args.batch_eval, shuffle=False,
+                                  num_workers=args.num_workers, pin_memory=True)
+
+    ptest_infer_ds = AirbusTrainDataset(train_img_dir, ptest_ids, id2rles, args.infer_size)
+    ptest_infer_loader = DataLoader(ptest_infer_ds, batch_size=args.batch_eval, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True)
+
+    # threshold tuning
+    logger.info(f"[THR] collecting VAL probs/targets for threshold tuning (TTA={use_tta}) ...")
+    val_probs, val_tgt = collect_probs_targets(model, val_infer_loader, device=device, use_tta=use_tta, limit_images=args.thr_tune_limit)
+    best_thr, best_thr_metric = tune_threshold_by_metric(val_probs, val_tgt, thr_grid_n=args.thr_grid_n, metric=args.thr_metric)
+    logger.info(f"[THR DONE] best_thr={best_thr:.3f} best_val_{args.thr_metric}={best_thr_metric:.6f}")
+
+    # pseudo-test metrics
+    logger.info("[PTEST] evaluating pseudo-test metrics (TTA mandatory) ...")
+    p_probs, p_tgt = collect_probs_targets(model, ptest_infer_loader, device=device, use_tta=use_tta, limit_images=None)
+    pred = (p_probs >= best_thr).astype(np.uint8)
+    tgtb = (p_tgt >= 0.5).astype(np.uint8)
+    tp = int((pred & tgtb).sum())
+    fp = int((pred & (1-tgtb)).sum())
+    fn = int(((1-pred) & tgtb).sum())
+    tn = int(((1-pred) & (1-tgtb)).sum())
+    prec, rec, f1, f2, iou = metrics_from_counts(tp, fp, fn, tn, beta=2.0)
+    logger.info(f"[PTEST] thr={best_thr:.3f} P={prec:.6f} R={rec:.6f} F1={f1:.6f} F2={f2:.6f} IoU={iou:.6f}")
+
+    # Kaggle test template ids
+    with open(sample_sub, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        sample_ids = [r["ImageId"] for r in reader]
+
+    test_ds = AirbusTestDataset(test_img_dir, sample_ids, args.infer_size)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_eval, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=True)
+
+    # inference + instances + variable-row submission
+    logger.info("[SUBMIT] start Kaggle test inference (TTA mandatory) ...")
+
+    rows_out: List[Tuple[str, str]] = []
+    n_empty = 0
+    n_inst_total = 0
+
+    with torch.no_grad():
+        for x, img_ids, paths in test_loader:
+            x = x.to(device, non_blocking=True)
+            logits = predict_logits(model, x, use_tta=use_tta)
+            prob = torch.sigmoid(logits).detach().cpu().numpy()  # (B,1,H,W)
+
+            for i in range(prob.shape[0]):
+                img_id = img_ids[i]
+                p = prob[i, 0]
+                binmask = (p >= best_thr).astype(np.uint8)
+
+                insts = connected_components_instances(binmask, min_area=args.min_area)
+                if len(insts) == 0:
+                    rows_out.append((img_id, ""))
+                    n_empty += 1
+                    continue
+
+                for inst_mask in insts:
+                    rows_out.append((img_id, rle_encode(inst_mask)))
+                    n_inst_total += 1
+
+    # write submission.csv
+    with open(submission_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id, rle in rows_out:
+            w.writerow([img_id, rle])
+
+    logger.info(f"[SUBMIT DONE] wrote: {submission_csv}")
+    logger.info(f"[SUBMIT STATS] rows={len(rows_out)} empty_images={n_empty} instances_total={n_inst_total}")
+
+    # update summary
+    with open(summary_json, "r", encoding="utf-8") as f:
+        summary = json.load(f)
+
+    summary.update({
+        "finished_at": now_str(),
+        "best_epoch": best_epoch,
+        "best_val_softDice": float(best_val_softdice),
+        "best_thr": float(best_thr),
+        "best_val_thr_metric": args.thr_metric,
+        "best_val_thr_metric_value": float(best_thr_metric),
+        "ptest": {
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": float(prec), "recall": float(rec),
+            "f1": float(f1), "f2": float(f2), "iou": float(iou),
+        },
+        "submission_csv": submission_csv,
+        "submission_rows": int(len(rows_out)),
+        "submission_empty_images": int(n_empty),
+        "submission_instances_total": int(n_inst_total),
+        "ckpt_path": ckpt_path,
+    })
+
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[DONE] summary.json written: {summary_json}")
+    logger.info("==== END ====")
+    logger.close()
+
+
+if __name__ == "__main__":
+    main()
