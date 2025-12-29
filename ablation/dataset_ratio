@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ablation_posfrac_allinone_with_submissions.py
+
+Airbus Ship Detection (segmentation) — pos:neg ratio ablation runner
+- Train conditions: pos_frac in [0.3,0.4,0.5,0.6,0.7] + ship-only
+- For each condition:
+    * sample val set with THE SAME ratio as train (image-level)
+    * sample train set with THE SAME ratio as train (image-level) from remaining
+    * train DeepLabV3-ResNet50 (FP32 only)
+    * tune threshold on that condition's val using pixel F_beta
+    * run inference on Kaggle test_v2 (usual) at infer_size and write submission.csv
+    * save best_model.pt + meta.json + manifest entry
+
+Submission format:
+- One row per image (union mask). Safe for Kaggle evaluation.
+
+TTA:
+- flip4: average over {none, hflip, vflip, hvflip}
+
+NOTE:
+- Kaggle/offline environments may not allow downloading pretrained weights.
+  Use --pretrained 0 if torchvision tries to download.
+"""
+
+import os
+import sys
+import json
+import csv
+import time
+import math
+import random
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.transforms import functional as TF
+
+
+# -------------------------
+# Reproducibility
+# -------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class Logger:
+    def __init__(self, path: str):
+        self.path = path
+        self.fp = open(path, "a", encoding="utf-8")
+
+    def log(self, msg: str) -> None:
+        line = f"{now_str()} {msg}"
+        print(line)
+        self.fp.write(line + "\n")
+        self.fp.flush()
+
+    def close(self) -> None:
+        try:
+            self.fp.close()
+        except Exception:
+            pass
+
+
+def mean(xs: List[float]) -> float:
+    return float(sum(xs) / max(1, len(xs)))
+
+
+# -------------------------
+# RLE decode/encode (Airbus)
+# -------------------------
+def rle_decode(rle: str, shape_hw: Tuple[int, int]) -> np.ndarray:
+    """
+    Kaggle Airbus RLE uses column-major (Fortran) order.
+    shape_hw: (H, W)
+    """
+    if rle is None or rle == "":
+        return np.zeros(shape_hw, dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    h, w = shape_hw
+    img = np.zeros(h * w, dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    return img.reshape((w, h), order="F").T
+
+
+def rle_encode(mask_hw: np.ndarray) -> str:
+    """
+    mask_hw: (H,W) uint8 {0,1}
+    Return RLE string in Airbus format (column-major).
+    """
+    if mask_hw.dtype != np.uint8:
+        mask_hw = mask_hw.astype(np.uint8)
+    if mask_hw.max() == 0:
+        return ""
+    # Flatten in Fortran order (column-major)
+    pixels = mask_hw.T.reshape(-1)
+    # Add sentinel
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+def load_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None or rle == "":
+                continue
+            id2rles.setdefault(img_id, []).append(rle)
+    return id2rles
+
+
+def build_union_mask_from_rles(rles: List[str], shape_hw: Tuple[int, int]) -> np.ndarray:
+    if not rles:
+        return np.zeros(shape_hw, dtype=np.uint8)
+    m = np.zeros(shape_hw, dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode(r, shape_hw)
+    return (m > 0).astype(np.uint8)
+
+
+# -------------------------
+# Image list helpers
+# -------------------------
+def list_jpg_ids(dir_path: str) -> List[str]:
+    ids = []
+    for fn in os.listdir(dir_path):
+        if fn.lower().endswith(".jpg"):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+
+@dataclass
+class SampleInfo:
+    image_id: str
+    img_path: str
+    is_pos: bool
+
+
+def build_samples_map(ids: List[str], img_dir: str, id2rles: Dict[str, List[str]]) -> Dict[str, SampleInfo]:
+    m = {}
+    for img_id in ids:
+        m[img_id] = SampleInfo(
+            image_id=img_id,
+            img_path=os.path.join(img_dir, img_id),
+            is_pos=(img_id in id2rles),
+        )
+    return m
+
+
+# -------------------------
+# Dataset
+# -------------------------
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
+class AirbusSegDataset(Dataset):
+    def __init__(self, samples: List[SampleInfo], id2rles: Dict[str, List[str]], size: int, augment: bool):
+        self.samples = samples
+        self.id2rles = id2rles
+        self.size = size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _augment(self, img: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Minimal augmentation: flips + rot90
+        if random.random() < 0.5:
+            img = torch.flip(img, dims=[2])
+            mask = torch.flip(mask, dims=[2])
+        if random.random() < 0.5:
+            img = torch.flip(img, dims=[1])
+            mask = torch.flip(mask, dims=[1])
+        k = random.randint(0, 3)
+        if k != 0:
+            img = torch.rot90(img, k, dims=[1, 2])
+            mask = torch.rot90(mask, k, dims=[1, 2])
+        return img, mask
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        # image
+        with Image.open(s.img_path) as im:
+            im = im.convert("RGB")
+            im = im.resize((self.size, self.size), resample=Image.BILINEAR)
+            img = TF.to_tensor(im)  # [3,H,W] in [0,1]
+        img = TF.normalize(img, IMAGENET_MEAN, IMAGENET_STD)
+
+        # mask (union), decode at 768 then resize nearest
+        rles = self.id2rles.get(s.image_id, [])
+        if len(rles) == 0:
+            mask_np = np.zeros((768, 768), dtype=np.uint8)
+        else:
+            mask_np = build_union_mask_from_rles(rles, (768, 768))
+        mask_im = Image.fromarray((mask_np * 255).astype(np.uint8))
+        mask_im = mask_im.resize((self.size, self.size), resample=Image.NEAREST)
+        mask = (torch.from_numpy(np.array(mask_im)) > 127).float().unsqueeze(0)  # [1,H,W]
+
+        if self.augment:
+            img, mask = self._augment(img, mask)
+
+        return img, mask, s.image_id
+
+
+# -------------------------
+# Model
+# -------------------------
+def build_deeplabv3_resnet50(num_classes: int = 1, pretrained: bool = True) -> nn.Module:
+    if pretrained:
+        model = torchvision.models.segmentation.deeplabv3_resnet50(weights="DEFAULT")
+    else:
+        model = torchvision.models.segmentation.deeplabv3_resnet50(weights=None)
+    in_ch = model.classifier[-1].in_channels
+    model.classifier[-1] = nn.Conv2d(in_ch, num_classes, kernel_size=1)
+    return model
+
+
+# -------------------------
+# Loss: BCE + Tversky
+# -------------------------
+def tversky_loss_with_logits(logits: torch.Tensor, target: torch.Tensor,
+                            alpha: float = 0.60, beta: float = 0.40, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    tp = (prob * target).sum(dim=(2,3))
+    fp = (prob * (1.0 - target)).sum(dim=(2,3))
+    fn = ((1.0 - prob) * target).sum(dim=(2,3))
+    t = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return 1.0 - t.mean()
+
+
+def compute_fbeta(tp: float, fp: float, fn: float, beta: float, eps: float = 1e-9) -> float:
+    b2 = beta * beta
+    return float((1.0 + b2) * tp / ((1.0 + b2) * tp + b2 * fn + fp + eps))
+
+
+# -------------------------
+# Sampling (image-level stratified)
+# -------------------------
+def stratified_sample_ids(rng: random.Random,
+                          pos_ids: List[str], neg_ids: List[str],
+                          n_total: int, pos_frac: float,
+                          ship_only: bool) -> List[str]:
+    if ship_only:
+        if len(pos_ids) < n_total:
+            raise RuntimeError(f"Not enough pos images for ship-only: need={n_total}, have={len(pos_ids)}")
+        out = rng.sample(pos_ids, n_total)
+        rng.shuffle(out)
+        return out
+
+    n_pos = int(round(n_total * pos_frac))
+    n_neg = n_total - n_pos
+    if n_pos > len(pos_ids):
+        raise RuntimeError(f"Not enough pos images: need={n_pos}, have={len(pos_ids)}")
+    if n_neg > len(neg_ids):
+        raise RuntimeError(f"Not enough neg images: need={n_neg}, have={len(neg_ids)}")
+
+    out = rng.sample(pos_ids, n_pos) + rng.sample(neg_ids, n_neg)
+    rng.shuffle(out)
+    return out
+
+
+# -------------------------
+# Threshold tuning on val (pixel-level)
+# -------------------------
+@torch.no_grad()
+def tune_threshold_pixel_fbeta(model: nn.Module, loader: DataLoader, device: torch.device,
+                               thr_grid_n: int, thr_tune_limit: int, beta_f: float, logger: Logger) -> Tuple[float, float]:
+    model.eval()
+    thrs = np.linspace(0.05, 0.95, thr_grid_n).astype(np.float32)
+    tps = np.zeros((thr_grid_n,), dtype=np.float64)
+    fps = np.zeros((thr_grid_n,), dtype=np.float64)
+    fns = np.zeros((thr_grid_n,), dtype=np.float64)
+
+    n_img = 0
+    for imgs, masks, _ in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        out = model(imgs)["out"]
+        prob = torch.sigmoid(out).detach().cpu().numpy()  # [N,1,H,W]
+        y = masks.detach().cpu().numpy()
+
+        for b in range(prob.shape[0]):
+            p_flat = prob[b,0].reshape(-1)
+            y_flat = (y[b,0].reshape(-1) >= 0.5)
+
+            for i, t in enumerate(thrs):
+                pred = (p_flat >= t)
+                tp = np.logical_and(pred, y_flat).sum()
+                fp = np.logical_and(pred, np.logical_not(y_flat)).sum()
+                fn = np.logical_and(np.logical_not(pred), y_flat).sum()
+                tps[i] += tp
+                fps[i] += fp
+                fns[i] += fn
+
+            n_img += 1
+            if n_img >= thr_tune_limit:
+                break
+        if n_img >= thr_tune_limit:
+            break
+
+    best_thr = 0.5
+    best_f = -1.0
+    for i, t in enumerate(thrs):
+        f = compute_fbeta(tps[i], fps[i], fns[i], beta_f)
+        if f > best_f:
+            best_f = f
+            best_thr = float(t)
+
+    logger.log(f"[thr_tune] n_img={n_img} best_thr={best_thr:.4f} best_fbeta={best_f:.6f}")
+    return best_thr, float(best_f)
+
+
+@torch.no_grad()
+def eval_pixel_fbeta_at_thr(model: nn.Module, loader: DataLoader, device: torch.device,
+                           thr: float, beta_f: float) -> float:
+    model.eval()
+    tp = 0.0
+    fp = 0.0
+    fn = 0.0
+    for imgs, masks, _ in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        out = model(imgs)["out"]
+        prob = torch.sigmoid(out)
+        pred = (prob >= thr).float()
+        tp += float((pred * masks).sum().item())
+        fp += float((pred * (1.0 - masks)).sum().item())
+        fn += float(((1.0 - pred) * masks).sum().item())
+    return compute_fbeta(tp, fp, fn, beta_f)
+
+
+# -------------------------
+# TTA inference
+# -------------------------
+def apply_tta(img: torch.Tensor, mode: str, k: int) -> torch.Tensor:
+    # img: [3,H,W]
+    if mode == "none":
+        return img
+    if mode != "flip4":
+        raise ValueError(f"Unknown tta mode: {mode}")
+    # flip4 variants: 0=none,1=hflip,2=vflip,3=hvflip
+    if k == 0:
+        return img
+    if k == 1:
+        return torch.flip(img, dims=[2])
+    if k == 2:
+        return torch.flip(img, dims=[1])
+    if k == 3:
+        return torch.flip(img, dims=[1,2])
+    raise ValueError("k must be 0..3")
+
+
+def invert_tta(prob: torch.Tensor, mode: str, k: int) -> torch.Tensor:
+    # prob: [1,H,W] or [H,W]
+    if prob.dim() == 2:
+        prob = prob.unsqueeze(0)
+    if mode == "none":
+        return prob
+    if mode != "flip4":
+        raise ValueError(f"Unknown tta mode: {mode}")
+    if k == 0:
+        return prob
+    if k == 1:
+        return torch.flip(prob, dims=[2])
+    if k == 2:
+        return torch.flip(prob, dims=[1])
+    if k == 3:
+        return torch.flip(prob, dims=[1,2])
+    raise ValueError("k must be 0..3")
+
+
+@torch.no_grad()
+def predict_prob_single(model: nn.Module, img_t: torch.Tensor, device: torch.device, tta: str) -> torch.Tensor:
+    """
+    img_t: [3,H,W] normalized
+    returns: prob [H,W] float32 cpu
+    """
+    model.eval()
+    if tta == "none":
+        x = img_t.unsqueeze(0).to(device)
+        out = model(x)["out"]
+        prob = torch.sigmoid(out)[0,0].detach().cpu()
+        return prob
+
+    # flip4
+    probs = []
+    for k in range(4):
+        xk = apply_tta(img_t, "flip4", k).unsqueeze(0).to(device)
+        outk = model(xk)["out"]
+        pk = torch.sigmoid(outk)[0,0].detach().cpu()  # [H,W]
+        pk = invert_tta(pk, "flip4", k)[0]
+        probs.append(pk)
+    return torch.stack(probs, dim=0).mean(dim=0)
+
+
+# -------------------------
+# Simple postprocess: min_area filter
+# -------------------------
+def remove_small_objects(mask_hw: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 1:
+        return mask_hw
+    # connected components (8-connect)
+    h, w = mask_hw.shape
+    mask = (mask_hw > 0).astype(np.uint8)
+    if mask.sum() == 0:
+        return mask
+    try:
+        import cv2
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        for i in range(1, num):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area >= min_area:
+                out[labels == i] = 1
+        return out
+    except Exception:
+        # fallback: no cv2 -> do nothing
+        return mask
+
+
+# -------------------------
+# Training one condition
+# -------------------------
+def train_one_condition(
+    *,
+    condition_name: str,
+    run_dir: str,
+    device: torch.device,
+    seed: int,
+    samples_map: Dict[str, SampleInfo],
+    pos_ids_all: List[str],
+    neg_ids_all: List[str],
+    id2rles: Dict[str, List[str]],
+    train_n: int,
+    val_n: int,
+    pos_frac: float,
+    ship_only: bool,
+    train_size: int,
+    infer_size: int,
+    batch_train: int,
+    num_workers: int,
+    lr: float,
+    weight_decay: float,
+    max_epochs: int,
+    patience: int,
+    thr_grid_n: int,
+    thr_tune_limit: int,
+    beta_f: float,
+    tta: str,
+    min_area: int,
+    pretrained: bool,
+    logger: Logger,
+) -> Dict:
+    ensure_dir(run_dir)
+
+    # condition-specific split: val first (same ratio), then train from remaining (same ratio)
+    rng = random.Random(seed + 10007 + hash(condition_name) % 100000)
+
+    pos_pool = pos_ids_all[:]
+    neg_pool = neg_ids_all[:]
+
+    val_ids = stratified_sample_ids(rng, pos_pool, neg_pool, val_n, pos_frac, ship_only)
+
+    val_set = set(val_ids)
+    pos_rem = [x for x in pos_pool if x not in val_set]
+    neg_rem = [x for x in neg_pool if x not in val_set]
+
+    train_ids = stratified_sample_ids(rng, pos_rem, neg_rem, train_n, pos_frac, ship_only)
+
+    # Save ids
+    with open(os.path.join(run_dir, "val_ids.txt"), "w", encoding="utf-8") as f:
+        for x in val_ids:
+            f.write(x + "\n")
+    with open(os.path.join(run_dir, "train_ids.txt"), "w", encoding="utf-8") as f:
+        for x in train_ids:
+            f.write(x + "\n")
+
+    train_samples = [samples_map[x] for x in train_ids]
+    val_samples   = [samples_map[x] for x in val_ids]
+
+    ds_train = AirbusSegDataset(train_samples, id2rles, size=train_size, augment=True)
+    # val is evaluated at infer_size to match Kaggle inference
+    ds_val   = AirbusSegDataset(val_samples,   id2rles, size=infer_size, augment=False)
+
+    dl_train = DataLoader(ds_train, batch_size=batch_train, shuffle=True,
+                          num_workers=num_workers, pin_memory=True,
+                          persistent_workers=(num_workers > 0), drop_last=True)
+
+    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False,
+                        num_workers=num_workers, pin_memory=True,
+                        persistent_workers=(num_workers > 0), drop_last=False)
+
+    logger.log(f"[start] condition={condition_name} ship_only={ship_only} pos_frac={pos_frac}")
+    logger.log(f"[split] train_n={len(ds_train)} val_n={len(ds_val)} train_size={train_size} infer_size={infer_size}")
+    logger.log(f"[opt  ] lr={lr} wd={weight_decay} max_epochs={max_epochs} patience={patience} tta={tta} min_area={min_area}")
+
+    model = build_deeplabv3_resnet50(num_classes=1, pretrained=pretrained).to(device)
+
+    # NOTE: for "ratio ablation", fixing pos_weight can bias comparisons.
+    # Here we keep it as a mild constant to stabilize tiny positives.
+    # If you want cleaner ratio-only ablation, set pos_weight=1.0.
+    pos_weight = torch.tensor([20.0], device=device, dtype=torch.float32)
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    def loss_fn(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return bce(logits, target) + tversky_loss_with_logits(logits, target, alpha=0.60, beta=0.40, eps=1e-6)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_val = -1.0
+    best_epoch = -1
+    best_thr = 0.5
+    best_path = os.path.join(run_dir, "best_model.pt")
+    bad = 0
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        t0 = time.time()
+        losses = []
+
+        for step, (imgs, masks, _) in enumerate(dl_train, start=1):
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            out = model(imgs)["out"]
+            loss = loss_fn(out, masks)
+
+            if not torch.isfinite(loss):
+                logger.log(f"[nan] epoch={epoch} step={step} loss not finite -> abort")
+                raise RuntimeError("Non-finite loss")
+
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.item()))
+
+            if step % 200 == 0:
+                logger.log(f"[train] epoch={epoch} step={step}/{len(dl_train)} loss={mean(losses[-200:]):.6f}")
+
+        # tune thr on val (subset limit)
+        thr, fbest = tune_threshold_pixel_fbeta(
+            model=model, loader=dl_val, device=device,
+            thr_grid_n=thr_grid_n, thr_tune_limit=thr_tune_limit,
+            beta_f=beta_f, logger=logger
+        )
+
+        # eval on full val at tuned thr
+        val_f = eval_pixel_fbeta_at_thr(model, dl_val, device, thr, beta_f)
+
+        dt = time.time() - t0
+        logger.log(f"[epoch] {epoch:03d} train_loss={mean(losses):.6f} val_fbeta={val_f:.6f} thr={thr:.4f} time={dt:.1f}s")
+
+        if val_f > best_val + 1e-8:
+            best_val = val_f
+            best_epoch = epoch
+            best_thr = thr
+            bad = 0
+            torch.save(model.state_dict(), best_path)
+            logger.log(f"[ckpt] saved best -> {best_path} (val_fbeta={best_val:.6f})")
+        else:
+            bad += 1
+            if bad >= patience:
+                logger.log(f"[stop] early stopping at epoch={epoch} best_epoch={best_epoch} best_val={best_val:.6f}")
+                break
+
+    meta = {
+        "condition": condition_name,
+        "seed": seed,
+        "train_n": train_n,
+        "val_n": val_n,
+        "pos_frac": pos_frac,
+        "ship_only": ship_only,
+        "train_size": train_size,
+        "infer_size": infer_size,
+        "batch_train": batch_train,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "max_epochs": max_epochs,
+        "patience": patience,
+        "best_epoch": best_epoch,
+        "best_thr": float(best_thr),
+        "best_val_fbeta": float(best_val),
+        "best_model_path": best_path,
+        "beta_f": beta_f,
+        "thr_grid_n": thr_grid_n,
+        "thr_tune_limit": thr_tune_limit,
+        "tta": tta,
+        "min_area": int(min_area),
+        "pretrained": bool(pretrained),
+    }
+    with open(os.path.join(run_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    logger.log(f"[done] condition={condition_name} best_epoch={best_epoch} best_thr={best_thr:.4f} best_val={best_val:.6f}")
+    return meta
+
+
+# -------------------------
+# Submission generation
+# -------------------------
+@torch.no_grad()
+def make_submission(
+    *,
+    run_dir: str,
+    model_path: str,
+    device: torch.device,
+    test_img_dir: str,
+    sample_sub_path: str,
+    infer_size: int,
+    thr: float,
+    tta: str,
+    min_area: int,
+    pretrained: bool,
+    logger: Logger,
+) -> str:
+    """
+    Writes run_dir/submission.csv using sample_submission_v2.csv image order.
+    One row per ImageId (union mask).
+    """
+    out_csv = os.path.join(run_dir, "submission.csv")
+
+    # build model and load weights
+    model = build_deeplabv3_resnet50(num_classes=1, pretrained=pretrained).to(device)
+    sd = torch.load(model_path, map_location=device)
+    model.load_state_dict(sd, strict=True)
+    model.eval()
+
+    # read template
+    image_ids = []
+    with open(sample_sub_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            image_ids.append(row["ImageId"])
+
+    logger.log(f"[subm] start n_test={len(image_ids)} infer_size={infer_size} thr={thr:.4f} tta={tta} min_area={min_area}")
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["ImageId", "EncodedPixels"])
+
+        for i, img_id in enumerate(image_ids, start=1):
+            img_path = os.path.join(test_img_dir, img_id)
+            if not os.path.isfile(img_path):
+                # Some environments might have path mismatch; keep safe
+                writer.writerow([img_id, ""])
+                continue
+
+            with Image.open(img_path) as im:
+                im = im.convert("RGB")
+                im = im.resize((infer_size, infer_size), resample=Image.BILINEAR)
+                img_t = TF.to_tensor(im)
+            img_t = TF.normalize(img_t, IMAGENET_MEAN, IMAGENET_STD)
+
+            prob = predict_prob_single(model, img_t, device, tta=tta)  # [H,W] cpu
+            mask = (prob.numpy() >= thr).astype(np.uint8)
+
+            mask = remove_small_objects(mask, min_area=min_area)
+
+            rle = rle_encode(mask)
+            writer.writerow([img_id, rle])
+
+            if i % 500 == 0:
+                logger.log(f"[subm] {i}/{len(image_ids)} done")
+
+    # sanity check
+    size_bytes = os.path.getsize(out_csv)
+    logger.log(f"[subm] wrote {out_csv} bytes={size_bytes}")
+    return out_csv
+
+
+# -------------------------
+# Main
+# -------------------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, required=True,
+                    help="Root dir containing train_v2/, test_v2/, train_ship_segmentations_v2.csv, sample_submission_v2.csv")
+    ap.add_argument("--out_root", type=str, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--train_n", type=int, default=20000)
+    ap.add_argument("--val_n", type=int, default=3000)
+
+    ap.add_argument("--train_size", type=int, default=256)
+    ap.add_argument("--infer_size", type=int, default=768)
+
+    ap.add_argument("--batch_train", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--max_epochs", type=int, default=50)
+    ap.add_argument("--patience", type=int, default=6)
+
+    ap.add_argument("--thr_grid_n", type=int, default=41)
+    ap.add_argument("--thr_tune_limit", type=int, default=1200)
+    ap.add_argument("--beta_f", type=float, default=1.225)
+
+    ap.add_argument("--pos_fracs", type=float, nargs="*", default=[0.3, 0.4, 0.5, 0.6, 0.7])
+    ap.add_argument("--include_ship_only", type=int, default=1)
+
+    ap.add_argument("--tta", type=str, default="flip4", choices=["none", "flip4"])
+    ap.add_argument("--min_area", type=int, default=50)
+
+    ap.add_argument("--pretrained", type=int, default=1, choices=[0, 1])
+
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+    ensure_dir(args.out_root)
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    test_img_dir = os.path.join(args.data_dir, "test_v2")
+    csv_train = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(args.data_dir, "sample_submission_v2.csv")
+
+    if not os.path.isdir(train_img_dir):
+        raise FileNotFoundError(f"train_v2 not found: {train_img_dir}")
+    if not os.path.isdir(test_img_dir):
+        raise FileNotFoundError(f"test_v2 not found: {test_img_dir}")
+    if not os.path.isfile(csv_train):
+        raise FileNotFoundError(f"train_ship_segmentations_v2.csv not found: {csv_train}")
+    if not os.path.isfile(sample_sub):
+        raise FileNotFoundError(f"sample_submission_v2.csv not found: {sample_sub}")
+
+    id2rles = load_id2rles(csv_train)
+
+    all_train_ids = list_jpg_ids(train_img_dir)
+    pos_ids = [x for x in all_train_ids if x in id2rles]
+    neg_ids = [x for x in all_train_ids if x not in id2rles]
+
+    samples_map = build_samples_map(all_train_ids, train_img_dir, id2rles)
+
+    conditions = []
+    for pf in args.pos_fracs:
+        conditions.append((f"pos{int(round(pf*100)):02d}", float(pf), False))
+    if args.include_ship_only == 1:
+        conditions.append(("shiponly", 1.0, True))
+
+    manifest = {
+        "data_dir": args.data_dir,
+        "out_root": args.out_root,
+        "seed": args.seed,
+        "train_n": args.train_n,
+        "val_n": args.val_n,
+        "train_size": args.train_size,
+        "infer_size": args.infer_size,
+        "tta": args.tta,
+        "min_area": args.min_area,
+        "beta_f": args.beta_f,
+        "thr_grid_n": args.thr_grid_n,
+        "thr_tune_limit": args.thr_tune_limit,
+        "pretrained": bool(args.pretrained),
+        "runs": []
+    }
+
+    manifest_path = os.path.join(args.out_root, "ensemble_manifest.json")
+
+    for (name, pf, ship_only) in conditions:
+        run_dir = os.path.join(args.out_root, f"run__{name}__seed{args.seed}__train{args.train_n}__val{args.val_n}")
+        ensure_dir(run_dir)
+        logger = Logger(os.path.join(run_dir, "run.log"))
+        try:
+            meta = train_one_condition(
+                condition_name=name,
+                run_dir=run_dir,
+                device=device,
+                seed=args.seed,
+                samples_map=samples_map,
+                pos_ids_all=pos_ids,
+                neg_ids_all=neg_ids,
+                id2rles=id2rles,
+                train_n=args.train_n,
+                val_n=args.val_n,
+                pos_frac=pf,
+                ship_only=ship_only,
+                train_size=args.train_size,
+                infer_size=args.infer_size,
+                batch_train=args.batch_train,
+                num_workers=args.num_workers,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                max_epochs=args.max_epochs,
+                patience=args.patience,
+                thr_grid_n=args.thr_grid_n,
+                thr_tune_limit=args.thr_tune_limit,
+                beta_f=args.beta_f,
+                tta=args.tta,
+                min_area=args.min_area,
+                pretrained=bool(args.pretrained),
+                logger=logger,
+            )
+
+            # Make submission for Kaggle comparison
+            sub_path = make_submission(
+                run_dir=run_dir,
+                model_path=meta["best_model_path"],
+                device=device,
+                test_img_dir=test_img_dir,
+                sample_sub_path=sample_sub,
+                infer_size=args.infer_size,
+                thr=float(meta["best_thr"]),
+                tta=args.tta,
+                min_area=args.min_area,
+                pretrained=bool(args.pretrained),
+                logger=logger,
+            )
+            meta["submission_path"] = sub_path
+            manifest["runs"].append(meta)
+
+        finally:
+            logger.close()
+
+        # update manifest after each run
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    print(f"[OK] wrote manifest: {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
