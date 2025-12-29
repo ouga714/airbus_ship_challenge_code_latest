@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+airbus_detector_effnetv2_momos.py
+
+Airbus Ship Detection (Kaggle) 用: 画像レベル二値分類 Detector (ship-present vs ship-absent)
+- Model: torchvision EfficientNetV2 (default: efficientnet_v2_s)
+- Input size: 768x768 (default)
+- Training: FP32 only (NO AMP)
+- Labels: train_ship_segmentations_v2.csv の ImageId に non-empty RLE が1つでもあれば POS
+- Dataset population (重要): train_v2 ディレクトリ内の全画像を母集団にする（船なし画像を落とさない）
+- Split: stratified + disjoint (train/val)
+- Optional: train時の pos:neg 比率をサンプリングで調整 (例 0.8/0.2) できる
+- Outputs:
+  <out_dir>/<run_name>/
+    - best_model.pt
+    - last_model.pt
+    - splits.json
+    - config.json
+    - metrics_val_best.json
+    - train.log
+
+想定データ配置（momos / docker内）:
+  --data_dir /workspace/kaggle_competition/dataset/airbus_ship_detection
+    - train_v2/
+    - train_ship_segmentations_v2.csv
+
+実行例:
+python3 airbus_detector_effnetv2_momos.py \
+  --data_dir /workspace/kaggle_competition/dataset/airbus_ship_detection \
+  --out_dir  /workspace/kaggle_competition/outputs_airbus_detector \
+  --model efficientnet_v2_s \
+  --img_size 768 \
+  --epochs 12 --batch 8 --num_workers 8 \
+  --lr 3e-4 --weight_decay 1e-4 \
+  --seed 42 \
+  --val_ratio 0.15 \
+  --train_sample_n 120000 \
+  --train_pos_frac 0.50 \
+  --use_weighted_sampler 1
+
+注意:
+- 768入力は重いので batch は GPU (2080Ti) だと 4〜12 程度が現実的。
+- sklearn が無い環境でも動くように AUROC は optional（無ければ計算スキップ）。
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import hashlib
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+import torchvision
+from torchvision import transforms
+
+# optional metrics
+_HAS_SKLEARN = False
+try:
+    from sklearn.metrics import (
+        roc_auc_score,
+        precision_recall_fscore_support,
+        accuracy_score,
+        confusion_matrix,
+    )
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
+
+try:
+    from PIL import Image
+except Exception as e:
+    print("PIL(Pillow) is required.", file=sys.stderr)
+    raise
+
+
+# -------------------------
+# Utilities
+# -------------------------
+def now_str() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+class Logger:
+    def __init__(self, path: str, also_stdout: bool = True):
+        self.path = path
+        self.also_stdout = also_stdout
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.f = open(path, "w", encoding="utf-8")
+
+    def log(self, msg: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} {msg}"
+        self.f.write(line + "\n")
+        self.f.flush()
+        if self.also_stdout:
+            print(line)
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 再現性を優先（速度は落ちる）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def sha1_of_file_head(path: str, nbytes: int = 1024 * 1024) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()
+
+
+# -------------------------
+# Label building
+# -------------------------
+def load_pos_set_from_csv(csv_path: str) -> set:
+    """
+    train_ship_segmentations_v2.csv:
+      ImageId, EncodedPixels
+    EncodedPixels が空でない行が1つでもあれば POS
+    """
+    pos = set()
+    with open(csv_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in r.fieldnames or "EncodedPixels" not in r.fieldnames:
+            raise RuntimeError(f"Unexpected CSV header: {r.fieldnames}")
+        for row in r:
+            img_id = row["ImageId"]
+            enc = row["EncodedPixels"]
+            if enc is None:
+                continue
+            enc = str(enc).strip()
+            if enc == "" or enc.lower() == "nan":
+                continue
+            pos.add(img_id)
+    return pos
+
+
+def list_train_ids(train_img_dir: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png")
+    ids = [fn for fn in os.listdir(train_img_dir) if fn.lower().endswith(exts)]
+    ids.sort()
+    if not ids:
+        raise RuntimeError(f"No images in: {train_img_dir}")
+    return ids
+
+
+def stratified_split(ids: List[str], pos_set: set, val_ratio: float, seed: int) -> Dict[str, List[str]]:
+    """
+    stratified & disjoint split for detector
+    """
+    rng = np.random.default_rng(seed)
+    pos_ids = [i for i in ids if i in pos_set]
+    neg_ids = [i for i in ids if i not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    n_pos = len(pos_ids)
+    n_neg = len(neg_ids)
+    n_pos_val = int(round(n_pos * val_ratio))
+    n_neg_val = int(round(n_neg * val_ratio))
+
+    val = pos_ids[:n_pos_val] + neg_ids[:n_neg_val]
+    train = pos_ids[n_pos_val:] + neg_ids[n_neg_val:]
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return {"train": train, "val": val}
+
+
+def stratified_subsample(
+    ids: List[str],
+    pos_set: set,
+    total_n: int,
+    pos_frac: float,
+    seed: int,
+) -> List[str]:
+    """
+    train poolから (pos_frac) で層化抽出したリストを返す。
+    total_n <= 0 の場合は ids をそのまま返す。
+    """
+    if total_n is None or total_n <= 0 or total_n >= len(ids):
+        return ids
+
+    rng = np.random.default_rng(seed)
+    pos_ids = [i for i in ids if i in pos_set]
+    neg_ids = [i for i in ids if i not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    n_pos = int(round(total_n * pos_frac))
+    n_neg = total_n - n_pos
+    if n_pos > len(pos_ids):
+        n_pos = len(pos_ids)
+        n_neg = total_n - n_pos
+    if n_neg > len(neg_ids):
+        n_neg = len(neg_ids)
+        n_pos = total_n - n_neg
+    if n_pos < 0 or n_neg < 0:
+        raise RuntimeError("Invalid subsample counts.")
+
+    out = pos_ids[:n_pos] + neg_ids[:n_neg]
+    rng.shuffle(out)
+    return out
+
+
+# -------------------------
+# Dataset
+# -------------------------
+_IMNET_MEAN = (0.485, 0.456, 0.406)
+_IMNET_STD  = (0.229, 0.224, 0.225)
+
+
+class AirbusDetectorDataset(Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        image_ids: List[str],
+        pos_set: set,
+        tfm,
+    ):
+        self.img_dir = img_dir
+        self.ids = image_ids
+        self.pos_set = pos_set
+        self.tfm = tfm
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = Image.open(path).convert("RGB")
+        x = self.tfm(img)
+        y = 1.0 if img_id in self.pos_set else 0.0
+        y = torch.tensor([y], dtype=torch.float32)
+        return x, y, img_id
+
+
+def build_transforms(img_size: int, train: bool):
+    if train:
+        # 768の分類なので「壊しすぎない」拡張に寄せる（過度な幾何変換は検出を壊しやすい）
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+
+
+# -------------------------
+# Model
+# -------------------------
+def build_model(model_name: str, num_classes: int = 1) -> nn.Module:
+    """
+    torchvision EfficientNetV2:
+      - efficientnet_v2_s / _m / _l
+    出力は binary なので num_classes=1 (logit)
+    """
+    model_name = model_name.strip().lower()
+
+    if model_name == "efficientnet_v2_s":
+        m = torchvision.models.efficientnet_v2_s(weights=torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1)
+    elif model_name == "efficientnet_v2_m":
+        m = torchvision.models.efficientnet_v2_m(weights=torchvision.models.EfficientNet_V2_M_Weights.IMAGENET1K_V1)
+    elif model_name == "efficientnet_v2_l":
+        m = torchvision.models.efficientnet_v2_l(weights=torchvision.models.EfficientNet_V2_L_Weights.IMAGENET1K_V1)
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
+    # classifier: Sequential(Dropout, Linear)
+    in_features = m.classifier[-1].in_features
+    m.classifier[-1] = nn.Linear(in_features, num_classes)
+    return m
+
+
+# -------------------------
+# Metrics
+# -------------------------
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    thr: float = 0.5,
+) -> Dict[str, float]:
+    model.eval()
+    ys = []
+    ps = []
+    loss_sum = 0.0
+    n = 0
+
+    bce = nn.BCEWithLogitsLoss(reduction="sum")
+
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logit = model(x)
+        loss = bce(logit, y)
+        loss_sum += float(loss.item())
+        n += int(y.shape[0])
+
+        prob = torch.sigmoid(logit).detach().cpu().numpy().reshape(-1)
+        gt = y.detach().cpu().numpy().reshape(-1)
+        ps.append(prob)
+        ys.append(gt)
+
+    y_true = np.concatenate(ys, axis=0).astype(np.float32)
+    y_prob = np.concatenate(ps, axis=0).astype(np.float32)
+    y_pred = (y_prob >= thr).astype(np.int32)
+
+    out = {}
+    out["loss"] = float(loss_sum / max(1, n))
+    out["acc"] = float((y_pred == y_true).mean())
+
+    # precision/recall/f1
+    tp = float(((y_pred == 1) & (y_true == 1)).sum())
+    fp = float(((y_pred == 1) & (y_true == 0)).sum())
+    fn = float(((y_pred == 0) & (y_true == 1)).sum())
+    eps = 1e-9
+    prec = tp / (tp + fp + eps)
+    rec = tp / (tp + fn + eps)
+    f1 = 2 * prec * rec / (prec + rec + eps)
+    out["precision"] = float(prec)
+    out["recall"] = float(rec)
+    out["f1"] = float(f1)
+
+    # AUROC (optional)
+    if _HAS_SKLEARN:
+        try:
+            # roc_auc_score needs both classes present
+            if (y_true.max() > 0.0) and (y_true.min() < 1.0):
+                out["auroc"] = float(roc_auc_score(y_true, y_prob))
+            else:
+                out["auroc"] = float("nan")
+        except Exception:
+            out["auroc"] = float("nan")
+    else:
+        out["auroc"] = float("nan")
+
+    out["n"] = float(len(y_true))
+    out["pos_rate"] = float(y_true.mean())
+    out["thr"] = float(thr)
+    return out
+
+
+@torch.no_grad()
+def tune_threshold_on_val(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    grid_n: int = 101,
+    metric: str = "f1",
+) -> Tuple[float, Dict[str, float]]:
+    """
+    val上でthrを走査して f1（デフォ）最大のthrを返す。
+    detectorは「見逃しを抑える」用途が強いので、実運用では recall制約付き最適化もあり。
+    """
+    model.eval()
+    ys = []
+    ps = []
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        logit = model(x)
+        prob = torch.sigmoid(logit).detach().cpu().numpy().reshape(-1)
+        gt = y.detach().cpu().numpy().reshape(-1)
+        ps.append(prob)
+        ys.append(gt)
+    y_true = np.concatenate(ys, axis=0).astype(np.float32)
+    y_prob = np.concatenate(ps, axis=0).astype(np.float32)
+
+    thrs = np.linspace(0.0, 1.0, grid_n).astype(np.float32)
+    best_thr = 0.5
+    best_score = -1.0
+    best_pack = {}
+
+    eps = 1e-9
+    for thr in thrs:
+        y_pred = (y_prob >= thr).astype(np.int32)
+        tp = float(((y_pred == 1) & (y_true == 1)).sum())
+        fp = float(((y_pred == 1) & (y_true == 0)).sum())
+        fn = float(((y_pred == 0) & (y_true == 1)).sum())
+        prec = tp / (tp + fp + eps)
+        rec = tp / (tp + fn + eps)
+        f1 = 2 * prec * rec / (prec + rec + eps)
+
+        if metric == "recall":
+            score = rec
+        else:
+            score = f1
+
+        if score > best_score:
+            best_score = float(score)
+            best_thr = float(thr)
+            best_pack = {
+                "thr": float(thr),
+                "precision": float(prec),
+                "recall": float(rec),
+                "f1": float(f1),
+                "pos_rate": float(y_true.mean()),
+                "n": float(len(y_true)),
+            }
+
+    return best_thr, best_pack
+
+
+# -------------------------
+# Train
+# -------------------------
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    epoch: int,
+    log: Logger,
+    grad_clip: float = 0.0,
+) -> Dict[str, float]:
+    model.train()
+    loss_sum = 0.0
+    n = 0
+    t0 = time.time()
+
+    for it, (x, y, _) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logit = model(x)
+        loss = criterion(logit, y)
+        loss.backward()
+
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
+        optimizer.step()
+
+        bs = int(y.shape[0])
+        loss_sum += float(loss.item()) * bs
+        n += bs
+
+        if (it % 50) == 0:
+            log.log(f"[TRAIN] epoch={epoch} iter={it}/{len(loader)} loss={loss.item():.6f}")
+
+    dt = time.time() - t0
+    return {
+        "train_loss": float(loss_sum / max(1, n)),
+        "train_n": float(n),
+        "sec": float(dt),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+
+    ap.add_argument("--model", type=str, default="efficientnet_v2_s")
+    ap.add_argument("--img_size", type=int, default=768)
+
+    ap.add_argument("--epochs", type=int, default=12)
+    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=8)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val_ratio", type=float, default=0.15)
+
+    # optional: subsample train to speed up
+    ap.add_argument("--train_sample_n", type=int, default=0, help="0 means use all train pool")
+    ap.add_argument("--train_pos_frac", type=float, default=0.50, help="pos fraction in stratified subsample (only if train_sample_n>0)")
+
+    # optional: weighted sampler to emulate target pos_frac per epoch (works even without subsample)
+    ap.add_argument("--use_weighted_sampler", type=int, default=1, help="1: use WeightedRandomSampler for train to target pos frac")
+    ap.add_argument("--target_pos_frac", type=float, default=0.50)
+
+    # loss options
+    ap.add_argument("--pos_weight", type=float, default=0.0, help="BCE pos_weight; 0 => auto from train distribution")
+    ap.add_argument("--label_smoothing", type=float, default=0.0, help="0~0.1程度。二値分類でも軽く効くことがある")
+
+    # threshold tuning
+    ap.add_argument("--thr_grid_n", type=int, default=101)
+    ap.add_argument("--select_metric", type=str, default="f1", choices=["f1", "recall"])
+
+    # misc
+    ap.add_argument("--grad_clip", type=float, default=0.0)
+    ap.add_argument("--save_every", type=int, default=1)
+
+    args = ap.parse_args()
+
+    seed_everything(args.seed)
+
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    train_csv = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+    if not os.path.exists(train_img_dir):
+        raise RuntimeError(f"train_v2 not found: {train_img_dir}")
+    if not os.path.exists(train_csv):
+        raise RuntimeError(f"train_ship_segmentations_v2.csv not found: {train_csv}")
+
+    pos_set = load_pos_set_from_csv(train_csv)
+    all_ids = list_train_ids(train_img_dir)
+
+    splits = stratified_split(all_ids, pos_set, val_ratio=args.val_ratio, seed=args.seed)
+    train_ids_full = splits["train"]
+    val_ids = splits["val"]
+
+    # optional: stratified subsample for speed
+    if args.train_sample_n and args.train_sample_n > 0:
+        train_ids = stratified_subsample(
+            train_ids_full,
+            pos_set=pos_set,
+            total_n=args.train_sample_n,
+            pos_frac=args.train_pos_frac,
+            seed=args.seed + 777,
+        )
+    else:
+        train_ids = train_ids_full
+
+    # run dir
+    run_name = (
+        f"run__detector_{args.model}__img{args.img_size}"
+        f"__seed{args.seed}__train{len(train_ids)}__val{len(val_ids)}__valr{args.val_ratio:.2f}"
+    )
+    run_dir = os.path.join(args.out_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    log = Logger(os.path.join(run_dir, "train.log"), also_stdout=True)
+    log.log("==== START: Airbus Detector (EfficientNetV2) ====")
+    log.log(f"run_dir={run_dir}")
+    log.log(f"data_dir={args.data_dir}")
+    log.log(f"train_img_dir={train_img_dir}")
+    log.log(f"train_csv={train_csv}")
+    log.log(f"sklearn_available={_HAS_SKLEARN}")
+    log.log(f"pos_set_size={len(pos_set)} / all_images={len(all_ids)} (pos_rate={len(pos_set)/len(all_ids):.4f})")
+
+    # save config + splits
+    config_path = os.path.join(run_dir, "config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+
+    splits_path = os.path.join(run_dir, "splits.json")
+    with open(splits_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "seed": args.seed,
+                "val_ratio": args.val_ratio,
+                "train_ids_used_n": len(train_ids),
+                "train_ids_full_n": len(train_ids_full),
+                "val_ids_n": len(val_ids),
+                "train_ids": train_ids,
+                "val_ids": val_ids,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    log.log(f"[SPLIT] train_used={len(train_ids)} train_full={len(train_ids_full)} val={len(val_ids)}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.log(f"device={device}")
+
+    # datasets
+    tfm_train = build_transforms(args.img_size, train=True)
+    tfm_val = build_transforms(args.img_size, train=False)
+
+    ds_train = AirbusDetectorDataset(train_img_dir, train_ids, pos_set, tfm_train)
+    ds_val = AirbusDetectorDataset(train_img_dir, val_ids, pos_set, tfm_val)
+
+    # sampler (optional)
+    if int(args.use_weighted_sampler) == 1:
+        # WeightedRandomSampler で「学習時の見せ方」を target_pos_frac に寄せる
+        labels = np.array([1 if i in pos_set else 0 for i in train_ids], dtype=np.int64)
+        n_pos = int(labels.sum())
+        n_neg = int(len(labels) - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            log.log("[WARN] sampler disabled due to single-class train set.")
+            sampler = None
+            shuffle = True
+        else:
+            # 目標 pos 比率に近づくように重み設計
+            # 期待サンプル比: pos:neg = target_pos_frac : (1-target_pos_frac)
+            target_pos = float(args.target_pos_frac)
+            target_neg = 1.0 - target_pos
+            # 各クラスの重みを (target / count) に比例させる
+            w_pos = target_pos / max(1, n_pos)
+            w_neg = target_neg / max(1, n_neg)
+            weights = np.where(labels == 1, w_pos, w_neg).astype(np.float64)
+            weights_t = torch.from_numpy(weights)
+
+            sampler = WeightedRandomSampler(
+                weights=weights_t,
+                num_samples=len(train_ids),  # 1 epochあたりのサンプル数（置換あり）
+                replacement=True
+            )
+            shuffle = False
+            log.log(f"[SAMPLER] enabled: n_pos={n_pos} n_neg={n_neg} target_pos_frac={target_pos:.3f} w_pos={w_pos:.6e} w_neg={w_neg:.6e}")
+    else:
+        sampler = None
+        shuffle = True
+        labels = np.array([1 if i in pos_set else 0 for i in train_ids], dtype=np.int64)
+        n_pos = int(labels.sum())
+        n_neg = int(len(labels) - n_pos)
+        log.log(f"[SAMPLER] disabled: n_pos={n_pos} n_neg={n_neg} train_pos_rate={n_pos/len(labels):.4f}")
+
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=args.batch,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    dl_val = DataLoader(
+        ds_val,
+        batch_size=max(1, args.batch),
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    # model
+    model = build_model(args.model, num_classes=1).to(device)
+
+    # pos_weight
+    if args.pos_weight and args.pos_weight > 0:
+        pos_weight = float(args.pos_weight)
+        log.log(f"[LOSS] pos_weight(user)={pos_weight}")
+    else:
+        # auto from (train_ids distribution) (注意: samplerを使っても、pos_weightは実データ分布ベースの方が安定)
+        labels_pw = np.array([1 if i in pos_set else 0 for i in train_ids], dtype=np.int64)
+        n_pos = float(labels_pw.sum())
+        n_neg = float(len(labels_pw) - labels_pw.sum())
+        # BCEWithLogitsLoss の pos_weight は「正例の重み」= neg/pos が基本
+        pos_weight = float(n_neg / max(1.0, n_pos))
+        # 極端すぎると学習が不安定になるので軽くクリップ
+        pos_weight = float(min(50.0, max(1.0, pos_weight)))
+        log.log(f"[LOSS] pos_weight(auto)={pos_weight:.4f} (neg/pos clipped)")
+
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+
+    # label smoothing (binary)
+    def criterion(logit, y):
+        if args.label_smoothing and args.label_smoothing > 0:
+            s = float(args.label_smoothing)
+            y_sm = y * (1.0 - s) + 0.5 * s
+            return bce(logit, y_sm)
+        return bce(logit, y)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # train loop
+    best_score = -1.0
+    best_epoch = -1
+    best_thr = 0.5
+    best_val_metrics = {}
+
+    for epoch in range(1, args.epochs + 1):
+        tr = train_one_epoch(
+            model=model,
+            loader=dl_train,
+            device=device,
+            optimizer=optimizer,
+            criterion=criterion,
+            epoch=epoch,
+            log=log,
+            grad_clip=args.grad_clip,
+        )
+
+        # val thr tuning + val eval
+        val_thr, val_thr_pack = tune_threshold_on_val(
+            model=model,
+            loader=dl_val,
+            device=device,
+            grid_n=args.thr_grid_n,
+            metric=args.select_metric,
+        )
+        val_metrics = evaluate(model, dl_val, device, thr=val_thr)
+
+        # score for selecting best model
+        # - detector用途では recall を優先したい場面が多い
+        if args.select_metric == "recall":
+            score = float(val_metrics["recall"])
+        else:
+            score = float(val_metrics["f1"])
+
+        log.log(
+            f"[EPOCH] {epoch}/{args.epochs} "
+            f"train_loss={tr['train_loss']:.6f} "
+            f"val_loss={val_metrics['loss']:.6f} "
+            f"val_thr={val_thr:.3f} "
+            f"val_acc={val_metrics['acc']:.4f} "
+            f"val_p={val_metrics['precision']:.4f} val_r={val_metrics['recall']:.4f} val_f1={val_metrics['f1']:.4f} "
+            f"val_auroc={val_metrics['auroc']:.4f}"
+        )
+
+        # save last
+        if (epoch % max(1, args.save_every)) == 0:
+            last_path = os.path.join(run_dir, "last_model.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "config": vars(args),
+                    "val_thr": float(val_thr),
+                    "val_metrics": val_metrics,
+                },
+                last_path,
+            )
+
+        # update best
+        if score > best_score:
+            best_score = float(score)
+            best_epoch = int(epoch)
+            best_thr = float(val_thr)
+            best_val_metrics = dict(val_metrics)
+
+            best_path = os.path.join(run_dir, "best_model.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "config": vars(args),
+                    "best_thr": float(best_thr),
+                    "val_metrics": best_val_metrics,
+                },
+                best_path,
+            )
+            log.log(f"[BEST] epoch={best_epoch} score({args.select_metric})={best_score:.6f} best_thr={best_thr:.3f} saved={best_path}")
+
+    # write best metrics summary
+    best_json = os.path.join(run_dir, "metrics_val_best.json")
+    with open(best_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "select_metric": args.select_metric,
+                "best_thr": best_thr,
+                "best_val_metrics": best_val_metrics,
+                "best_model_path": os.path.join(run_dir, "best_model.pt"),
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # final report
+    best_model_path = os.path.join(run_dir, "best_model.pt")
+    head_sha1 = sha1_of_file_head(best_model_path) if os.path.exists(best_model_path) else "NA"
+    log.log("==== DONE ====")
+    log.log(f"run_dir={run_dir}")
+    log.log(f"best_epoch={best_epoch} best_score({args.select_metric})={best_score:.6f} best_thr={best_thr:.3f}")
+    log.log(f"best_model.pt sha1(first1MB)={head_sha1}")
+    log.log(f"best_val_metrics={json.dumps(best_val_metrics, ensure_ascii=False)}")
+
+    log.close()
+
+
+if __name__ == "__main__":
+    main()
+
