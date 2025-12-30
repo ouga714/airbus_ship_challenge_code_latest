@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Airbus Ship Detection (hades) — Train DeepLabV3 with:
+- Train sampling ratio (pos:neg) = 7:3 via WeightedRandomSampler (with replacement)
+- Use ALL available data (train_v2 directory defines the population)
+- Pos augmentation to effectively increase positive samples (stronger aug for pos)
+- Val split = 15% (and also ratio 7:3)
+- Loss = BCEWithLogits + Tversky (alpha=0.60, beta=0.40)  # precision>recall
+- Early stopping (monitor: val soft-Tversky index; threshold-free)
+- TTA mandatory (flip4) for val evaluation, threshold tuning, and test inference
+- Generate submission.csv (union mask; one row per image)
+- Save best model path for later detector-gated usage
+
+Expected dataset layout under --data_dir:
+  train_v2/ (images)
+  test_v2/ (images)
+  train_ship_segmentations_v2.csv
+  sample_submission_v2.csv
+
+Outputs under --out_dir/run_name/:
+  best_model.pt
+  meta.json
+  splits.json
+  run_global.log
+  run_detail.log
+  submission.csv
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+from PIL import Image
+
+try:
+    import torchvision
+    from torchvision.models.segmentation import deeplabv3_resnet50
+    import torchvision.transforms.functional as TF
+except Exception as e:
+    print("ERROR: torchvision is required. Install/enable torchvision in your environment.")
+    raise
+
+# Optional postprocess (remove small components)
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def list_image_ids_from_dir(img_dir: str) -> List[str]:
+    ids = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith(".jpg") or fn.lower().endswith(".png"):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+
+def read_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    """
+    train_ship_segmentations_v2.csv:
+      ImageId,EncodedPixels
+    EncodedPixels empty => no ship
+    Many rows per ImageId (instances). We'll union them in training mask.
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None or len(header) < 2:
+            raise RuntimeError(f"CSV header invalid: {csv_path}")
+        for row in reader:
+            if not row:
+                continue
+            image_id = row[0]
+            rle = row[1] if len(row) > 1 else ""
+            if rle is None:
+                rle = ""
+            rle = rle.strip()
+            if rle == "":
+                continue
+            if image_id not in id2rles:
+                id2rles[image_id] = []
+            id2rles[image_id].append(rle)
+    return id2rles
+
+
+def rle_decode_one(rle: str, shape: Tuple[int, int] = (768, 768)) -> np.ndarray:
+    """
+    Kaggle Airbus RLE is 1-indexed, column-major (Fortran order).
+    Returns mask shape (H,W) with {0,1}.
+    """
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    h, w = shape
+    img = np.zeros(h * w, dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    # reshape in Fortran order then transpose to (H,W)
+    img = img.reshape((w, h), order="F").T
+    return img
+
+
+def rle_decode_union(rles: List[str], shape: Tuple[int, int] = (768, 768)) -> np.ndarray:
+    if len(rles) == 0:
+        return np.zeros(shape, dtype=np.uint8)
+    m = np.zeros(shape, dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode_one(r, shape=shape)
+    return m
+
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    Encode binary mask (H,W) to RLE in column-major (Fortran order), 1-indexed.
+    Returns '' if mask empty.
+    """
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() == 0:
+        return ""
+    # Convert to Fortran order flatten:
+    pixels = mask.T.flatten(order="F")
+    # Pad with zeros at ends to catch transitions
+    pixels = np.concatenate([[0], pixels, [0]]).astype(np.uint8)
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+def remove_small_components(mask01: np.ndarray, min_area: int) -> np.ndarray:
+    """
+    Remove connected components smaller than min_area.
+    mask01: (H,W) uint8 {0,1}
+    """
+    if min_area <= 0:
+        return mask01
+    if not _HAS_CV2:
+        return mask01
+    m = (mask01 * 255).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    out = np.zeros_like(mask01, dtype=np.uint8)
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            out[labels == i] = 1
+    return out
+
+
+# -------------------------
+# Augmentation (torchvision functional; no albumentations dependency)
+# -------------------------
+
+@dataclass
+class AugConfig:
+    # geometric
+    p_hflip: float = 0.5
+    p_vflip: float = 0.5
+    p_rot90: float = 0.5  # random k*90
+
+    # photometric (pos mainly)
+    p_color_jitter: float = 0.8
+    brightness: float = 0.15
+    contrast: float = 0.15
+    saturation: float = 0.10
+    hue: float = 0.02
+
+    p_gamma: float = 0.5
+    gamma_min: float = 0.85
+    gamma_max: float = 1.15
+
+    p_noise: float = 0.3
+    noise_std: float = 0.02
+
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
+def apply_geometric_aug(img: Image.Image, mask: Image.Image, cfg: AugConfig) -> Tuple[Image.Image, Image.Image]:
+    # hflip
+    if random.random() < cfg.p_hflip:
+        img = TF.hflip(img)
+        mask = TF.hflip(mask)
+    # vflip
+    if random.random() < cfg.p_vflip:
+        img = TF.vflip(img)
+        mask = TF.vflip(mask)
+    # rot90
+    if random.random() < cfg.p_rot90:
+        k = random.randint(0, 3)
+        if k != 0:
+            img = TF.rotate(img, angle=90 * k, expand=False)
+            mask = TF.rotate(mask, angle=90 * k, expand=False)
+    return img, mask
+
+
+def apply_photometric_aug(img_t: torch.Tensor, cfg: AugConfig) -> torch.Tensor:
+    """
+    img_t: float tensor in [0,1], shape (3,H,W)
+    """
+    # color jitter
+    if random.random() < cfg.p_color_jitter:
+        b = 1.0 + random.uniform(-cfg.brightness, cfg.brightness)
+        c = 1.0 + random.uniform(-cfg.contrast, cfg.contrast)
+        s = 1.0 + random.uniform(-cfg.saturation, cfg.saturation)
+        h = random.uniform(-cfg.hue, cfg.hue)
+        img_t = TF.adjust_brightness(img_t, b)
+        img_t = TF.adjust_contrast(img_t, c)
+        img_t = TF.adjust_saturation(img_t, s)
+        img_t = TF.adjust_hue(img_t, h)
+
+    # gamma
+    if random.random() < cfg.p_gamma:
+        g = random.uniform(cfg.gamma_min, cfg.gamma_max)
+        img_t = TF.adjust_gamma(img_t, g)
+
+    # noise
+    if random.random() < cfg.p_noise:
+        noise = torch.randn_like(img_t) * cfg.noise_std
+        img_t = torch.clamp(img_t + noise, 0.0, 1.0)
+
+    return img_t
+
+
+# -------------------------
+# Dataset
+# -------------------------
+
+class AirbusSegDataset(Dataset):
+    def __init__(
+        self,
+        data_dir: str,
+        ids: List[str],
+        is_pos_flags: List[bool],
+        id2rles: Dict[str, List[str]],
+        train: bool,
+        size: int,
+        aug_pos: AugConfig,
+        aug_neg: AugConfig,
+        decode_shape: Tuple[int, int] = (768, 768),
+    ):
+        self.data_dir = data_dir
+        self.ids = ids
+        self.is_pos_flags = is_pos_flags
+        self.id2rles = id2rles
+        self.train = train
+        self.size = size
+        self.aug_pos = aug_pos
+        self.aug_neg = aug_neg
+        self.decode_shape = decode_shape
+
+        self.train_img_dir = os.path.join(data_dir, "train_v2")
+        self.test_img_dir = os.path.join(data_dir, "test_v2")
+
+        if not os.path.isdir(self.train_img_dir):
+            raise FileNotFoundError(f"train_v2 dir not found: {self.train_img_dir}")
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _load_img(self, image_id: str) -> Image.Image:
+        p = os.path.join(self.train_img_dir, image_id)
+        if not os.path.isfile(p):
+            # sometimes ids already are full names; still error if missing
+            raise FileNotFoundError(f"Missing image: {p}")
+        img = Image.open(p).convert("RGB")
+        return img
+
+    def _load_mask(self, image_id: str) -> Image.Image:
+        rles = self.id2rles.get(image_id, [])
+        m = rle_decode_union(rles, shape=self.decode_shape)  # uint8 {0,1}
+        # PIL expects 0..255
+        m = (m * 255).astype(np.uint8)
+        return Image.fromarray(m, mode="L")
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_id = self.ids[idx]
+        is_pos = self.is_pos_flags[idx]
+
+        img = self._load_img(image_id)
+        mask = self._load_mask(image_id)
+
+        # resize first to training size (geometric aug is ok at this scale)
+        img = img.resize((self.size, self.size), resample=Image.BILINEAR)
+        mask = mask.resize((self.size, self.size), resample=Image.NEAREST)
+
+        if self.train:
+            cfg = self.aug_pos if is_pos else self.aug_neg
+            img, mask = apply_geometric_aug(img, mask, cfg)
+
+        # to tensor in [0,1]
+        img_t = TF.to_tensor(img)  # (3,H,W)
+        mask_t = TF.to_tensor(mask)  # (1,H,W) in [0,1] but from 0/255 => {0,1}
+        mask_t = (mask_t > 0.5).float()
+
+        if self.train:
+            # photometric only on image
+            cfg = self.aug_pos if is_pos else self.aug_neg
+            img_t = apply_photometric_aug(img_t, cfg)
+
+        # normalize
+        img_t = TF.normalize(img_t, IMAGENET_MEAN, IMAGENET_STD)
+
+        return img_t, mask_t
+
+
+# -------------------------
+# Model + Loss
+# -------------------------
+
+class DeepLabV3Binary(nn.Module):
+    def __init__(self, pretrained: bool = False):
+        super().__init__()
+        weights = None
+        if pretrained:
+            # try to use torchvision weights if available; fallback gracefully if download not possible
+            try:
+                weights = torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT
+            except Exception:
+                weights = None
+        try:
+            self.model = deeplabv3_resnet50(weights=weights, aux_loss=False)
+        except TypeError:
+            # older torchvision compatibility
+            self.model = deeplabv3_resnet50(pretrained=pretrained, aux_loss=False)
+
+        # replace classifier last conv to 1 channel
+        # torchvision deeplab classifier is DeepLabHead with final conv at index 4
+        if hasattr(self.model, "classifier") and isinstance(self.model.classifier, nn.Sequential):
+            # expected: [ASPP, Conv, BN, ReLU, Conv]
+            last = self.model.classifier[-1]
+            if isinstance(last, nn.Conv2d):
+                in_ch = last.in_channels
+                self.model.classifier[-1] = nn.Conv2d(in_ch, 1, kernel_size=1)
+            else:
+                raise RuntimeError("Unexpected DeepLabV3 classifier structure (last layer not Conv2d).")
+        else:
+            raise RuntimeError("Unexpected DeepLabV3 model structure (classifier not nn.Sequential).")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.model(x)["out"]  # (B,1,H,W)
+        return out
+
+
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.60, beta: float = 0.40, eps: float = 1e-6):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.eps = float(eps)
+
+    def forward(self, probs: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        probs: sigmoid(logits), (B,1,H,W)
+        targets: (B,1,H,W) in {0,1}
+        Returns (loss, tversky_index_mean)
+        """
+        p = probs.view(probs.size(0), -1)
+        t = targets.view(targets.size(0), -1)
+
+        tp = (p * t).sum(dim=1)
+        fp = (p * (1.0 - t)).sum(dim=1)
+        fn = ((1.0 - p) * t).sum(dim=1)
+
+        ti = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+        loss = 1.0 - ti
+        return loss.mean(), ti.mean()
+
+
+# -------------------------
+# TTA (flip4)
+# -------------------------
+
+@torch.no_grad()
+def predict_prob_tta_flip4(model: nn.Module, img_t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """
+    img_t: (1,3,H,W), normalized
+    returns prob: (1,1,H,W) in [0,1]
+    """
+    model.eval()
+    x = img_t.to(device)
+
+    def fwd(x_in: torch.Tensor) -> torch.Tensor:
+        logits = model(x_in)
+        return torch.sigmoid(logits)
+
+    # none
+    p0 = fwd(x)
+    # hflip
+    x1 = torch.flip(x, dims=[3])
+    p1 = torch.flip(fwd(x1), dims=[3])
+    # vflip
+    x2 = torch.flip(x, dims=[2])
+    p2 = torch.flip(fwd(x2), dims=[2])
+    # hvflip
+    x3 = torch.flip(x, dims=[2, 3])
+    p3 = torch.flip(fwd(x3), dims=[2, 3])
+
+    p = (p0 + p1 + p2 + p3) / 4.0
+    return p
+
+
+# -------------------------
+# Metrics (pixel-level)
+# -------------------------
+
+def fbeta_from_counts(tp: float, fp: float, fn: float, beta: float) -> float:
+    beta2 = beta * beta
+    denom = (1 + beta2) * tp + beta2 * fn + fp
+    if denom <= 0:
+        return 0.0
+    return (1 + beta2) * tp / denom
+
+
+@torch.no_grad()
+def eval_soft_tversky(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    tversky_loss: TverskyLoss,
+    bce_loss: nn.BCEWithLogitsLoss,
+    use_tta: bool = True,
+    log_detail: Optional[logging.Logger] = None,
+    max_batches: int = 0,
+) -> Dict[str, float]:
+    """
+    Evaluate val loss and soft-tversky index (threshold-free).
+    TTA is mandatory by default (flip4).
+    max_batches=0 => all
+    """
+    model.eval()
+    total_loss = 0.0
+    total_bce = 0.0
+    total_tv_loss = 0.0
+    total_tv = 0.0
+    n = 0
+
+    for bi, (img, mask) in enumerate(loader):
+        if max_batches > 0 and bi >= max_batches:
+            break
+        img = img.to(device)
+        mask = mask.to(device)
+
+        if use_tta:
+            # TTA path: need logits for BCE too; approximate by averaging probs then logit-stabilize
+            # We compute probs via TTA, then convert to logits by log(p/(1-p)).
+            probs = predict_prob_tta_flip4(model, img, device=device)  # (B=1,1,H,W)
+            probs = torch.clamp(probs, 1e-6, 1 - 1e-6)
+            logits = torch.log(probs / (1.0 - probs))
+        else:
+            logits = model(img)
+            probs = torch.sigmoid(logits)
+
+        bce = bce_loss(logits, mask)
+        tv_loss, tv = tversky_loss(probs, mask)
+        loss = bce + tv_loss
+
+        total_loss += float(loss.item())
+        total_bce += float(bce.item())
+        total_tv_loss += float(tv_loss.item())
+        total_tv += float(tv.item())
+        n += 1
+
+        if log_detail is not None and (bi % 100 == 0):
+            log_detail.info(f"[VAL step {bi}] loss={loss.item():.6f} bce={bce.item():.6f} tv_loss={tv_loss.item():.6f} soft_tv={tv.item():.6f}")
+
+    if n == 0:
+        return {"val_loss": 0.0, "val_bce": 0.0, "val_tv_loss": 0.0, "val_soft_tversky": 0.0}
+
+    return {
+        "val_loss": total_loss / n,
+        "val_bce": total_bce / n,
+        "val_tv_loss": total_tv_loss / n,
+        "val_soft_tversky": total_tv / n,
+    }
+
+
+@torch.no_grad()
+def tune_threshold_hist(
+    model: nn.Module,
+    dataset: Dataset,
+    device: torch.device,
+    thr_grid_n: int = 41,
+    beta_f: float = 2.0,
+    tune_limit: int = 1200,
+    use_tta: bool = True,
+    log: Optional[logging.Logger] = None,
+) -> float:
+    """
+    Tune threshold to maximize pixel-level F_beta using histograms of predicted probs.
+    This avoids O(num_pixels * num_thresholds).
+    """
+    model.eval()
+    n = len(dataset)
+    idxs = list(range(n))
+    random.shuffle(idxs)
+    if tune_limit > 0:
+        idxs = idxs[:min(tune_limit, n)]
+
+    bins = thr_grid_n
+    pos_hist = np.zeros(bins, dtype=np.float64)
+    neg_hist = np.zeros(bins, dtype=np.float64)
+
+    # bin edges in [0,1]
+    edges = np.linspace(0.0, 1.0, bins + 1)
+
+    for k, di in enumerate(idxs):
+        img, mask = dataset[di]
+        img = img.unsqueeze(0)
+        mask_np = (mask.numpy().reshape(-1) > 0.5).astype(np.uint8)
+
+        if use_tta:
+            prob = predict_prob_tta_flip4(model, img, device=device)
+        else:
+            prob = torch.sigmoid(model(img.to(device)))
+
+        prob_np = prob.detach().cpu().numpy().reshape(-1)
+        prob_np = np.clip(prob_np, 0.0, 1.0)
+
+        pos_probs = prob_np[mask_np == 1]
+        neg_probs = prob_np[mask_np == 0]
+
+        # histogram counts per bin
+        if pos_probs.size > 0:
+            hpos, _ = np.histogram(pos_probs, bins=edges)
+            pos_hist += hpos.astype(np.float64)
+        if neg_probs.size > 0:
+            hneg, _ = np.histogram(neg_probs, bins=edges)
+            neg_hist += hneg.astype(np.float64)
+
+        if log is not None and (k % 100 == 0):
+            log.info(f"[THR_TUNE] {k}/{len(idxs)} processed")
+
+    # For threshold t, predicted positive if prob >= t
+    # With hist bins, approximate using cumulative sums from top.
+    pos_cum = np.cumsum(pos_hist[::-1])[::-1]
+    neg_cum = np.cumsum(neg_hist[::-1])[::-1]
+    total_pos = pos_hist.sum()
+
+    best_thr = 0.5
+    best_f = -1.0
+
+    # candidate thresholds: use left edges of bins
+    # for bin i: probs in [edges[i], edges[i+1])
+    # predicted >= edges[i]
+    for i in range(bins):
+        tp = pos_cum[i]
+        fp = neg_cum[i]
+        fn = total_pos - tp
+        f = fbeta_from_counts(tp, fp, fn, beta=beta_f)
+        thr = float(edges[i])
+        if f > best_f:
+            best_f = f
+            best_thr = thr
+
+    if log is not None:
+        log.info(f"[THR_TUNE DONE] best_thr={best_thr:.6f} best_F{beta_f:.2f}={best_f:.6f} (bins={bins}, n_images={len(idxs)})")
+
+    return float(best_thr)
+
+
+# -------------------------
+# Train / Inference
+# -------------------------
+
+def build_loggers(run_dir: str) -> Tuple[logging.Logger, logging.Logger]:
+    ensure_dir(run_dir)
+    global_log_path = os.path.join(run_dir, "run_global.log")
+    detail_log_path = os.path.join(run_dir, "run_detail.log")
+
+    logger = logging.getLogger("global")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+
+    fh = logging.FileHandler(global_log_path, mode="w")
+    fh.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    ch.setFormatter(fmt)
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+
+    detail = logging.getLogger("detail")
+    detail.setLevel(logging.INFO)
+    detail.handlers.clear()
+
+    fh2 = logging.FileHandler(detail_log_path, mode="w")
+    fh2.setLevel(logging.INFO)
+    fh2.setFormatter(fmt)
+    detail.addHandler(fh2)
+
+    return logger, detail
+
+
+def save_json(path: str, obj: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data_dir", type=str, default="/workspace/kaggle_competition/dataset/airbus_ship_detection")
+    ap.add_argument("--out_dir", type=str, default="/workspace/kaggle_competition/outputs_airbus_seg_p7r3")
+
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--train_size", type=int, default=256)
+    ap.add_argument("--infer_size", type=int, default=768)
+
+    ap.add_argument("--batch_train", type=int, default=4)
+    ap.add_argument("--batch_eval", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--max_epochs", type=int, default=50)
+    ap.add_argument("--patience", type=int, default=6)
+
+    # Tversky (precision>recall)
+    ap.add_argument("--alpha", type=float, default=0.60)  # FP weight
+    ap.add_argument("--beta", type=float, default=0.40)   # FN weight
+    ap.add_argument("--tversky_lambda", type=float, default=1.0)
+
+    # Split ratio pos:neg = 7:3
+    ap.add_argument("--pos_frac", type=float, default=0.70)
+    ap.add_argument("--val_frac", type=float, default=0.15)
+
+    # Epoch size multiplier: num_samples_per_epoch = epoch_mult * len(train_ids)
+    ap.add_argument("--epoch_mult", type=float, default=1.0)
+
+    # Threshold tuning
+    ap.add_argument("--thr_grid_n", type=int, default=41)
+    ap.add_argument("--thr_tune_limit", type=int, default=1200)  # set 0 to use all val (very slow)
+    ap.add_argument("--beta_f", type=float, default=2.0)         # F2 emphasis (Kaggle metric-like)
+
+    # Postprocess
+    ap.add_argument("--min_area", type=int, default=50)
+
+    # Pretrained backbone (may try download; we handle fallback)
+    ap.add_argument("--pretrained", type=int, default=0)
+
+    # GPU / DP
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--gpu_ids", type=str, default="")  # e.g. "0,1,2,3" to enable DataParallel
+
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+
+    run_name = f"run__deeplabv3__bce_tversky__p7r3__seed{args.seed}__val{int(args.val_frac*100)}__tta1__es"
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+
+    logger, detail = build_loggers(run_dir)
+    logger.info(f"==== START {now_str()} ====")
+    logger.info("Config:")
+    logger.info(json.dumps(vars(args), indent=2))
+
+    # Paths
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    test_img_dir = os.path.join(args.data_dir, "test_v2")
+    csv_path = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+    sub_path = os.path.join(args.data_dir, "sample_submission_v2.csv")
+
+    for p in [train_img_dir, test_img_dir, csv_path, sub_path]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing required path: {p}")
+
+    # Read population
+    logger.info("Loading id2rles from CSV...")
+    id2rles = read_id2rles(csv_path)
+    pos_set = set(id2rles.keys())
+
+    logger.info("Listing ALL train image ids from train_v2 directory (includes ship-negative)...")
+    all_train_ids = list_image_ids_from_dir(train_img_dir)
+    all_set = set(all_train_ids)
+
+    # pos ids in directory
+    pos_ids = [i for i in all_train_ids if i in pos_set]
+    # neg ids = all - pos_set
+    neg_ids = [i for i in all_train_ids if i not in pos_set]
+
+    logger.info(f"Total train_v2 images: {len(all_train_ids)}")
+    logger.info(f"Pos images (ship-positive): {len(pos_ids)}")
+    logger.info(f"Neg images (ship-negative): {len(neg_ids)}")
+
+    if len(pos_ids) == 0 or len(neg_ids) == 0:
+        raise RuntimeError("pos_ids or neg_ids is empty; dataset parsing failed.")
+
+    # Build val split (15% of pos; neg scaled to keep pos:neg = 7:3)
+    rng = random.Random(args.seed)
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    val_pos_n = int(round(len(pos_ids) * args.val_frac))
+    val_pos_n = max(1, min(val_pos_n, len(pos_ids)))
+
+    # keep ratio: neg = pos * (1-pos_frac)/pos_frac
+    val_neg_n = int(round(val_pos_n * (1.0 - args.pos_frac) / args.pos_frac))
+    val_neg_n = max(1, min(val_neg_n, len(neg_ids)))
+
+    val_pos_ids = pos_ids[:val_pos_n]
+    val_neg_ids = neg_ids[:val_neg_n]
+
+    train_pos_ids = pos_ids[val_pos_n:]
+    train_neg_ids = neg_ids[val_neg_n:]
+
+    logger.info(f"VAL split: pos={len(val_pos_ids)} neg={len(val_neg_ids)} (target pos_frac={args.pos_frac:.2f})")
+    logger.info(f"TRAIN pool: pos={len(train_pos_ids)} neg={len(train_neg_ids)}")
+
+    # Build train lists
+    train_ids = train_pos_ids + train_neg_ids
+    train_is_pos = [True] * len(train_pos_ids) + [False] * len(train_neg_ids)
+
+    # WeightedRandomSampler to enforce 7:3 as sampling distribution
+    pos_w = args.pos_frac / max(1, len(train_pos_ids))
+    neg_w = (1.0 - args.pos_frac) / max(1, len(train_neg_ids))
+    weights = [pos_w if flag else neg_w for flag in train_is_pos]
+
+    # Number of samples per epoch
+    num_samples_per_epoch = int(round(args.epoch_mult * len(train_ids)))
+    num_samples_per_epoch = max(1, num_samples_per_epoch)
+    sampler = WeightedRandomSampler(weights=weights, num_samples=num_samples_per_epoch, replacement=True)
+
+    # Val dataset lists
+    val_ids = val_pos_ids + val_neg_ids
+    val_is_pos = [True] * len(val_pos_ids) + [False] * len(val_neg_ids)
+
+    # Aug configs
+    aug_pos = AugConfig(
+        p_hflip=0.5, p_vflip=0.5, p_rot90=0.7,
+        p_color_jitter=0.9, brightness=0.18, contrast=0.18, saturation=0.12, hue=0.02,
+        p_gamma=0.6, gamma_min=0.85, gamma_max=1.15,
+        p_noise=0.35, noise_std=0.02
+    )
+    # Neg: keep mild to avoid teaching FP-y patterns
+    aug_neg = AugConfig(
+        p_hflip=0.5, p_vflip=0.5, p_rot90=0.5,
+        p_color_jitter=0.2, brightness=0.05, contrast=0.05, saturation=0.03, hue=0.0,
+        p_gamma=0.2, gamma_min=0.95, gamma_max=1.05,
+        p_noise=0.10, noise_std=0.01
+    )
+
+    logger.info("Building datasets...")
+    train_ds = AirbusSegDataset(
+        data_dir=args.data_dir,
+        ids=train_ids,
+        is_pos_flags=train_is_pos,
+        id2rles=id2rles,
+        train=True,
+        size=args.train_size,
+        aug_pos=aug_pos,
+        aug_neg=aug_neg,
+        decode_shape=(768, 768),
+    )
+    val_ds_eval = AirbusSegDataset(
+        data_dir=args.data_dir,
+        ids=val_ids,
+        is_pos_flags=val_is_pos,
+        id2rles=id2rles,
+        train=False,
+        size=args.train_size,   # evaluate at train_size to match training dynamics
+        aug_pos=aug_pos,
+        aug_neg=aug_neg,
+        decode_shape=(768, 768),
+    )
+    # For threshold tuning, use the same val dataset (train_size)
+    val_ds_thr = val_ds_eval
+
+    logger.info("Building dataloaders...")
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_train,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds_eval,
+        batch_size=args.batch_eval,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    # Device
+    if args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    logger.info(f"Device: {device}")
+
+    # Model
+    logger.info("Building model...")
+    model = DeepLabV3Binary(pretrained=bool(args.pretrained))
+    model = model.to(device)
+
+    # DataParallel if requested
+    use_dp = False
+    if args.gpu_ids.strip() != "" and device.type == "cuda":
+        gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip() != ""]
+        if len(gpu_ids) >= 2:
+            logger.info(f"Enabling DataParallel on GPUs: {gpu_ids}")
+            model = nn.DataParallel(model, device_ids=gpu_ids)
+            use_dp = True
+
+    # Loss
+    # pos_weight for BCE can help extreme pixel imbalance; estimate roughly by a conservative constant
+    # (Your previous pipelines often used clipping around 50)
+    pos_weight = torch.tensor([50.0], device=device)
+    bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    tversky = TverskyLoss(alpha=args.alpha, beta=args.beta, eps=1e-6)
+
+    # Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Training loop with Early Stopping on val soft-Tversky
+    best_epoch = -1
+    best_val_tv = -1.0
+    best_path = os.path.join(run_dir, "best_model.pt")
+
+    epochs_no_improve = 0
+
+    logger.info("==== TRAIN START ====")
+    for epoch in range(1, args.max_epochs + 1):
+        model.train()
+        t0 = time.time()
+
+        running_loss = 0.0
+        running_bce = 0.0
+        running_tv_loss = 0.0
+
+        # We'll log some steps for diagnostics
+        for step, (img, mask) in enumerate(train_loader, start=1):
+            img = img.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = model(img)
+            probs = torch.sigmoid(logits)
+
+            bce = bce_loss(logits, mask)
+            tv_loss, _tv = tversky(probs, mask)
+            loss = bce + args.tversky_lambda * tv_loss
+
+            # NaN/Inf guard
+            if not torch.isfinite(loss):
+                detail.info(f"[NaN/Inf] epoch={epoch} step={step} loss={loss.item()} bce={bce.item()} tv_loss={tv_loss.item()}")
+                # Skip this batch to avoid killing training
+                continue
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += float(loss.item())
+            running_bce += float(bce.item())
+            running_tv_loss += float(tv_loss.item())
+
+            if step % 200 == 0:
+                detail.info(f"[TRAIN] epoch={epoch} step={step} loss={loss.item():.6f} bce={bce.item():.6f} tv_loss={tv_loss.item():.6f}")
+
+        # Train epoch summary
+        steps_done = max(1, step)
+        train_loss = running_loss / steps_done
+        train_bce = running_bce / steps_done
+        train_tv_loss = running_tv_loss / steps_done
+
+        # Val eval (TTA mandatory)
+        val_metrics = eval_soft_tversky(
+            model=model,
+            loader=val_loader,
+            device=device,
+            tversky_loss=tversky,
+            bce_loss=bce_loss,
+            use_tta=True,
+            log_detail=detail,
+            max_batches=0,
+        )
+        val_tv = val_metrics["val_soft_tversky"]
+        dt = time.time() - t0
+
+        logger.info(
+            f"[EPOCH {epoch:03d}] "
+            f"train_loss={train_loss:.6f} (bce={train_bce:.6f}, tv={train_tv_loss:.6f) } "
+            f"val_loss={val_metrics['val_loss']:.6f} "
+            f"val_soft_tv={val_tv:.6f} "
+            f"time={dt:.1f}s"
+        )
+
+        # Early stopping check
+        improved = val_tv > best_val_tv + 1e-6
+        if improved:
+            best_val_tv = val_tv
+            best_epoch = epoch
+            epochs_no_improve = 0
+
+            # Save best weights
+            state = model.module.state_dict() if use_dp else model.state_dict()
+            torch.save(state, best_path)
+            logger.info(f"  -> New BEST: val_soft_tv={best_val_tv:.6f} @ epoch={best_epoch}, saved={best_path}")
+        else:
+            epochs_no_improve += 1
+            logger.info(f"  -> No improve. patience={epochs_no_improve}/{args.patience}")
+
+        if epochs_no_improve >= args.patience:
+            logger.info("==== EARLY STOPPING TRIGGERED ====")
+            break
+
+    # Load best model for tuning/inference
+    logger.info(f"Loading best model: {best_path}")
+    state = torch.load(best_path, map_location=device)
+    if use_dp:
+        model.module.load_state_dict(state)
+    else:
+        model.load_state_dict(state)
+
+    # Threshold tuning (TTA mandatory)
+    logger.info("==== THRESHOLD TUNING (pixel F_beta with histogram) ====")
+    best_thr = tune_threshold_hist(
+        model=model,
+        dataset=val_ds_thr,
+        device=device,
+        thr_grid_n=args.thr_grid_n,
+        beta_f=args.beta_f,
+        tune_limit=args.thr_tune_limit,
+        use_tta=True,
+        log=logger,
+    )
+
+    # Inference on test_v2 and submission generation
+    logger.info("==== TEST INFERENCE + SUBMISSION ====")
+    # Read sample_submission_v2.csv to preserve ordering
+    sub_ids: List[str] = []
+    with open(sub_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None or len(header) < 2:
+            raise RuntimeError("Invalid sample_submission_v2.csv header.")
+        for row in reader:
+            if not row:
+                continue
+            sub_ids.append(row[0])
+
+    logger.info(f"Submission template rows: {len(sub_ids)}")
+
+    # Build inference helper: preprocess test image to infer_size and normalize
+    def load_test_img_tensor(image_id: str, size: int) -> torch.Tensor:
+        p = os.path.join(test_img_dir, image_id)
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"Missing test image: {p}")
+        img = Image.open(p).convert("RGB")
+        img = img.resize((size, size), resample=Image.BILINEAR)
+        t = TF.to_tensor(img)
+        t = TF.normalize(t, IMAGENET_MEAN, IMAGENET_STD)
+        return t.unsqueeze(0)  # (1,3,H,W)
+
+    submission_rows: List[Tuple[str, str]] = []
+    for i, image_id in enumerate(sub_ids):
+        img_t = load_test_img_tensor(image_id, size=args.infer_size)
+
+        prob = predict_prob_tta_flip4(model, img_t, device=device)  # (1,1,H,W)
+        prob_np = prob.detach().cpu().numpy()[0, 0]  # (H,W)
+
+        pred = (prob_np >= best_thr).astype(np.uint8)
+
+        # postprocess: remove small components
+        pred = remove_small_components(pred, min_area=args.min_area)
+
+        enc = rle_encode(pred)
+        submission_rows.append((image_id, enc))
+
+        if (i + 1) % 500 == 0:
+            logger.info(f"[INFER] {i+1}/{len(sub_ids)} done")
+
+    sub_out = os.path.join(run_dir, "submission.csv")
+    with open(sub_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for image_id, enc in submission_rows:
+            w.writerow([image_id, enc])
+
+    logger.info(f"submission.csv written: {sub_out}")
+
+    # Save meta + splits
+    meta = {
+        "started_at": now_str(),
+        "run_dir": run_dir,
+        "best_model_path": best_path,
+        "best_epoch": best_epoch,
+        "best_val_soft_tversky": best_val_tv,
+        "best_thr": best_thr,
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "pos_frac_sampling": args.pos_frac,
+        "val_frac": args.val_frac,
+        "num_samples_per_epoch": num_samples_per_epoch,
+        "thr_grid_n": args.thr_grid_n,
+        "thr_tune_limit": args.thr_tune_limit,
+        "infer_size": args.infer_size,
+        "train_size": args.train_size,
+        "min_area": args.min_area,
+        "tta": "flip4",
+        "notes": "Train sampling uses WeightedRandomSampler with replacement to enforce pos:neg=7:3 without discarding negatives.",
+        "args": vars(args),
+    }
+    save_json(os.path.join(run_dir, "meta.json"), meta)
+
+    splits = {
+        "seed": args.seed,
+        "val_pos_n": len(val_pos_ids),
+        "val_neg_n": len(val_neg_ids),
+        "train_pos_n": len(train_pos_ids),
+        "train_neg_n": len(train_neg_ids),
+        "val_pos_ids": val_pos_ids,
+        "val_neg_ids": val_neg_ids,
+        # train ids may be huge; we store counts + seed, not the entire list.
+    }
+    save_json(os.path.join(run_dir, "splits.json"), splits)
+
+    logger.info("==== DONE ====")
+    logger.info(f"BEST MODEL PATH: {best_path}")
+    logger.info(f"SUBMISSION PATH: {sub_out}")
+
+
+if __name__ == "__main__":
+    main()
