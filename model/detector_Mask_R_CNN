@@ -1,0 +1,1493 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_maskrcnn_detector_gated_airbus_hades.py
+
+Airbus Ship Detection (hades / Docker) — Detector-gated Mask R-CNN training + inference pipeline.
+
+Design goals (your requirements):
+- Detector is FIXED: classify ship-present/absent, and ONLY ship-present images are used for Mask R-CNN training.
+- Same flow for inference: detector gating -> (if positive) instance segmentation inference.
+- MUST include TTA and Early Stopping.
+- Mask loss MUST be BCE + Tversky (implemented by patching torchvision's maskrcnn_loss).
+- Small-object friendly settings:
+  * smaller anchors (default includes 8,16,...)
+  * multi-scale training (train_scales)
+  * enlarge mask crop (mask roi pool output_size=28 -> usually yields 56 output after deconv)
+- Threshold tuning on VAL for (score_thr, mask_thr) via F2 on union masks (pixel-level proxy).
+- Visualization outputs (PNG):
+  raw image, union mask, instance overlay, contours.
+- Submission:
+  variable-row, instance-per-row RLE (ImageId duplicates allowed).
+  If no prediction, write exactly one row with empty EncodedPixels.
+
+Expected data layout under --data_dir:
+  train_v2/
+  test_v2/
+  train_ship_segmentations_v2.csv
+  sample_submission_v2.csv
+
+Run artifacts under:
+  --out_dir/<run_name>/
+    best_model.pt
+    last_model.pt
+    det_cache.json
+    splits.json
+    threshold_tuning.json
+    submission.csv
+    logs/
+    vis_val/
+    vis_test/
+
+Notes:
+- FP32 only (no AMP).
+- Robust path checks and helpful errors.
+"""
+
+import os
+import re
+import json
+import time
+import math
+import random
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+import torchvision
+from torchvision.ops import nms
+from torchvision.transforms import functional as F
+from torchvision.models.detection import MaskRCNN
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.models.detection.roi_heads import project_masks_on_boxes
+from torchvision.models.detection import roi_heads as tv_roi_heads
+from torchvision.models.detection.roi_heads import paste_masks_in_image
+from torchvision.ops import MultiScaleRoIAlign
+
+from PIL import Image, ImageDraw
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def log_line(fp, s: str) -> None:
+    fp.write(s.rstrip() + "\n")
+    fp.flush()
+
+def human_time(sec: float) -> str:
+    sec = float(sec)
+    if sec < 60:
+        return f"{sec:.1f}s"
+    m = int(sec // 60)
+    s = sec - 60*m
+    if m < 60:
+        return f"{m}m{s:.0f}s"
+    h = int(m // 60)
+    m2 = m - 60*h
+    return f"{h}h{m2}m"
+
+def safe_load_image(path: str) -> Image.Image:
+    # RGB
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+    return im
+
+# ----------------------------
+# RLE encode/decode (Airbus)
+# ----------------------------
+
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Kaggle Airbus RLE:
+    - 1-indexed starts
+    - column-major (Fortran order)
+    shape = (H, W)
+    """
+    h, w = shape
+    mask = np.zeros(h * w, dtype=np.uint8)
+    rle = rle.strip()
+    if rle == "" or rle.lower() == "nan":
+        return mask.reshape((h, w), order="F")
+
+    s = rle.split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    for lo, hi in zip(starts, ends):
+        if lo < 0:
+            lo = 0
+        if hi > mask.size:
+            hi = mask.size
+        mask[lo:hi] = 1
+    return mask.reshape((h, w), order="F")
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: HxW, {0,1}
+    Airbus expects column-major flatten.
+    """
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() == 0:
+        return ""
+    pixels = mask.reshape(-1, order="F")
+    # pad zeros
+    pads = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pads[1:] != pads[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+# ----------------------------
+# Detector (EfficientNetV2-S binary classifier)
+# ----------------------------
+
+class EffNetV2Detector(nn.Module):
+    def __init__(self, pretrained: bool = False):
+        super().__init__()
+        # Use torchvision efficientnet_v2_s backbone
+        weights = None
+        if pretrained:
+            weights = torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
+        self.model = torchvision.models.efficientnet_v2_s(weights=weights)
+        in_features = self.model.classifier[1].in_features
+        self.model.classifier[1] = nn.Linear(in_features, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+def detector_preprocess_pil(im: Image.Image, size: int = 768) -> torch.Tensor:
+    # resize to size x size, ImageNet normalize
+    im = im.resize((size, size), resample=Image.BILINEAR)
+    x = F.to_tensor(im)  # 0..1
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=x.dtype, device=x.device).view(3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], dtype=x.dtype, device=x.device).view(3, 1, 1)
+    x = (x - mean) / std
+    return x
+
+@torch.no_grad()
+def run_detector_on_paths(
+    det_model: nn.Module,
+    img_paths: List[str],
+    device: torch.device,
+    det_img_size: int,
+    batch: int = 16
+) -> Dict[str, float]:
+    det_model.eval()
+    out: Dict[str, float] = {}
+    n = len(img_paths)
+    for i in range(0, n, batch):
+        sub = img_paths[i:i+batch]
+        xs = []
+        ids = []
+        for p in sub:
+            try:
+                im = safe_load_image(p)
+            except Exception:
+                continue
+            x = detector_preprocess_pil(im, size=det_img_size)
+            xs.append(x)
+            ids.append(Path(p).name)
+        if not xs:
+            continue
+        x = torch.stack(xs, dim=0).to(device)
+        logits = det_model(x)
+        prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+        for k, pr in zip(ids, prob.tolist()):
+            out[k] = float(pr)
+    return out
+
+# ----------------------------
+# Torchvision Mask R-CNN mask loss patch: BCE + Tversky
+# ----------------------------
+
+TVERSKY_ALPHA = 0.60
+TVERSKY_BETA  = 0.40
+TVERSKY_LAMBDA = 1.00
+TVERSKY_EPS = 1e-6
+
+def tversky_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor,
+                             alpha: float, beta: float, eps: float) -> torch.Tensor:
+    """
+    logits: [N, H, W]
+    targets: [N, H, W] float {0,1}
+    """
+    probs = torch.sigmoid(logits)
+    probs = probs.flatten(1)
+    targets = targets.flatten(1)
+
+    tp = (probs * targets).sum(dim=1)
+    fp = (probs * (1.0 - targets)).sum(dim=1)
+    fn = ((1.0 - probs) * targets).sum(dim=1)
+
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return (1.0 - tversky).mean()
+
+def maskrcnn_loss_bce_tversky(
+    mask_logits: torch.Tensor,
+    proposals: List[torch.Tensor],
+    gt_masks: List[torch.Tensor],
+    gt_labels: List[torch.Tensor],
+    pos_matched_idxs: List[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Re-implementation of torchvision roi_heads.maskrcnn_loss with extra Tversky term.
+    This function will be monkey-patched into torchvision.models.detection.roi_heads.maskrcnn_loss
+    """
+    # Collect labels and mask targets for positive proposals
+    labels = []
+    mask_targets = []
+    start = 0
+
+    for proposals_per_image, gt_masks_per_image, gt_labels_per_image, matched_idxs_per_image in zip(
+        proposals, gt_masks, gt_labels, pos_matched_idxs
+    ):
+        num_pos = proposals_per_image.shape[0]
+        if num_pos == 0:
+            continue
+
+        # matched gt indices for these positive proposals
+        if matched_idxs_per_image.numel() == 0:
+            continue
+
+        labels_per_image = gt_labels_per_image[matched_idxs_per_image]  # [num_pos]
+        labels.append(labels_per_image)
+
+        # Project gt masks on the proposal boxes to get fixed-size targets
+        # project_masks_on_boxes expects gt_masks as [num_instances, H, W] uint8
+        # and boxes as [num_pos, 4] float
+        gt_masks_per_image = gt_masks_per_image.to(dtype=torch.uint8)
+        matched_gt_masks = gt_masks_per_image[matched_idxs_per_image]  # [num_pos, H, W]
+        # NOTE: project_masks_on_boxes expects boxes in (x1,y1,x2,y2) and returns [num_pos, M, M]
+        projected = project_masks_on_boxes(matched_gt_masks, proposals_per_image, mask_logits.shape[-1])
+        mask_targets.append(projected)
+
+        start += num_pos
+
+    if len(labels) == 0:
+        return mask_logits.sum() * 0.0
+
+    labels = torch.cat(labels, dim=0)  # [sum_pos]
+    mask_targets = torch.cat(mask_targets, dim=0)  # [sum_pos, M, M]
+
+    # select logits corresponding to the class label (ship=1)
+    # mask_logits: [sum_pos, num_classes, M, M]
+    idx = torch.arange(mask_logits.shape[0], device=mask_logits.device)
+    # clamp label to valid range
+    labels = labels.clamp(min=0, max=mask_logits.shape[1]-1)
+    logits = mask_logits[idx, labels]  # [sum_pos, M, M]
+
+    # BCEWithLogits for mask
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits, mask_targets.to(dtype=logits.dtype), reduction="mean"
+    )
+
+    # Tversky (on sigmoid probs)
+    tv = tversky_loss_from_logits(
+        logits, mask_targets.to(dtype=logits.dtype),
+        alpha=TVERSKY_ALPHA, beta=TVERSKY_BETA, eps=TVERSKY_EPS
+    )
+
+    return bce + (TVERSKY_LAMBDA * tv)
+
+def patch_torchvision_mask_loss(alpha: float, beta: float, lamb: float) -> None:
+    global TVERSKY_ALPHA, TVERSKY_BETA, TVERSKY_LAMBDA
+    TVERSKY_ALPHA = float(alpha)
+    TVERSKY_BETA  = float(beta)
+    TVERSKY_LAMBDA = float(lamb)
+    tv_roi_heads.maskrcnn_loss = maskrcnn_loss_bce_tversky
+
+# ----------------------------
+# Dataset (instance targets from RLE)
+# ----------------------------
+
+def build_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    df = pd.read_csv(csv_path)
+    id2rles: Dict[str, List[str]] = {}
+    for image_id, enc in zip(df["ImageId"].values.tolist(), df["EncodedPixels"].values.tolist()):
+        if isinstance(enc, float) and math.isnan(enc):
+            continue
+        if enc is None:
+            continue
+        s = str(enc)
+        if s.strip() == "" or s.lower() == "nan":
+            continue
+        id2rles.setdefault(image_id, []).append(s)
+    return id2rles
+
+def masks_to_boxes_np(masks: np.ndarray) -> np.ndarray:
+    """
+    masks: [N,H,W] uint8
+    returns boxes: [N,4] float32 in x1,y1,x2,y2
+    """
+    boxes = []
+    for m in masks:
+        ys, xs = np.where(m > 0)
+        if len(xs) == 0:
+            boxes.append([0,0,1,1])
+            continue
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        boxes.append([x1, y1, x2+1, y2+1])
+    return np.asarray(boxes, dtype=np.float32)
+
+class AirbusInstanceDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        image_ids: List[str],
+        id2rles: Dict[str, List[str]],
+        transforms=None,
+        img_size: int = 768,
+        return_empty: bool = False,
+    ):
+        self.img_dir = img_dir
+        self.image_ids = image_ids
+        self.id2rles = id2rles
+        self.transforms = transforms
+        self.img_size = img_size
+        self.return_empty = return_empty
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+    def __getitem__(self, idx: int):
+        image_id = self.image_ids[idx]
+        path = os.path.join(self.img_dir, image_id)
+        im = safe_load_image(path)  # PIL RGB
+        w, h = im.size
+        # Airbus should be 768x768
+        if (h, w) != (self.img_size, self.img_size):
+            im = im.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
+            w, h = self.img_size, self.img_size
+
+        rles = self.id2rles.get(image_id, [])
+        masks = []
+        for rle in rles:
+            m = rle_decode(rle, (h, w))
+            if m.max() > 0:
+                masks.append(m)
+        if len(masks) == 0:
+            if not self.return_empty:
+                # empty sample (no target)
+                masks_np = np.zeros((0, h, w), dtype=np.uint8)
+            else:
+                masks_np = np.zeros((0, h, w), dtype=np.uint8)
+        else:
+            masks_np = np.stack(masks, axis=0).astype(np.uint8)
+
+        boxes_np = masks_to_boxes_np(masks_np) if masks_np.shape[0] > 0 else np.zeros((0,4), dtype=np.float32)
+
+        # Torch target dict
+        target: Dict[str, torch.Tensor] = {}
+        target["boxes"] = torch.as_tensor(boxes_np, dtype=torch.float32)
+        target["labels"] = torch.ones((boxes_np.shape[0],), dtype=torch.int64)  # ship=1
+        target["masks"] = torch.as_tensor(masks_np, dtype=torch.uint8)
+        target["image_id"] = torch.tensor([idx], dtype=torch.int64)
+        if boxes_np.shape[0] > 0:
+            area = (target["boxes"][:, 3] - target["boxes"][:, 1]) * (target["boxes"][:, 2] - target["boxes"][:, 0])
+        else:
+            area = torch.zeros((0,), dtype=torch.float32)
+        target["area"] = area
+        target["iscrowd"] = torch.zeros((boxes_np.shape[0],), dtype=torch.int64)
+
+        if self.transforms is not None:
+            im, target = self.transforms(im, target)
+
+        x = F.to_tensor(im)  # 0..1 float
+        return x, target, image_id
+
+def collate_fn(batch):
+    xs, targets, ids = zip(*batch)
+    return list(xs), list(targets), list(ids)
+
+# ----------------------------
+# Transforms (safe & simple)
+# ----------------------------
+
+class Compose:
+    def __init__(self, ts):
+        self.ts = ts
+
+    def __call__(self, img, target):
+        for t in self.ts:
+            img, target = t(img, target)
+        return img, target
+
+class RandomHFlip:
+    def __init__(self, p=0.5):
+        self.p = float(p)
+
+    def __call__(self, img, target):
+        if random.random() > self.p:
+            return img, target
+        img = F.hflip(img)
+        if target["masks"].numel() > 0:
+            masks = target["masks"].numpy()
+            masks = masks[:, :, ::-1].copy()
+            target["masks"] = torch.as_tensor(masks, dtype=torch.uint8)
+            boxes_np = masks_to_boxes_np(masks)
+            target["boxes"] = torch.as_tensor(boxes_np, dtype=torch.float32)
+        return img, target
+
+class RandomVFlip:
+    def __init__(self, p=0.5):
+        self.p = float(p)
+
+    def __call__(self, img, target):
+        if random.random() > self.p:
+            return img, target
+        img = F.vflip(img)
+        if target["masks"].numel() > 0:
+            masks = target["masks"].numpy()
+            masks = masks[:, ::-1, :].copy()
+            target["masks"] = torch.as_tensor(masks, dtype=torch.uint8)
+            boxes_np = masks_to_boxes_np(masks)
+            target["boxes"] = torch.as_tensor(boxes_np, dtype=torch.float32)
+        return img, target
+
+class RandomResizeSquare:
+    def __init__(self, sizes: List[int]):
+        self.sizes = [int(s) for s in sizes]
+
+    def __call__(self, img, target):
+        size = random.choice(self.sizes)
+        if img.size[0] == size and img.size[1] == size:
+            return img, target
+        img = img.resize((size, size), resample=Image.BILINEAR)
+        if target["masks"].numel() > 0:
+            masks = target["masks"].numpy()
+            # resize each mask with NEAREST
+            resized = []
+            for m in masks:
+                mm = Image.fromarray(m * 255)
+                mm = mm.resize((size, size), resample=Image.NEAREST)
+                resized.append((np.array(mm) > 127).astype(np.uint8))
+            masks2 = np.stack(resized, axis=0).astype(np.uint8)
+            target["masks"] = torch.as_tensor(masks2, dtype=torch.uint8)
+            boxes_np = masks_to_boxes_np(masks2)
+            target["boxes"] = torch.as_tensor(boxes_np, dtype=torch.float32)
+        return img, target
+
+# ----------------------------
+# Model builder (Mask R-CNN small object friendly)
+# ----------------------------
+
+def build_maskrcnn(num_classes: int,
+                   anchor_sizes: List[int],
+                   mask_roi_out: int,
+                   pretrained: int = 1) -> MaskRCNN:
+    """
+    - num_classes includes background.
+    - anchor_sizes: e.g. [8,16,32,64,128] for small objects.
+    - mask_roi_out: output_size for mask roi pool. Default 14; using 28 usually yields 56 after deconv.
+    """
+    # Patch mask loss (BCE + Tversky) BEFORE building model
+    # done outside via patch_torchvision_mask_loss()
+
+    weights = None
+    weights_backbone = None
+    if int(pretrained) == 1:
+        weights = torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.COCO_V1
+        weights_backbone = None
+
+    # Anchor generator for FPN: provide tuple per level
+    # torchvision expects sizes as Tuple[Tuple[int,...], ...] with one tuple per FPN level.
+    # We map roughly to 5 FPN levels (P2-P6).
+    s = [int(x) for x in anchor_sizes]
+    sizes = (tuple(s), tuple(s), tuple(s), tuple(s), tuple(s))
+    aspect_ratios = ((0.5, 1.0, 2.0),) * len(sizes)
+    anchor_gen = AnchorGenerator(sizes=sizes, aspect_ratios=aspect_ratios)
+
+    # Build base model
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+        weights=weights,
+        weights_backbone=weights_backbone,
+        num_classes=None,  # will replace predictors below
+        rpn_anchor_generator=anchor_gen,
+    )
+
+    # Replace box predictor
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # Replace mask predictor
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden, num_classes)
+
+    # Enlarge mask ROI pool output_size (14->mask_roi_out)
+    # default: output_size=14 => output 28
+    # set output_size=28 => output 56 (similar to 10th solution idea)
+    model.roi_heads.mask_roi_pool = MultiScaleRoIAlign(
+        featmap_names=["0", "1", "2", "3"],
+        output_size=int(mask_roi_out),
+        sampling_ratio=2
+    )
+
+    # Small-object friendly RPN / RCNN knobs (recall-oriented)
+    model.rpn.pre_nms_top_n_train = 4000
+    model.rpn.post_nms_top_n_train = 2000
+    model.rpn.pre_nms_top_n_test = 3000
+    model.rpn.post_nms_top_n_test = 1500
+    model.rpn.nms_thresh = 0.8
+
+    model.roi_heads.detections_per_img = 400
+    model.roi_heads.nms_thresh = 0.6
+    # score_thresh is used in postprocess; we will override per-inference thresholds anyway
+
+    return model
+
+# ----------------------------
+# TTA (flip4)
+# ----------------------------
+
+def apply_flip_boxes(boxes: torch.Tensor, H: int, W: int, hflip: bool, vflip: bool) -> torch.Tensor:
+    b = boxes.clone()
+    if hflip:
+        x1 = b[:, 0].clone()
+        x2 = b[:, 2].clone()
+        b[:, 0] = W - x2
+        b[:, 2] = W - x1
+    if vflip:
+        y1 = b[:, 1].clone()
+        y2 = b[:, 3].clone()
+        b[:, 1] = H - y2
+        b[:, 3] = H - y1
+    return b
+
+def apply_flip_masks(masks: torch.Tensor, hflip: bool, vflip: bool) -> torch.Tensor:
+    # masks: [N,1,H,W]
+    m = masks
+    if hflip:
+        m = torch.flip(m, dims=[3])
+    if vflip:
+        m = torch.flip(m, dims=[2])
+    return m
+
+@torch.no_grad()
+def predict_with_tta_flip4(model: nn.Module, x: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
+    """
+    x: [3,H,W] 0..1
+    Returns concatenated predictions across flip4, mapped back to original orientation.
+    """
+    model.eval()
+    H, W = x.shape[1], x.shape[2]
+
+    variants = [
+        (False, False),  # none
+        (True,  False),  # h
+        (False, True),   # v
+        (True,  True),   # hv
+    ]
+
+    all_boxes = []
+    all_scores = []
+    all_masks = []
+
+    for hf, vf in variants:
+        xx = x
+        if hf:
+            xx = torch.flip(xx, dims=[2])
+        if vf:
+            xx = torch.flip(xx, dims=[1])
+
+        preds = model([xx.to(device)])[0]
+        boxes = preds["boxes"].detach().cpu()
+        scores = preds["scores"].detach().cpu()
+        masks = preds["masks"].detach().cpu()  # [N,1,H,W] in 0..1
+
+        # map back
+        boxes2 = apply_flip_boxes(boxes, H, W, hflip=hf, vflip=vf)
+        masks2 = apply_flip_masks(masks, hflip=hf, vflip=vf)
+
+        all_boxes.append(boxes2)
+        all_scores.append(scores)
+        all_masks.append(masks2)
+
+    if len(all_boxes) == 0:
+        return {"boxes": torch.zeros((0,4)), "scores": torch.zeros((0,)), "masks": torch.zeros((0,1,H,W))}
+
+    boxes = torch.cat(all_boxes, dim=0)
+    scores = torch.cat(all_scores, dim=0)
+    masks = torch.cat(all_masks, dim=0)
+    return {"boxes": boxes, "scores": scores, "masks": masks}
+
+def mask_iou(a: torch.Tensor, b: torch.Tensor) -> float:
+    # a,b: [H,W] uint8 {0,1}
+    inter = (a & b).sum().item()
+    union = (a | b).sum().item()
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
+
+def dedup_instances_by_mask_iou(
+    scores: torch.Tensor,
+    masks_bin: torch.Tensor,
+    iou_thr: float = 0.5
+) -> List[int]:
+    """
+    scores: [N]
+    masks_bin: [N,H,W] uint8 {0,1}
+    returns indices to keep (greedy)
+    """
+    if scores.numel() == 0:
+        return []
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+    for idx in order.tolist():
+        m = masks_bin[idx]
+        ok = True
+        for j in keep:
+            if mask_iou(m, masks_bin[j]) >= iou_thr:
+                ok = False
+                break
+        if ok:
+            keep.append(idx)
+    return keep
+
+# ----------------------------
+# Metrics for tuning (pixel-level union proxy)
+# ----------------------------
+
+def fbeta_from_counts(tp: int, fp: int, fn: int, beta: float = 2.0) -> float:
+    beta2 = beta * beta
+    denom = (1 + beta2) * tp + beta2 * fn + fp
+    if denom == 0:
+        return 0.0
+    return float((1 + beta2) * tp) / float(denom)
+
+def union_mask_from_pred(pred_masks: np.ndarray) -> np.ndarray:
+    # pred_masks: [K,H,W] uint8
+    if pred_masks.shape[0] == 0:
+        return np.zeros(pred_masks.shape[1:], dtype=np.uint8)
+    return (pred_masks.max(axis=0) > 0).astype(np.uint8)
+
+def union_mask_from_gt_rles(rles: List[str], shape: Tuple[int,int]) -> np.ndarray:
+    if len(rles) == 0:
+        return np.zeros(shape, dtype=np.uint8)
+    ms = []
+    for r in rles:
+        m = rle_decode(r, shape)
+        ms.append(m)
+    mm = np.stack(ms, axis=0)
+    return (mm.max(axis=0) > 0).astype(np.uint8)
+
+def compute_pixel_counts(pred: np.ndarray, gt: np.ndarray) -> Tuple[int,int,int]:
+    # pred,gt: uint8 {0,1}
+    tp = int(((pred == 1) & (gt == 1)).sum())
+    fp = int(((pred == 1) & (gt == 0)).sum())
+    fn = int(((pred == 0) & (gt == 1)).sum())
+    return tp, fp, fn
+
+# ----------------------------
+# Visualization
+# ----------------------------
+
+def rand_color(i: int) -> Tuple[int,int,int]:
+    # deterministic-ish palette
+    random.seed(i * 99991 + 7)
+    return (random.randint(30,255), random.randint(30,255), random.randint(30,255))
+
+def overlay_instances_on_image(im: Image.Image, masks_bin: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    """
+    masks_bin: [K,H,W] uint8
+    """
+    if masks_bin.shape[0] == 0:
+        return im
+    im = im.convert("RGBA")
+    H, W = masks_bin.shape[1], masks_bin.shape[2]
+    overlay = Image.new("RGBA", (W, H), (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
+
+    for k in range(masks_bin.shape[0]):
+        col = rand_color(k)
+        # draw mask as pixels: faster with numpy alpha composite
+        m = masks_bin[k]
+        if m.max() == 0:
+            continue
+        # Create a colored layer
+        layer = Image.new("RGBA", (W, H), (col[0], col[1], col[2], int(255*alpha)))
+        # Create mask image
+        mm = Image.fromarray((m * 255).astype(np.uint8), mode="L")
+        overlay = Image.composite(layer, overlay, mm)
+
+    out = Image.alpha_composite(im, overlay).convert("RGB")
+    return out
+
+def draw_union_contours(im: Image.Image, union_mask: np.ndarray) -> Image.Image:
+    """
+    Draw simple contours by edge detection on union mask.
+    Pure PIL fallback: draw boundary pixels.
+    """
+    H, W = union_mask.shape
+    m = union_mask.astype(np.uint8)
+    # boundary pixels: 4-neighborhood
+    boundary = np.zeros_like(m)
+    boundary[1:-1,1:-1] = (
+        (m[1:-1,1:-1] == 1) &
+        (
+            (m[1:-1,0:-2] == 0) |
+            (m[1:-1,2:] == 0) |
+            (m[0:-2,1:-1] == 0) |
+            (m[2:,1:-1] == 0)
+        )
+    ).astype(np.uint8)
+    im2 = im.copy().convert("RGB")
+    pix = im2.load()
+    for y in range(H):
+        for x in range(W):
+            if boundary[y,x] == 1:
+                pix[x,y] = (255, 0, 0)
+    return im2
+
+# ----------------------------
+# Early stopping
+# ----------------------------
+
+@dataclass
+class EarlyStopper:
+    patience: int
+    best: float = float("inf")
+    bad_epochs: int = 0
+    best_epoch: int = -1
+
+    def step(self, metric: float, epoch: int) -> bool:
+        """
+        metric: lower is better
+        returns True if should stop
+        """
+        if metric < self.best - 1e-8:
+            self.best = metric
+            self.bad_epochs = 0
+            self.best_epoch = epoch
+            return False
+        else:
+            self.bad_epochs += 1
+            return self.bad_epochs >= self.patience
+
+# ----------------------------
+# Path resolver
+# ----------------------------
+
+def resolve_data_dir(data_dir: str) -> str:
+    """
+    Robustly find train_v2/test_v2/csv under given data_dir or common alternatives.
+    """
+    cand = []
+    data_dir = os.path.abspath(data_dir)
+    cand.append(data_dir)
+    cand.append(os.getcwd())
+    cand.append(os.path.dirname(os.path.abspath(__file__)))
+    cand.append(os.path.abspath(os.path.join(data_dir, "..")))
+    cand.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+
+    def ok(p):
+        return (
+            os.path.isdir(os.path.join(p, "train_v2")) and
+            os.path.isdir(os.path.join(p, "test_v2")) and
+            os.path.isfile(os.path.join(p, "train_ship_segmentations_v2.csv")) and
+            os.path.isfile(os.path.join(p, "sample_submission_v2.csv"))
+        )
+
+    for p in cand:
+        if ok(p):
+            return p
+    # final: search one level deep
+    for p in cand:
+        try:
+            for q in os.listdir(p):
+                qq = os.path.join(p, q)
+                if os.path.isdir(qq) and ok(qq):
+                    return qq
+        except Exception:
+            pass
+
+    raise FileNotFoundError(
+        "Could not resolve data_dir. Expected train_v2/, test_v2/, "
+        "train_ship_segmentations_v2.csv, sample_submission_v2.csv under data_dir.\n"
+        f"Tried: {cand}"
+    )
+
+# ----------------------------
+# Threshold tuning
+# ----------------------------
+
+@torch.no_grad()
+def cache_val_predictions(
+    model: nn.Module,
+    det_model: nn.Module,
+    val_ids: List[str],
+    data_dir: str,
+    id2rles: Dict[str, List[str]],
+    det_probs: Dict[str, float],
+    det_thr: float,
+    device: torch.device,
+    tta: int,
+    score_keep_max: int = 800,
+) -> Dict[str, Any]:
+    """
+    Cache raw predictions for val images (for fast grid search).
+    Stores scores and masks probs.
+    """
+    model.eval()
+    det_model.eval()
+    train_dir = os.path.join(data_dir, "train_v2")
+    cache: Dict[str, Any] = {}
+    for image_id in val_ids:
+        pr = det_probs.get(image_id, 0.0)
+        if pr < det_thr:
+            cache[image_id] = {"scores": [], "masks": []}
+            continue
+        path = os.path.join(train_dir, image_id)
+        im = safe_load_image(path).resize((768,768), resample=Image.BILINEAR)
+        x = F.to_tensor(im)
+        if int(tta) == 1:
+            pred = predict_with_tta_flip4(model, x, device=device)
+        else:
+            pred = model([x.to(device)])[0]
+            pred = {k: v.detach().cpu() for k,v in pred.items()}
+
+        scores = pred["scores"]
+        masks = pred["masks"]  # [N,1,H,W]
+        if scores.numel() > score_keep_max:
+            topk = torch.topk(scores, k=score_keep_max).indices
+            scores = scores[topk]
+            masks = masks[topk]
+
+        cache[image_id] = {
+            "scores": scores.float().cpu().numpy().tolist(),
+            "masks": masks.float().cpu().numpy(),  # large but val limited by tune_limit
+        }
+    return cache
+
+def tune_thresholds_on_val(
+    pred_cache: Dict[str, Any],
+    id2rles: Dict[str, List[str]],
+    score_grid: List[float],
+    mask_grid: List[float],
+    beta: float = 2.0,
+) -> Dict[str, Any]:
+    best = {"score_thr": 0.2, "mask_thr": 0.5, "f2": -1.0}
+    rows = []
+    for sthr in score_grid:
+        for mthr in mask_grid:
+            TP = FP = FN = 0
+            for image_id, item in pred_cache.items():
+                scores = np.asarray(item["scores"], dtype=np.float32)
+                masks = item["masks"]  # [N,1,H,W]
+                if len(scores) == 0 or masks is None or (isinstance(masks, list) and len(masks)==0):
+                    pred_union = np.zeros((768,768), dtype=np.uint8)
+                else:
+                    keep = scores >= sthr
+                    masks2 = masks[keep]  # [K,1,H,W]
+                    if masks2.shape[0] == 0:
+                        pred_union = np.zeros((768,768), dtype=np.uint8)
+                    else:
+                        mb = (masks2[:,0,:,:] >= mthr).astype(np.uint8)
+                        pred_union = union_mask_from_pred(mb)
+                gt_union = union_mask_from_gt_rles(id2rles.get(image_id, []), (768,768))
+                tp, fp, fn = compute_pixel_counts(pred_union, gt_union)
+                TP += tp; FP += fp; FN += fn
+            f2 = fbeta_from_counts(TP, FP, FN, beta=beta)
+            rows.append({"score_thr": float(sthr), "mask_thr": float(mthr), "f2": float(f2)})
+            if f2 > best["f2"]:
+                best = {"score_thr": float(sthr), "mask_thr": float(mthr), "f2": float(f2)}
+    return {"best": best, "grid": rows}
+
+# ----------------------------
+# Inference + submission
+# ----------------------------
+
+def instances_to_rles(
+    scores: torch.Tensor,
+    masks_prob: torch.Tensor,
+    score_thr: float,
+    mask_thr: float,
+    min_area: int,
+    dedup_iou_thr: float,
+) -> List[str]:
+    """
+    scores: [N]
+    masks_prob: [N,1,H,W] float
+    returns list of RLE strings per instance
+    """
+    if scores.numel() == 0:
+        return []
+    keep = scores >= float(score_thr)
+    scores2 = scores[keep]
+    masks2 = masks_prob[keep]
+    if scores2.numel() == 0:
+        return []
+
+    mb = (masks2[:,0,:,:] >= float(mask_thr)).to(torch.uint8)  # [K,H,W]
+    # remove tiny components by area
+    areas = mb.flatten(1).sum(dim=1)
+    keep2 = areas >= int(min_area)
+    scores2 = scores2[keep2]
+    mb = mb[keep2]
+    if scores2.numel() == 0:
+        return []
+
+    # dedup by mask IoU
+    keep_idx = dedup_instances_by_mask_iou(scores2, mb, iou_thr=float(dedup_iou_thr))
+    scores3 = scores2[keep_idx]
+    mb3 = mb[keep_idx]
+
+    rles = []
+    for k in range(mb3.shape[0]):
+        m = mb3[k].cpu().numpy().astype(np.uint8)
+        rles.append(rle_encode(m))
+    return rles
+
+def write_submission_variable_rows(
+    template_csv: str,
+    out_csv: str,
+    id2rles_pred: Dict[str, List[str]],
+) -> None:
+    df = pd.read_csv(template_csv)
+    image_ids = df["ImageId"].values.tolist()
+    rows = []
+    for image_id in image_ids:
+        inst = id2rles_pred.get(image_id, [])
+        if len(inst) == 0:
+            rows.append({"ImageId": image_id, "EncodedPixels": ""})
+        else:
+            for rle in inst:
+                rows.append({"ImageId": image_id, "EncodedPixels": rle})
+    out_df = pd.DataFrame(rows, columns=["ImageId", "EncodedPixels"])
+    out_df.to_csv(out_csv, index=False)
+
+# ----------------------------
+# Train / Val loops
+# ----------------------------
+
+@torch.no_grad()
+def evaluate_val_loss(model: nn.Module, loader, device: torch.device) -> float:
+    """
+    Compute mean total loss on val by running model in train() mode but no_grad (torchvision returns losses only in train mode).
+    """
+    model.train()
+    total = 0.0
+    n = 0
+    for images, targets, _ids in loader:
+        images = [img.to(device) for img in images]
+        # targets must be on device
+        targets2 = []
+        for t in targets:
+            tt = {}
+            for k,v in t.items():
+                tt[k] = v.to(device)
+            targets2.append(tt)
+        loss_dict = model(images, targets2)
+        loss = sum(loss_dict.values()).item()
+        total += float(loss)
+        n += 1
+    model.eval()
+    if n == 0:
+        return float("inf")
+    return total / n
+
+def train_one_epoch(model: nn.Module, loader, optimizer, device: torch.device, logfp, epoch: int,
+                    clip_grad: float = 0.0, log_every: int = 20) -> float:
+    model.train()
+    total = 0.0
+    n = 0
+    t0 = time.time()
+    for step, (images, targets, _ids) in enumerate(loader):
+        images = [img.to(device) for img in images]
+        targets2 = []
+        for t in targets:
+            tt = {}
+            for k,v in t.items():
+                tt[k] = v.to(device)
+            targets2.append(tt)
+
+        loss_dict = model(images, targets2)
+        loss = sum(loss_dict.values())
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if clip_grad and clip_grad > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_grad))
+        optimizer.step()
+
+        lv = float(loss.item())
+        total += lv
+        n += 1
+
+        if (step % log_every) == 0:
+            msg = (f"{now_str()} [TRAIN] epoch={epoch} step={step} "
+                   f"loss={lv:.6f} parts=" +
+                   ",".join([f"{k}={float(v.item()):.6f}" for k,v in loss_dict.items()]))
+            log_line(logfp, msg)
+    dt = time.time() - t0
+    mean = total / max(1, n)
+    log_line(logfp, f"{now_str()} [TRAIN] epoch={epoch} mean_loss={mean:.6f} time={human_time(dt)}")
+    return mean
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def parse_list_int(s: str) -> List[int]:
+    s = str(s).strip()
+    if s == "":
+        return []
+    return [int(x) for x in s.split(",")]
+
+def parse_list_float(s: str) -> List[float]:
+    s = str(s).strip()
+    if s == "":
+        return []
+    return [float(x) for x in s.split(",")]
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--mode", type=str, default="train_infer", choices=["train", "infer", "train_infer"])
+    ap.add_argument("--data_dir", type=str, default=".")
+    ap.add_argument("--out_dir", type=str, required=True)
+    ap.add_argument("--run_name", type=str, default="")
+    ap.add_argument("--seed", type=int, default=42)
+
+    # detector
+    ap.add_argument("--det_ckpt", type=str, required=True)
+    ap.add_argument("--det_thr", type=float, default=0.50)
+    ap.add_argument("--det_img_size", type=int, default=768)
+    ap.add_argument("--det_batch", type=int, default=32)
+    ap.add_argument("--det_cache", type=str, default="")  # optional
+
+    # maskrcnn
+    ap.add_argument("--pretrained", type=int, default=1)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--patience", type=int, default=6)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--clip_grad", type=float, default=0.0)
+    ap.add_argument("--val_frac", type=float, default=0.15)
+
+    ap.add_argument("--train_scales", type=str, default="768,1024,1280")
+    ap.add_argument("--anchor_sizes", type=str, default="8,16,32,64,128")
+    ap.add_argument("--mask_roi_out", type=int, default=28)
+
+    # loss
+    ap.add_argument("--tversky_alpha", type=float, default=0.60)
+    ap.add_argument("--tversky_beta", type=float, default=0.40)
+    ap.add_argument("--tversky_lambda", type=float, default=1.00)
+
+    # inference thresholds (will be overwritten by tuning if enabled)
+    ap.add_argument("--score_thr", type=float, default=0.20)
+    ap.add_argument("--mask_thr", type=float, default=0.50)
+    ap.add_argument("--min_area", type=int, default=30)
+    ap.add_argument("--dedup_iou_thr", type=float, default=0.50)
+
+    # TTA
+    ap.add_argument("--tta", type=int, default=1)
+
+    # tuning
+    ap.add_argument("--tune_score_grid", type=str, default="0.05,0.10,0.15,0.20,0.25,0.30,0.40,0.50")
+    ap.add_argument("--tune_mask_grid", type=str, default="0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60")
+    ap.add_argument("--tune_limit", type=int, default=400)
+
+    # visualization
+    ap.add_argument("--vis_val_n", type=int, default=80)
+    ap.add_argument("--vis_test_n", type=int, default=120)
+
+    # submission
+    ap.add_argument("--submission_mode", type=str, default="instance_rows", choices=["instance_rows"])
+    ap.add_argument("--seg_ckpt", type=str, default="")  # used in infer mode
+
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data_dir = resolve_data_dir(args.data_dir)
+    train_dir = os.path.join(data_dir, "train_v2")
+    test_dir  = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    template_csv = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    ensure_dir(args.out_dir)
+    run_name = args.run_name.strip()
+    if run_name == "":
+        run_name = f"run__maskrcnn_gated__seed{args.seed}__det{args.det_thr:.2f}__{int(time.time())}"
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+    ensure_dir(os.path.join(run_dir, "logs"))
+    ensure_dir(os.path.join(run_dir, "vis_val"))
+    ensure_dir(os.path.join(run_dir, "vis_test"))
+
+    global_log_path = os.path.join(run_dir, "logs", "run_global.log")
+    with open(global_log_path, "a", encoding="utf-8") as logfp:
+        log_line(logfp, f"{now_str()} ==== START: Detector-gated Mask R-CNN (Airbus) ====")
+        log_line(logfp, f"run_dir={run_dir}")
+        log_line(logfp, f"data_dir={data_dir}")
+        log_line(logfp, f"train_dir={train_dir}")
+        log_line(logfp, f"test_dir={test_dir}")
+        log_line(logfp, f"det_ckpt={args.det_ckpt}")
+        log_line(logfp, f"device={device}")
+        log_line(logfp, f"tta={args.tta}")
+
+    # ---------- load detector ----------
+    det_model = EffNetV2Detector(pretrained=False)
+    det_sd = torch.load(args.det_ckpt, map_location="cpu")
+    # tolerate checkpoints saved as {"model": state_dict} etc.
+    if isinstance(det_sd, dict) and "state_dict" in det_sd:
+        det_sd = det_sd["state_dict"]
+    if isinstance(det_sd, dict) and "model" in det_sd and isinstance(det_sd["model"], dict):
+        det_sd = det_sd["model"]
+    try:
+        det_model.load_state_dict(det_sd, strict=True)
+    except Exception:
+        # fallback: strict=False
+        det_model.load_state_dict(det_sd, strict=False)
+    det_model.to(device)
+    det_model.eval()
+
+    # ---------- detector cache ----------
+    det_cache_path = args.det_cache.strip()
+    if det_cache_path == "":
+        det_cache_path = os.path.join(run_dir, "det_cache.json")
+
+    train_img_paths = sorted([str(p) for p in Path(train_dir).glob("*.jpg")] +
+                             [str(p) for p in Path(train_dir).glob("*.png")] +
+                             [str(p) for p in Path(train_dir).glob("*.jpeg")])
+    if len(train_img_paths) == 0:
+        raise FileNotFoundError(f"No images found under: {train_dir}")
+
+    if os.path.isfile(det_cache_path):
+        with open(det_cache_path, "r", encoding="utf-8") as f:
+            det_probs = json.load(f)
+    else:
+        det_probs = run_detector_on_paths(
+            det_model, train_img_paths, device=device,
+            det_img_size=args.det_img_size, batch=args.det_batch
+        )
+        with open(det_cache_path, "w", encoding="utf-8") as f:
+            json.dump(det_probs, f, ensure_ascii=False, indent=2)
+
+    # ---------- build id2rles ----------
+    id2rles = build_id2rles(train_csv)
+
+    # ---------- define gated positive pool ----------
+    all_train_ids = [Path(p).name for p in train_img_paths]
+    pos_pool = [iid for iid in all_train_ids if det_probs.get(iid, 0.0) >= float(args.det_thr)]
+
+    # Safety: if detector too strict, training set can be empty
+    if len(pos_pool) < 50:
+        # relax as emergency
+        sorted_by_prob = sorted([(iid, det_probs.get(iid, 0.0)) for iid in all_train_ids], key=lambda x: x[1], reverse=True)
+        pos_pool = [iid for iid,_ in sorted_by_prob[:max(200, int(0.10*len(all_train_ids)))]]
+
+    # split val
+    random.shuffle(pos_pool)
+    n_val = max(1, int(len(pos_pool) * float(args.val_frac)))
+    val_ids = pos_pool[:n_val]
+    trn_ids = pos_pool[n_val:]
+
+    splits = {
+        "seed": args.seed,
+        "det_thr": float(args.det_thr),
+        "n_all_train_images": len(all_train_ids),
+        "n_det_positive_pool": len(pos_pool),
+        "n_train_ids": len(trn_ids),
+        "n_val_ids": len(val_ids),
+        "train_ids_head": trn_ids[:20],
+        "val_ids_head": val_ids[:20],
+    }
+    with open(os.path.join(run_dir, "splits.json"), "w", encoding="utf-8") as f:
+        json.dump(splits, f, ensure_ascii=False, indent=2)
+
+    # ---------- build model (and patch loss) ----------
+    patch_torchvision_mask_loss(args.tversky_alpha, args.tversky_beta, args.tversky_lambda)
+
+    model = build_maskrcnn(
+        num_classes=2,
+        anchor_sizes=parse_list_int(args.anchor_sizes),
+        mask_roi_out=int(args.mask_roi_out),
+        pretrained=int(args.pretrained),
+    )
+    model.to(device)
+
+    # ---------- loaders ----------
+    train_scales = parse_list_int(args.train_scales)
+    tf_train = Compose([
+        RandomResizeSquare(train_scales),
+        RandomHFlip(0.5),
+        RandomVFlip(0.5),
+    ])
+    tf_val = Compose([
+        # keep 768 for stable validation loss + tuning
+        RandomResizeSquare([768]),
+    ])
+
+    ds_train = AirbusInstanceDataset(train_dir, trn_ids, id2rles, transforms=tf_train, img_size=768)
+    ds_val   = AirbusInstanceDataset(train_dir, val_ids, id2rles, transforms=tf_val, img_size=768)
+
+    dl_train = torch.utils.data.DataLoader(
+        ds_train, batch_size=int(args.batch), shuffle=True,
+        num_workers=int(args.num_workers), pin_memory=True, collate_fn=collate_fn
+    )
+    dl_val = torch.utils.data.DataLoader(
+        ds_val, batch_size=1, shuffle=False,
+        num_workers=max(1, int(args.num_workers)//2), pin_memory=True, collate_fn=collate_fn
+    )
+
+    best_path = os.path.join(run_dir, "best_model.pt")
+    last_path = os.path.join(run_dir, "last_model.pt")
+
+    # ---------- TRAIN ----------
+    if args.mode in ("train", "train_infer"):
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [INFO] train_ids={len(trn_ids)} val_ids={len(val_ids)}")
+            log_line(logfp, f"{now_str()} [INFO] Using BCE+Tversky mask loss: a={args.tversky_alpha} b={args.tversky_beta} lam={args.tversky_lambda}")
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.AdamW(params, lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+        stopper = EarlyStopper(patience=int(args.patience))
+        best_val = float("inf")
+
+        for epoch in range(int(args.epochs)):
+            with open(global_log_path, "a", encoding="utf-8") as logfp:
+                train_one_epoch(model, dl_train, optimizer, device, logfp, epoch, clip_grad=float(args.clip_grad))
+
+                val_loss = evaluate_val_loss(model, dl_val, device=device)
+                log_line(logfp, f"{now_str()} [VAL] epoch={epoch} val_loss={val_loss:.6f}")
+
+                # save last
+                torch.save(model.state_dict(), last_path)
+
+                if val_loss < best_val - 1e-8:
+                    best_val = val_loss
+                    torch.save(model.state_dict(), best_path)
+                    log_line(logfp, f"{now_str()} [CKPT] best updated: val_loss={best_val:.6f} -> {best_path}")
+
+                if stopper.step(val_loss, epoch):
+                    log_line(logfp, f"{now_str()} [EARLY_STOP] patience={args.patience} best_epoch={stopper.best_epoch} best_val={stopper.best:.6f}")
+                    break
+
+        # load best
+        sd = torch.load(best_path, map_location=device)
+        model.load_state_dict(sd)
+        model.eval()
+
+        # ---------- THRESHOLD TUNING ----------
+        # limit val ids for speed
+        tune_ids = val_ids[:max(1, int(args.tune_limit))]
+        score_grid = parse_list_float(args.tune_score_grid)
+        mask_grid  = parse_list_float(args.tune_mask_grid)
+
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [TUNE] caching val preds n={len(tune_ids)} (tta={args.tta})")
+        pred_cache = cache_val_predictions(
+            model, det_model, tune_ids, data_dir, id2rles, det_probs, float(args.det_thr),
+            device=device, tta=int(args.tta)
+        )
+        tune_res = tune_thresholds_on_val(pred_cache, id2rles, score_grid, mask_grid, beta=2.0)
+        with open(os.path.join(run_dir, "threshold_tuning.json"), "w", encoding="utf-8") as f:
+            json.dump(tune_res, f, ensure_ascii=False, indent=2)
+
+        best_score_thr = float(tune_res["best"]["score_thr"])
+        best_mask_thr  = float(tune_res["best"]["mask_thr"])
+
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [TUNE] best score_thr={best_score_thr:.3f} mask_thr={best_mask_thr:.3f} f2={tune_res['best']['f2']:.6f}")
+
+        # store tuned thresholds
+        args.score_thr = best_score_thr
+        args.mask_thr  = best_mask_thr
+
+        # ---------- VAL VIS ----------
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [VIS] generating val visualizations n={args.vis_val_n}")
+
+        vis_ids = val_ids[:min(len(val_ids), int(args.vis_val_n))]
+        for i, image_id in enumerate(vis_ids):
+            path = os.path.join(train_dir, image_id)
+            im = safe_load_image(path).resize((768,768), resample=Image.BILINEAR)
+            x = F.to_tensor(im)
+            pr = det_probs.get(image_id, 0.0)
+
+            if pr < float(args.det_thr):
+                pred_rles = []
+                pred_union = np.zeros((768,768), dtype=np.uint8)
+                inst_masks = np.zeros((0,768,768), dtype=np.uint8)
+            else:
+                if int(args.tta) == 1:
+                    pred = predict_with_tta_flip4(model, x, device=device)
+                else:
+                    pred = model([x.to(device)])[0]
+                    pred = {k: v.detach().cpu() for k,v in pred.items()}
+                rles = instances_to_rles(
+                    pred["scores"], pred["masks"],
+                    score_thr=float(args.score_thr), mask_thr=float(args.mask_thr),
+                    min_area=int(args.min_area), dedup_iou_thr=float(args.dedup_iou_thr)
+                )
+                pred_rles = rles
+                # build binary instance masks for vis
+                inst_masks = []
+                for r in rles:
+                    m = rle_decode(r, (768,768))
+                    inst_masks.append(m)
+                inst_masks = np.stack(inst_masks, axis=0).astype(np.uint8) if len(inst_masks) > 0 else np.zeros((0,768,768), dtype=np.uint8)
+                pred_union = union_mask_from_pred(inst_masks)
+
+            gt_union = union_mask_from_gt_rles(id2rles.get(image_id, []), (768,768))
+            overlay = overlay_instances_on_image(im, inst_masks, alpha=0.45)
+            contour = draw_union_contours(im, pred_union)
+
+            out_base = os.path.join(run_dir, "vis_val", f"{i:04d}_{image_id}")
+            im.save(out_base + "_raw.png")
+            overlay.save(out_base + "_pred_overlay.png")
+            contour.save(out_base + "_pred_contour.png")
+            Image.fromarray((pred_union*255).astype(np.uint8)).save(out_base + "_pred_union.png")
+            Image.fromarray((gt_union*255).astype(np.uint8)).save(out_base + "_gt_union.png")
+
+    # ---------- INFER ----------
+    if args.mode in ("infer", "train_infer"):
+        # load model weights if infer-only
+        if args.mode == "infer":
+            if args.seg_ckpt.strip() == "":
+                raise ValueError("--seg_ckpt is required in --mode infer")
+            sd = torch.load(args.seg_ckpt, map_location=device)
+            model.load_state_dict(sd)
+            model.to(device)
+            model.eval()
+
+            # try to load tuned thresholds if exists in the same dir
+            maybe_tune = os.path.join(os.path.dirname(args.seg_ckpt), "threshold_tuning.json")
+            if os.path.isfile(maybe_tune):
+                with open(maybe_tune, "r", encoding="utf-8") as f:
+                    tr = json.load(f)
+                args.score_thr = float(tr["best"]["score_thr"])
+                args.mask_thr  = float(tr["best"]["mask_thr"])
+
+        test_img_paths = sorted([str(p) for p in Path(test_dir).glob("*.jpg")] +
+                                [str(p) for p in Path(test_dir).glob("*.png")] +
+                                [str(p) for p in Path(test_dir).glob("*.jpeg")])
+        if len(test_img_paths) == 0:
+            raise FileNotFoundError(f"No images found under: {test_dir}")
+
+        # read template order
+        template = pd.read_csv(template_csv)
+        test_ids = template["ImageId"].values.tolist()
+
+        # detector on test: cache locally (separate key)
+        det_test_cache = os.path.join(run_dir, "det_cache_test.json")
+        if os.path.isfile(det_test_cache):
+            with open(det_test_cache, "r", encoding="utf-8") as f:
+                det_probs_test = json.load(f)
+        else:
+            # only run on needed ids
+            id2path = {Path(p).name: p for p in test_img_paths}
+            paths = [id2path[iid] for iid in test_ids if iid in id2path]
+            det_probs_test = run_detector_on_paths(
+                det_model, paths, device=device, det_img_size=args.det_img_size, batch=args.det_batch
+            )
+            with open(det_test_cache, "w", encoding="utf-8") as f:
+                json.dump(det_probs_test, f, ensure_ascii=False, indent=2)
+
+        # inference loop
+        id2pred_rles: Dict[str, List[str]] = {}
+        vis_ids = test_ids[:min(len(test_ids), int(args.vis_test_n))]
+
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [INFER] start test n={len(test_ids)} det_thr={args.det_thr} score_thr={args.score_thr} mask_thr={args.mask_thr} tta={args.tta}")
+
+        id2path = {Path(p).name: p for p in test_img_paths}
+
+        for j, image_id in enumerate(test_ids):
+            p = id2path.get(image_id, None)
+            if p is None:
+                id2pred_rles[image_id] = [""]
+                continue
+
+            pr = float(det_probs_test.get(image_id, 0.0))
+            if pr < float(args.det_thr):
+                id2pred_rles[image_id] = []
+                continue
+
+            im = safe_load_image(p).resize((768,768), resample=Image.BILINEAR)
+            x = F.to_tensor(im)
+
+            if int(args.tta) == 1:
+                pred = predict_with_tta_flip4(model, x, device=device)
+            else:
+                pred = model([x.to(device)])[0]
+                pred = {k: v.detach().cpu() for k,v in pred.items()}
+
+            rles = instances_to_rles(
+                pred["scores"], pred["masks"],
+                score_thr=float(args.score_thr), mask_thr=float(args.mask_thr),
+                min_area=int(args.min_area), dedup_iou_thr=float(args.dedup_iou_thr)
+            )
+            id2pred_rles[image_id] = rles
+
+            # visualization subset
+            if image_id in vis_ids:
+                inst_masks = []
+                for r in rles:
+                    m = rle_decode(r, (768,768))
+                    inst_masks.append(m)
+                inst_masks = np.stack(inst_masks, axis=0).astype(np.uint8) if len(inst_masks) > 0 else np.zeros((0,768,768), dtype=np.uint8)
+                pred_union = union_mask_from_pred(inst_masks)
+                overlay = overlay_instances_on_image(im, inst_masks, alpha=0.45)
+                contour = draw_union_contours(im, pred_union)
+
+                out_base = os.path.join(run_dir, "vis_test", f"{j:05d}_{image_id}")
+                im.save(out_base + "_raw.png")
+                overlay.save(out_base + "_pred_overlay.png")
+                contour.save(out_base + "_pred_contour.png")
+                Image.fromarray((pred_union*255).astype(np.uint8)).save(out_base + "_pred_union.png")
+
+        # submission
+        sub_path = os.path.join(run_dir, "submission.csv")
+        write_submission_variable_rows(template_csv, sub_path, id2pred_rles)
+
+        # sanity checks
+        out_df = pd.read_csv(sub_path)
+        with open(global_log_path, "a", encoding="utf-8") as logfp:
+            log_line(logfp, f"{now_str()} [SUB] wrote {sub_path}")
+            log_line(logfp, f"{now_str()} [SUB] rows={len(out_df)} unique_imageids={out_df['ImageId'].nunique()} template_images={len(pd.read_csv(template_csv))}")
+            non_empty = int((out_df["EncodedPixels"].astype(str).str.len() > 0).sum())
+            log_line(logfp, f"{now_str()} [SUB] non_empty_rows={non_empty}")
+            # head bytes
+            try:
+                with open(sub_path, "rb") as fb:
+                    head = fb.read(120)
+                log_line(logfp, f"{now_str()} [SUB] head_bytes={head!r}")
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    main()
