@@ -1,0 +1,1572 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_deeplabv3_detector_gated_airbus.py
+
+Airbus Ship Detection (momos / docker) — Detector-gated segmentation training + inference + visualization
+
+Pipeline (fixed detector -> train seg on detector-positive only):
+  1) Load fixed detector checkpoint (EfficientNetV2-S by default).
+  2) Run detector over ALL train_v2 images (cached) to get p_ship per image.
+  3) Keep only detector-positive images (p_ship >= det_thr) => P_det
+  4) Build train/val split *inside P_det* (stratified by GT ship presence if available).
+  5) Train DeepLabv3-ResNet50 (binary segmentation) on TRAIN(P_det) with:
+       - Loss = BCEWithLogits + soft-Tversky(alpha,beta)
+       - TTA mandatory for validation (flip4)
+       - Early stopping mandatory (monitor VAL soft-Tversky)
+       - FP32 only (no AMP)
+  6) Tune seg threshold on VAL(P_det) by maximizing pixel-level F2.
+  7) Inference on Kaggle test_v2 with the SAME gating:
+       detector -> if negative => empty mask => blank EncodedPixels
+                -> if positive => seg TTA inference => threshold => postprocess => RLE
+  8) Save submission.csv and visualization images (PNG) for train/val/test samples.
+
+Outputs (run_dir under out_dir):
+  - best_model.pt
+  - train_config.json
+  - splits.json
+  - det_cache_train.csv / det_cache_test.csv
+  - thr_tuning.json
+  - submission.csv
+  - run_global.log / run_detail.log
+  - vis/ (PNG images: img_*, pred_*, gt_*, overlay_*, compare_*)
+
+Notes:
+  - Default dataset dir (container):
+      /workspace/kaggle_competition/dataset/airbus_ship_detection
+  - Default detector ckpt (container) is from your saved path.
+  - Robustness: corrupted images are skipped and logged, never crash the whole run.
+
+Authoring philosophy:
+  - "Won't error" first, then speed.
+"""
+
+import os
+import re
+import sys
+import json
+import math
+import time
+import random
+import shutil
+import argparse
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+from PIL import Image, ImageOps
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision import transforms
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Determinism knobs (trade-off speed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def write_json(p: str, obj):
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def read_json(p: str):
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def human_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    x = float(n)
+    for u in units:
+        if x < 1024.0:
+            return f"{x:.2f}{u}"
+        x /= 1024.0
+    return f"{x:.2f}PB"
+
+
+def safe_pil_open(path: str) -> Optional[Image.Image]:
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    except Exception:
+        return None
+
+
+# -----------------------------
+# RLE (Airbus format)
+# Kaggle expects column-major (Fortran order) on a 768x768 mask
+# -----------------------------
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: 2D uint8/bool array, shape (H,W), values 0/1
+    Returns RLE string in Kaggle Airbus format.
+    """
+    if mask is None:
+        return ""
+    if mask.ndim != 2:
+        raise ValueError("mask must be 2D")
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    # Flatten in Fortran order (column-major)
+    pixels = m.flatten(order="F")
+    # Pad with zero at both ends to catch transitions
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    # runs are starts and ends; convert to start,length
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Decode Airbus RLE into 2D uint8 mask (H,W).
+    """
+    h, w = shape
+    mask = np.zeros(h * w, dtype=np.uint8)
+    if rle is None:
+        return mask.reshape((h, w), order="F")
+    rle = str(rle).strip()
+    if rle == "" or rle.lower() == "nan":
+        return mask.reshape((h, w), order="F")
+    s = list(map(int, rle.split()))
+    starts = s[0::2]
+    lengths = s[1::2]
+    # 1-indexed
+    for st, le in zip(starts, lengths):
+        st0 = st - 1
+        mask[st0:st0 + le] = 1
+    return mask.reshape((h, w), order="F")
+
+
+# -----------------------------
+# Metrics (binary)
+# -----------------------------
+def safe_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(x)
+
+
+def soft_tversky_score_from_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    beta: float,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    logits: (B,1,H,W)
+    targets: (B,1,H,W) float {0,1}
+    returns mean soft-Tversky score in [0,1]
+    """
+    probs = torch.sigmoid(logits)
+    p = probs.view(probs.shape[0], -1)
+    t = targets.view(targets.shape[0], -1)
+    tp = (p * t).sum(dim=1)
+    fp = (p * (1 - t)).sum(dim=1)
+    fn = ((1 - p) * t).sum(dim=1)
+    score = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return score.mean()
+
+
+def tversky_loss_from_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    beta: float,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    return 1.0 - soft_tversky_score_from_logits(logits, targets, alpha, beta, eps=eps)
+
+
+def fbeta_from_pr(p: float, r: float, beta: float) -> float:
+    if p <= 0.0 and r <= 0.0:
+        return 0.0
+    b2 = beta * beta
+    return (1 + b2) * p * r / (b2 * p + r + 1e-12)
+
+
+def compute_pixel_prf(
+    pred: np.ndarray,
+    gt: np.ndarray
+) -> Tuple[float, float, float]:
+    """
+    pred, gt: 2D {0,1}
+    returns precision, recall, f1
+    """
+    pred = pred.astype(np.uint8)
+    gt = gt.astype(np.uint8)
+    tp = int((pred & gt).sum())
+    fp = int((pred & (1 - gt)).sum())
+    fn = int(((1 - pred) & gt).sum())
+    p = tp / (tp + fp + 1e-12)
+    r = tp / (tp + fn + 1e-12)
+    f1 = 2 * p * r / (p + r + 1e-12)
+    return p, r, f1
+
+
+# -----------------------------
+# Postprocess: remove small components
+# (Pure numpy BFS is slow; but min_area filtering can be approximated by connected components
+# with OpenCV if available. We'll try cv2 and fallback.)
+# -----------------------------
+def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 0:
+        return mask
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return m
+    # Try OpenCV
+    try:
+        import cv2  # type: ignore
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        out = np.zeros_like(m)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                out[labels == i] = 1
+        return out
+    except Exception:
+        # Fallback: naive BFS (OK for small masks; might be slower)
+        h, w = m.shape
+        visited = np.zeros_like(m, dtype=np.uint8)
+        out = np.zeros_like(m, dtype=np.uint8)
+        neigh = [(-1, -1), (-1, 0), (-1, 1),
+                 (0, -1),           (0, 1),
+                 (1, -1),  (1, 0),  (1, 1)]
+        for y in range(h):
+            for x in range(w):
+                if m[y, x] == 1 and visited[y, x] == 0:
+                    stack = [(y, x)]
+                    visited[y, x] = 1
+                    comp = [(y, x)]
+                    while stack:
+                        cy, cx = stack.pop()
+                        for dy, dx in neigh:
+                            ny, nx = cy + dy, cx + dx
+                            if 0 <= ny < h and 0 <= nx < w:
+                                if m[ny, nx] == 1 and visited[ny, nx] == 0:
+                                    visited[ny, nx] = 1
+                                    stack.append((ny, nx))
+                                    comp.append((ny, nx))
+                    if len(comp) >= min_area:
+                        for (yy, xx) in comp:
+                            out[yy, xx] = 1
+        return out
+
+
+# -----------------------------
+# Visualization helpers (PNG)
+# -----------------------------
+def to_uint8_mask(mask01: np.ndarray) -> Image.Image:
+    m = (mask01.astype(np.uint8) * 255)
+    return Image.fromarray(m, mode="L")
+
+
+def overlay_mask_on_image(img_rgb: Image.Image, mask01: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    """
+    img_rgb: PIL RGB
+    mask01: 2D {0,1} same size
+    """
+    img = img_rgb.convert("RGB")
+    m = mask01.astype(np.uint8)
+    if m.max() == 0:
+        return img
+    # Create red overlay without external libs
+    overlay = Image.new("RGB", img.size, (255, 0, 0))
+    mask_img = to_uint8_mask(m)  # 0..255
+    # Blend only where mask is 1
+    blended = Image.blend(img, overlay, alpha=alpha)
+    out = Image.composite(blended, img, mask_img)
+    return out
+
+
+def concat_h(img_a: Image.Image, img_b: Image.Image) -> Image.Image:
+    a = img_a.convert("RGB")
+    b = img_b.convert("RGB")
+    w = a.size[0] + b.size[0]
+    h = max(a.size[1], b.size[1])
+    out = Image.new("RGB", (w, h))
+    out.paste(a, (0, 0))
+    out.paste(b, (a.size[0], 0))
+    return out
+
+
+# -----------------------------
+# Detector model builder (EfficientNetV2-S)
+# Robust loading: try num_classes=1 then 2
+# -----------------------------
+def build_detector_model_efficientnet_v2_s(num_classes: int) -> nn.Module:
+    m = torchvision.models.efficientnet_v2_s(weights=None)
+    # classifier: Sequential(Dropout, Linear)
+    in_features = m.classifier[-1].in_features
+    m.classifier[-1] = nn.Linear(in_features, num_classes)
+    return m
+
+
+def load_detector(det_ckpt: str, device: torch.device, logger: logging.Logger) -> Tuple[nn.Module, int]:
+    """
+    Returns (model, out_dim) where out_dim is 1 or 2.
+    """
+    if not os.path.isfile(det_ckpt):
+        raise FileNotFoundError(f"Detector checkpoint not found: {det_ckpt}")
+    state = torch.load(det_ckpt, map_location="cpu")
+    # common patterns: state_dict directly or dict with 'state_dict'
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        sd = state["state_dict"]
+    elif isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
+        sd = state
+    else:
+        raise ValueError("Unsupported detector checkpoint format. Expected state_dict or {'state_dict': ...}")
+
+    # Try 1-class (single logit)
+    for out_dim in [1, 2]:
+        model = build_detector_model_efficientnet_v2_s(num_classes=out_dim)
+        try:
+            model.load_state_dict(sd, strict=True)
+            logger.info(f"[DETECTOR] Loaded EfficientNetV2-S with out_dim={out_dim} from {det_ckpt}")
+            model.to(device)
+            model.eval()
+            return model, out_dim
+        except Exception as e:
+            logger.warning(f"[DETECTOR] Failed strict load with out_dim={out_dim}: {repr(e)}")
+            # try non-strict (sometimes keys have 'module.' prefix etc.)
+            try:
+                sd2 = {}
+                for k, v in sd.items():
+                    k2 = k
+                    if k2.startswith("module."):
+                        k2 = k2[len("module."):]
+                    sd2[k2] = v
+                model = build_detector_model_efficientnet_v2_s(num_classes=out_dim)
+                model.load_state_dict(sd2, strict=False)
+                # sanity: check classifier weight shape
+                w = model.classifier[-1].weight
+                if w.shape[0] != out_dim:
+                    raise RuntimeError("Classifier out_dim mismatch after non-strict load.")
+                logger.info(f"[DETECTOR] Loaded (non-strict) EfficientNetV2-S with out_dim={out_dim} from {det_ckpt}")
+                model.to(device)
+                model.eval()
+                return model, out_dim
+            except Exception as e2:
+                logger.warning(f"[DETECTOR] Failed non-strict load with out_dim={out_dim}: {repr(e2)}")
+
+    raise RuntimeError(
+        "Could not load detector checkpoint into EfficientNetV2-S with out_dim=1 or 2.\n"
+        "If your detector architecture differs, adjust build_detector_model_efficientnet_v2_s()."
+    )
+
+
+@torch.no_grad()
+def detector_predict_proba(
+    model: nn.Module,
+    out_dim: int,
+    img_tensor: torch.Tensor
+) -> float:
+    """
+    img_tensor: (1,3,H,W)
+    returns p_ship in [0,1]
+    """
+    logits = model(img_tensor)
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+    # logits shape:
+    # - out_dim=1: (1,1)
+    # - out_dim=2: (1,2) -> interpret as ship class probability (index 1) after softmax
+    if out_dim == 1:
+        p = torch.sigmoid(logits.view(-1)[0]).item()
+        return float(p)
+    else:
+        probs = torch.softmax(logits, dim=1)
+        # assume class1 = ship
+        p = probs[0, 1].item()
+        return float(p)
+
+
+# -----------------------------
+# Segmentation model builder (DeepLabv3-ResNet50)
+# binary output: 1-channel logit
+# -----------------------------
+def build_deeplabv3_resnet50_binary(pretrained: bool, logger: logging.Logger) -> nn.Module:
+    # Try to use pretrained weights if available; if download fails, fallback to None
+    weights = None
+    if pretrained:
+        try:
+            weights = torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT
+        except Exception:
+            weights = None
+    try:
+        model = torchvision.models.segmentation.deeplabv3_resnet50(weights=weights)
+        logger.info(f"[SEG] deeplabv3_resnet50 built with weights={weights}")
+    except Exception as e:
+        logger.warning(f"[SEG] Failed to build with weights={weights}: {repr(e)}; fallback weights=None")
+        model = torchvision.models.segmentation.deeplabv3_resnet50(weights=None)
+
+    # Replace classifier to output 1 channel
+    # classifier[4] is Conv2d(256, 21, 1)
+    if hasattr(model, "classifier") and isinstance(model.classifier, nn.Sequential):
+        last = model.classifier[-1]
+        if isinstance(last, nn.Conv2d):
+            in_ch = last.in_channels
+            model.classifier[-1] = nn.Conv2d(in_ch, 1, kernel_size=1)
+        else:
+            # fallback: rebuild classifier head
+            model.classifier = nn.Sequential(
+                nn.Conv2d(256, 256, 3, padding=1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Conv2d(256, 1, 1)
+            )
+    else:
+        raise RuntimeError("Unexpected DeepLab model structure; cannot replace classifier head.")
+    return model
+
+
+# -----------------------------
+# Dataset for segmentation training (detector-positive subset)
+# -----------------------------
+@dataclass
+class Sample:
+    image_id: str
+    img_path: str
+    gt_rles: List[str]  # empty if none
+
+
+class AirbusSegDataset(Dataset):
+    def __init__(
+        self,
+        samples: List[Sample],
+        img_size: int,
+        augment: bool,
+        imagenet_norm: bool = True
+    ):
+        self.samples = samples
+        self.img_size = int(img_size)
+        self.augment = bool(augment)
+        self.imagenet_norm = bool(imagenet_norm)
+
+        self.to_tensor = transforms.ToTensor()
+        if imagenet_norm:
+            self.norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+        else:
+            self.norm = None
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _augment_pair(self, img: Image.Image, mask: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        # Simple, safe augmentation: random flips only
+        if random.random() < 0.5:
+            img = ImageOps.mirror(img)
+            mask = ImageOps.mirror(mask)
+        if random.random() < 0.5:
+            img = ImageOps.flip(img)
+            mask = ImageOps.flip(mask)
+        return img, mask
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        img = safe_pil_open(s.img_path)
+        if img is None:
+            # Return a dummy; caller can filter by catching
+            raise RuntimeError(f"Failed to read image: {s.img_path}")
+
+        img = img.convert("RGB")
+        # Build union GT mask (768x768) then resize to img_size
+        # Airbus images are 768x768
+        gt = np.zeros((768, 768), dtype=np.uint8)
+        for rle in s.gt_rles:
+            if rle is None:
+                continue
+            rle_str = str(rle).strip()
+            if rle_str == "" or rle_str.lower() == "nan":
+                continue
+            gt |= rle_decode(rle_str, (768, 768))
+        gt_img = Image.fromarray(gt * 255, mode="L")
+
+        # Resize
+        if self.img_size != 768:
+            img = img.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
+            gt_img = gt_img.resize((self.img_size, self.img_size), resample=Image.NEAREST)
+
+        if self.augment:
+            img, gt_img = self._augment_pair(img, gt_img)
+
+        x = self.to_tensor(img)  # (3,H,W) float 0..1
+        if self.norm is not None:
+            x = self.norm(x)
+        y = torch.from_numpy((np.array(gt_img) > 0).astype(np.float32))[None, ...]  # (1,H,W)
+        return {
+            "image_id": s.image_id,
+            "x": x,
+            "y": y
+        }
+
+
+# -----------------------------
+# TTA for segmentation (flip4)
+# -----------------------------
+@torch.no_grad()
+def seg_predict_tta_flip4(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    x: (B,3,H,W)
+    return prob: (B,1,H,W) float in [0,1]
+    """
+    def fwd(inp: torch.Tensor) -> torch.Tensor:
+        out = model(inp)
+        if isinstance(out, dict) and "out" in out:
+            logits = out["out"]
+        else:
+            logits = out
+        return torch.sigmoid(logits)
+
+    probs = []
+    # none
+    p0 = fwd(x)
+    probs.append(p0)
+    # hflip
+    x1 = torch.flip(x, dims=[3])
+    p1 = torch.flip(fwd(x1), dims=[3])
+    probs.append(p1)
+    # vflip
+    x2 = torch.flip(x, dims=[2])
+    p2 = torch.flip(fwd(x2), dims=[2])
+    probs.append(p2)
+    # hvflip
+    x3 = torch.flip(x, dims=[2, 3])
+    p3 = torch.flip(fwd(x3), dims=[2, 3])
+    probs.append(p3)
+    return torch.stack(probs, dim=0).mean(dim=0)
+
+
+# -----------------------------
+# Early stopping
+# -----------------------------
+class EarlyStopping:
+    def __init__(self, patience: int, mode: str = "max", min_delta: float = 0.0):
+        self.patience = int(patience)
+        self.mode = mode
+        self.min_delta = float(min_delta)
+        self.best = None
+        self.bad = 0
+
+    def step(self, metric: float) -> bool:
+        """
+        Returns True if should stop.
+        """
+        if self.best is None:
+            self.best = metric
+            self.bad = 0
+            return False
+        if self.mode == "max":
+            improved = (metric > self.best + self.min_delta)
+        else:
+            improved = (metric < self.best - self.min_delta)
+        if improved:
+            self.best = metric
+            self.bad = 0
+            return False
+        else:
+            self.bad += 1
+            return self.bad >= self.patience
+
+
+# -----------------------------
+# Detector cache runner
+# -----------------------------
+def list_image_ids(img_dir: str) -> List[str]:
+    ids = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith(".png"):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+
+def image_id_to_path(img_dir: str, image_id: str) -> str:
+    return os.path.join(img_dir, image_id)
+
+
+def build_id2rles(train_csv: str) -> Dict[str, List[str]]:
+    df = pd.read_csv(train_csv)
+    id2rles: Dict[str, List[str]] = {}
+    for _, row in df.iterrows():
+        iid = str(row["ImageId"])
+        rle = row.get("EncodedPixels", "")
+        if iid not in id2rles:
+            id2rles[iid] = []
+        # Keep even if empty; downstream will ignore empties
+        id2rles[iid].append("" if pd.isna(rle) else str(rle))
+    return id2rles
+
+
+def gt_has_ship_from_rles(rles: List[str]) -> int:
+    if rles is None:
+        return 0
+    for r in rles:
+        if r is None:
+            continue
+        s = str(r).strip()
+        if s != "" and s.lower() != "nan":
+            return 1
+    return 0
+
+
+def detector_cache_path(run_dir: str, split_name: str) -> str:
+    return os.path.join(run_dir, f"det_cache_{split_name}.csv")
+
+
+@torch.no_grad()
+def run_detector_and_cache(
+    split_name: str,
+    img_dir: str,
+    image_ids: List[str],
+    run_dir: str,
+    det_model: nn.Module,
+    det_out_dim: int,
+    det_thr: float,
+    img_size: int,
+    batch: int,
+    num_workers: int,
+    device: torch.device,
+    logger: logging.Logger
+) -> pd.DataFrame:
+    """
+    Run detector on given image_ids and cache results to CSV.
+    """
+    cache_p = detector_cache_path(run_dir, split_name)
+    if os.path.isfile(cache_p):
+        logger.info(f"[DETECTOR] Found cache: {cache_p} (will load)")
+        df = pd.read_csv(cache_p)
+        # Basic sanity
+        if "ImageId" in df.columns and "p_ship" in df.columns and "det_pred" in df.columns:
+            return df
+        else:
+            logger.warning(f"[DETECTOR] Cache format invalid; recompute: {cache_p}")
+
+    logger.info(f"[DETECTOR] Running detector for {split_name}: n={len(image_ids)} img_size={img_size} batch={batch}")
+    to_tensor = transforms.ToTensor()
+    norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+
+    rows = []
+    bad = 0
+
+    # Simple batching without Dataset to keep robust control
+    for i in range(0, len(image_ids), batch):
+        chunk = image_ids[i:i + batch]
+        xs = []
+        ok_ids = []
+        for iid in chunk:
+            p = image_id_to_path(img_dir, iid)
+            img = safe_pil_open(p)
+            if img is None:
+                bad += 1
+                continue
+            img = img.convert("RGB")
+            if img_size != 768:
+                img = img.resize((img_size, img_size), resample=Image.BILINEAR)
+            x = norm(to_tensor(img))
+            xs.append(x)
+            ok_ids.append(iid)
+
+        if not xs:
+            continue
+        xbat = torch.stack(xs, dim=0).to(device)
+        # model outputs (B, out_dim)
+        logits = det_model(xbat)
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
+        if det_out_dim == 1:
+            probs = torch.sigmoid(logits.view(-1)).detach().cpu().numpy().tolist()
+        else:
+            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy().tolist()
+
+        for iid, p_ship in zip(ok_ids, probs):
+            det_pred = 1 if float(p_ship) >= det_thr else 0
+            rows.append((iid, float(p_ship), int(det_pred)))
+
+        if (i // batch) % 50 == 0:
+            logger.info(f"[DETECTOR] progress {i}/{len(image_ids)}  bad={bad}")
+
+    df = pd.DataFrame(rows, columns=["ImageId", "p_ship", "det_pred"])
+    df.to_csv(cache_p, index=False)
+    logger.info(f"[DETECTOR] Saved cache: {cache_p}  rows={len(df)} bad={bad}")
+    return df
+
+
+# -----------------------------
+# Threshold tuning for segmentation (maximize F2)
+# -----------------------------
+@torch.no_grad()
+def tune_seg_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    thr_grid_n: int,
+    thr_tune_limit: int,
+    min_area: int,
+    beta_f: float,
+    logger: logging.Logger
+) -> Dict:
+    """
+    Tune threshold on a subset of validation data using TTA flip4.
+    """
+    thrs = np.linspace(0.05, 0.95, int(thr_grid_n)).tolist()
+    logger.info(f"[THR] Tuning seg threshold with grid_n={thr_grid_n}, limit={thr_tune_limit}, beta={beta_f}")
+
+    # Accumulate a set of predicted probs and GT masks (CPU) for speed
+    probs_list = []
+    gts_list = []
+    n_used = 0
+    for batch in loader:
+        x = batch["x"].to(device)
+        y = batch["y"].to(device)
+        prob = seg_predict_tta_flip4(model, x)  # (B,1,H,W)
+        probs_list.append(prob.detach().cpu())
+        gts_list.append(y.detach().cpu())
+        n_used += x.shape[0]
+        if thr_tune_limit > 0 and n_used >= thr_tune_limit:
+            break
+
+    if not probs_list:
+        logger.warning("[THR] No data for tuning; fallback seg_thr=0.5")
+        return {"best_thr": 0.5, "best_fbeta": 0.0, "grid": thrs}
+
+    probs_all = torch.cat(probs_list, dim=0).numpy()  # (N,1,H,W)
+    gts_all = torch.cat(gts_list, dim=0).numpy()      # (N,1,H,W)
+    probs_all = probs_all[:, 0]
+    gts_all = gts_all[:, 0].astype(np.uint8)
+
+    best_thr = 0.5
+    best_fb = -1.0
+    best_pr = (0.0, 0.0)
+
+    for thr in thrs:
+        # compute PR aggregated over pixels across batch
+        # (This is heavy; do it in integer sums)
+        tp = fp = fn = 0
+        for i in range(probs_all.shape[0]):
+            pred = (probs_all[i] >= thr).astype(np.uint8)
+            if min_area > 0 and pred.max() > 0:
+                pred = remove_small_components(pred, min_area=min_area)
+            gt = gts_all[i]
+            tp += int((pred & gt).sum())
+            fp += int((pred & (1 - gt)).sum())
+            fn += int(((1 - pred) & gt).sum())
+        p = tp / (tp + fp + 1e-12)
+        r = tp / (tp + fn + 1e-12)
+        fb = fbeta_from_pr(p, r, beta=beta_f)
+        if fb > best_fb:
+            best_fb = fb
+            best_thr = float(thr)
+            best_pr = (float(p), float(r))
+
+    logger.info(f"[THR] best_thr={best_thr:.4f} best_F{beta_f:.1f}={best_fb:.6f} P={best_pr[0]:.6f} R={best_pr[1]:.6f}")
+    return {
+        "best_thr": best_thr,
+        "best_fbeta": best_fb,
+        "best_precision": best_pr[0],
+        "best_recall": best_pr[1],
+        "grid": thrs,
+        "n_used": int(probs_all.shape[0]),
+        "min_area": int(min_area),
+        "beta": float(beta_f),
+    }
+
+
+# -----------------------------
+# Training / Validation loops
+# -----------------------------
+def has_nan_or_inf(t: torch.Tensor) -> bool:
+    return (torch.isnan(t).any().item() or torch.isinf(t).any().item())
+
+
+def build_logger(run_dir: str) -> logging.Logger:
+    logger = logging.getLogger("airbus_det_gated_seg")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    fh = logging.FileHandler(os.path.join(run_dir, "run_global.log"), mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+def build_detail_logger(run_dir: str) -> logging.Logger:
+    logger = logging.getLogger("airbus_det_gated_seg_detail")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    fh = logging.FileHandler(os.path.join(run_dir, "run_detail.log"), mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    return logger
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    alpha: float,
+    beta: float,
+    tv_weight: float,
+    bce_pos_weight: float,
+    log_every: int,
+    detail_logger: logging.Logger
+) -> Dict:
+    model.train()
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([bce_pos_weight], device=device))
+
+    t0 = time.time()
+    loss_sum = 0.0
+    n = 0
+
+    for step, batch in enumerate(loader):
+        x = batch["x"].to(device, non_blocking=True)
+        y = batch["y"].to(device, non_blocking=True)
+
+        out = model(x)
+        logits = out["out"] if isinstance(out, dict) else out  # (B,1,H,W)
+
+        if has_nan_or_inf(logits):
+            detail_logger.info(f"[NAN] logits nan/inf at step={step}")
+            continue
+
+        loss_bce = bce(logits, y)
+        loss_tv = tversky_loss_from_logits(logits, y, alpha=alpha, beta=beta, eps=1e-6)
+        loss = loss_bce + tv_weight * loss_tv
+
+        if has_nan_or_inf(loss):
+            detail_logger.info(f"[NAN] loss nan/inf at step={step} bce={loss_bce.item()} tv={loss_tv.item()}")
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        loss_sum += float(loss.item()) * x.shape[0]
+        n += x.shape[0]
+
+        if log_every > 0 and (step % log_every == 0):
+            detail_logger.info(
+                f"[TRAIN step] step={step} loss={loss.item():.6f} bce={loss_bce.item():.6f} tv={loss_tv.item():.6f}"
+            )
+
+    dt = time.time() - t0
+    return {
+        "train_loss": (loss_sum / max(n, 1)),
+        "train_samples": int(n),
+        "train_time_sec": float(dt),
+    }
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    alpha: float,
+    beta: float,
+    max_batches: int,
+    logger: logging.Logger
+) -> Dict:
+    model.eval()
+    tv_scores = []
+    n = 0
+    t0 = time.time()
+
+    for bi, batch in enumerate(loader):
+        x = batch["x"].to(device, non_blocking=True)
+        y = batch["y"].to(device, non_blocking=True)
+        # TTA mandatory
+        prob = seg_predict_tta_flip4(model, x)  # (B,1,H,W)
+        # Convert prob -> logit-like for soft tversky score:
+        # score uses probs directly; easiest: compute score with probs
+        p = prob.view(prob.shape[0], -1)
+        t = y.view(y.shape[0], -1)
+        tp = (p * t).sum(dim=1)
+        fp = (p * (1 - t)).sum(dim=1)
+        fn = ((1 - p) * t).sum(dim=1)
+        score = (tp + 1e-6) / (tp + alpha * fp + beta * fn + 1e-6)
+        tv_scores.append(score.detach().cpu())
+        n += x.shape[0]
+
+        if max_batches > 0 and (bi + 1) >= max_batches:
+            break
+
+    if tv_scores:
+        tv = torch.cat(tv_scores).mean().item()
+    else:
+        tv = 0.0
+    dt = time.time() - t0
+    logger.info(f"[VAL] soft_tversky={tv:.6f} samples={n} time={dt:.1f}s")
+    return {
+        "val_soft_tversky": float(tv),
+        "val_samples": int(n),
+        "val_time_sec": float(dt),
+    }
+
+
+# -----------------------------
+# Inference & submission
+# -----------------------------
+@torch.no_grad()
+def infer_one_image_seg(
+    model: nn.Module,
+    img_path: str,
+    infer_size: int,
+    device: torch.device,
+    imagenet_norm: bool = True
+) -> Tuple[np.ndarray, Image.Image]:
+    """
+    Returns (prob_map (H,W float32), img_rgb_resized PIL)
+    """
+    img = safe_pil_open(img_path)
+    if img is None:
+        raise RuntimeError(f"Failed to read image: {img_path}")
+    img = img.convert("RGB")
+    if infer_size != 768:
+        img = img.resize((infer_size, infer_size), resample=Image.BILINEAR)
+    to_tensor = transforms.ToTensor()
+    x = to_tensor(img)
+    if imagenet_norm:
+        x = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])(x)
+    x = x.unsqueeze(0).to(device)
+    prob = seg_predict_tta_flip4(model, x)[0, 0].detach().cpu().numpy().astype(np.float32)
+    return prob, img
+
+
+@torch.no_grad()
+def infer_detector_one_image(
+    det_model: nn.Module,
+    det_out_dim: int,
+    img_path: str,
+    det_img_size: int,
+    device: torch.device
+) -> float:
+    img = safe_pil_open(img_path)
+    if img is None:
+        return 0.0
+    img = img.convert("RGB")
+    if det_img_size != 768:
+        img = img.resize((det_img_size, det_img_size), resample=Image.BILINEAR)
+    to_tensor = transforms.ToTensor()
+    norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+    x = norm(to_tensor(img)).unsqueeze(0).to(device)
+    return detector_predict_proba(det_model, det_out_dim, x)
+
+
+def make_submission(
+    model: nn.Module,
+    det_model: nn.Module,
+    det_out_dim: int,
+    test_img_dir: str,
+    sample_sub_csv: str,
+    run_dir: str,
+    device: torch.device,
+    det_thr: float,
+    det_img_size: int,
+    seg_thr: float,
+    infer_size: int,
+    min_area: int,
+    vis_n_test: int,
+    seed: int,
+    logger: logging.Logger
+) -> str:
+    """
+    Create submission.csv (one row per image) and save visualizations.
+    """
+    df_sub = pd.read_csv(sample_sub_csv)
+    if "ImageId" not in df_sub.columns or "EncodedPixels" not in df_sub.columns:
+        raise ValueError("sample_submission_v2.csv must have columns: ImageId, EncodedPixels")
+
+    image_ids = df_sub["ImageId"].astype(str).tolist()
+
+    # Prepare visualization samples
+    rng = random.Random(seed)
+    vis_ids = image_ids[:]  # copy
+    rng.shuffle(vis_ids)
+    vis_ids = vis_ids[:max(0, int(vis_n_test))]
+
+    vis_dir = os.path.join(run_dir, "vis")
+    ensure_dir(vis_dir)
+
+    encs = []
+    n_det_pos = 0
+    n_bad = 0
+    n_nonempty = 0
+
+    logger.info(f"[INFER] test images={len(image_ids)} det_thr={det_thr} seg_thr={seg_thr} infer_size={infer_size}")
+
+    for i, iid in enumerate(image_ids):
+        img_path = os.path.join(test_img_dir, iid)
+        if not os.path.isfile(img_path):
+            # Some sample_submission ids should exist; if not, blank.
+            encs.append("")
+            n_bad += 1
+            continue
+
+        p_ship = infer_detector_one_image(det_model, det_out_dim, img_path, det_img_size, device=device)
+        det_pred = (p_ship >= det_thr)
+
+        if not det_pred:
+            encs.append("")
+        else:
+            n_det_pos += 1
+            try:
+                prob, img_rgb = infer_one_image_seg(model, img_path, infer_size=infer_size, device=device)
+                pred = (prob >= seg_thr).astype(np.uint8)
+                if min_area > 0 and pred.max() > 0:
+                    pred = remove_small_components(pred, min_area=min_area)
+                if pred.max() > 0:
+                    n_nonempty += 1
+                encs.append(rle_encode(pred))
+                # Visualization for selected images
+                if iid in vis_ids:
+                    # Save original, pred, overlay
+                    img_rgb.save(os.path.join(vis_dir, f"test_img_{iid}.png"))
+                    to_uint8_mask(pred).save(os.path.join(vis_dir, f"test_pred_{iid}.png"))
+                    overlay = overlay_mask_on_image(img_rgb, pred, alpha=0.45)
+                    overlay.save(os.path.join(vis_dir, f"test_overlay_{iid}.png"))
+            except Exception:
+                encs.append("")
+                n_bad += 1
+
+        if i % 500 == 0:
+            logger.info(f"[INFER] progress {i}/{len(image_ids)} det_pos={n_det_pos} nonempty={n_nonempty} bad={n_bad}")
+
+    df_sub["EncodedPixels"] = encs
+
+    out_csv = os.path.join(run_dir, "submission.csv")
+    df_sub.to_csv(out_csv, index=False)
+
+    logger.info(f"[INFER] Saved submission: {out_csv}")
+    logger.info(f"[INFER] det_pos={n_det_pos}/{len(image_ids)} ({n_det_pos/len(image_ids):.3f}) nonempty_pred={n_nonempty} bad={n_bad}")
+
+    # Basic sanity check
+    if len(df_sub) != len(image_ids):
+        logger.warning("[INFER] submission row count mismatch vs template.")
+    if df_sub.isna().any().any():
+        logger.warning("[INFER] submission contains NaNs; should not happen (EncodedPixels should be empty string).")
+
+    infer_summary = {
+        "test_n": int(len(image_ids)),
+        "det_thr": float(det_thr),
+        "seg_thr": float(seg_thr),
+        "det_pos_n": int(n_det_pos),
+        "det_pos_frac": float(n_det_pos / max(1, len(image_ids))),
+        "nonempty_pred_n": int(n_nonempty),
+        "bad_n": int(n_bad),
+        "infer_size": int(infer_size),
+        "det_img_size": int(det_img_size),
+        "min_area": int(min_area),
+        "vis_n_test": int(vis_n_test),
+    }
+    write_json(os.path.join(run_dir, "infer_summary.json"), infer_summary)
+    return out_csv
+
+
+# -----------------------------
+# Train/Val visualization
+# -----------------------------
+@torch.no_grad()
+def visualize_samples(
+    model: nn.Module,
+    samples: List[Sample],
+    img_size: int,
+    infer_size: int,
+    seg_thr: float,
+    min_area: int,
+    device: torch.device,
+    vis_dir: str,
+    prefix: str,
+    n_vis: int,
+    seed: int
+):
+    ensure_dir(vis_dir)
+    rng = random.Random(seed)
+    idxs = list(range(len(samples)))
+    rng.shuffle(idxs)
+    idxs = idxs[:max(0, int(n_vis))]
+
+    for k, idx in enumerate(idxs):
+        s = samples[idx]
+        # Load original 768 for visualization
+        img = safe_pil_open(s.img_path)
+        if img is None:
+            continue
+        img = img.convert("RGB")
+
+        # Build GT union mask at 768 for visualization
+        gt = np.zeros((768, 768), dtype=np.uint8)
+        for rle in s.gt_rles:
+            if rle is None:
+                continue
+            rs = str(rle).strip()
+            if rs == "" or rs.lower() == "nan":
+                continue
+            gt |= rle_decode(rs, (768, 768))
+        gt = gt.astype(np.uint8)
+
+        # Seg inference at infer_size then bring back to 768 for consistent viewing
+        prob, img_inf = infer_one_image_seg(model, s.img_path, infer_size=infer_size, device=device)
+        pred = (prob >= seg_thr).astype(np.uint8)
+        if min_area > 0 and pred.max() > 0:
+            pred = remove_small_components(pred, min_area=min_area)
+
+        # If infer_size differs, resize pred to 768 for saving
+        if infer_size != 768:
+            pred_img = Image.fromarray(pred * 255, mode="L").resize((768, 768), resample=Image.NEAREST)
+            pred = (np.array(pred_img) > 0).astype(np.uint8)
+
+        # Save files
+        iid = s.image_id
+        img.save(os.path.join(vis_dir, f"{prefix}_img_{iid}.png"))
+        to_uint8_mask(gt).save(os.path.join(vis_dir, f"{prefix}_gt_{iid}.png"))
+        to_uint8_mask(pred).save(os.path.join(vis_dir, f"{prefix}_pred_{iid}.png"))
+
+        overlay_pred = overlay_mask_on_image(img, pred, alpha=0.45)
+        overlay_gt = overlay_mask_on_image(img, gt, alpha=0.45)
+        overlay_pred.save(os.path.join(vis_dir, f"{prefix}_overlay_pred_{iid}.png"))
+        overlay_gt.save(os.path.join(vis_dir, f"{prefix}_overlay_gt_{iid}.png"))
+
+        comp = concat_h(overlay_gt, overlay_pred)
+        comp.save(os.path.join(vis_dir, f"{prefix}_compare_{iid}.png"))
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", type=str, default="/workspace/kaggle_competition/dataset/airbus_ship_detection")
+    p.add_argument("--out_dir", type=str, default="/workspace/kaggle_competition/outputs_airbus_detgated_seg")
+
+    # Detector (fixed)
+    p.add_argument(
+        "--det_ckpt",
+        type=str,
+        default="/workspace/kaggle_competition/outputs_airbus_detector_f1/run__detector_fbeta_1.00_efficientnet_v2_s__img768__seed42__all192556__valr0.15__tpos0.35__pw1.00__ic1__cache1/best_model.pt"
+    )
+    p.add_argument("--det_thr", type=float, default=0.30)          # Recall寄りのデフォルト
+    p.add_argument("--det_img_size", type=int, default=768)        # detector入力サイズ
+    p.add_argument("--det_cache_recompute", type=int, default=0)   # 1でキャッシュ無視
+
+    # Segmentation (train)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--train_size", type=int, default=256)          # 学習は軽量化のため256がデフォルト（要件上は全画像を使う）
+    p.add_argument("--infer_size", type=int, default=768)          # 推論は768
+    p.add_argument("--seg_pretrained", type=int, default=1)        # torchvision pretrained
+    p.add_argument("--batch_train", type=int, default=4)
+    p.add_argument("--batch_eval", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--max_epochs", type=int, default=50)
+    p.add_argument("--patience", type=int, default=6)
+
+    # Loss
+    p.add_argument("--alpha", type=float, default=0.60)
+    p.add_argument("--beta", type=float, default=0.40)
+    p.add_argument("--tv_weight", type=float, default=1.0)
+    p.add_argument("--bce_pos_weight", type=float, default=1.0)    # ピクセル不均衡の補正を入れたいなら >1 を検討
+
+    # Split
+    p.add_argument("--val_frac", type=float, default=0.15)
+
+    # Threshold tuning
+    p.add_argument("--thr_grid_n", type=int, default=41)
+    p.add_argument("--thr_tune_limit", type=int, default=1200)
+    p.add_argument("--beta_f", type=float, default=2.0)            # Kaggle寄り：F2
+
+    # Postprocess
+    p.add_argument("--min_area", type=int, default=50)
+
+    # Logging / Viz
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument("--vis_n_train", type=int, default=16)
+    p.add_argument("--vis_n_val", type=int, default=16)
+    p.add_argument("--vis_n_test", type=int, default=16)
+
+    # Speed knobs
+    p.add_argument("--val_max_batches", type=int, default=-1)       # -1で全val、>0で一部
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    seed_everything(args.seed)
+
+    # Paths
+    data_dir = args.data_dir
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub_csv = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    for pth in [train_img_dir, test_img_dir, train_csv, sample_sub_csv]:
+        if not os.path.exists(pth):
+            raise FileNotFoundError(f"Required path not found: {pth}")
+
+    # Run dir name (det_thr + sizes + seed)
+    run_name = (
+        f"run__detgated_deeplabv3__seed{args.seed}"
+        f"__detthr{args.det_thr:.2f}"
+        f"__tr{args.train_size}__inf{args.infer_size}"
+        f"__a{args.alpha:.2f}b{args.beta:.2f}"
+        f"__val{args.val_frac:.2f}"
+        f"__es{args.patience}"
+        f"__tta1"
+    )
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+
+    logger = build_logger(run_dir)
+    detail_logger = build_detail_logger(run_dir)
+
+    logger.info(f"==== START: Detector-gated DeepLabv3 Seg (Airbus) ====")
+    logger.info(f"started_at={now_str()}")
+    logger.info(f"run_dir={run_dir}")
+    logger.info(f"data_dir={data_dir}")
+    logger.info(f"train_img_dir={train_img_dir}")
+    logger.info(f"test_img_dir={test_img_dir}")
+    logger.info(f"train_csv={train_csv}")
+    logger.info(f"sample_sub_csv={sample_sub_csv}")
+    logger.info(f"det_ckpt={args.det_ckpt}")
+    logger.info(f"args={vars(args)}")
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"device={device} torch={torch.__version__} torchvision={torchvision.__version__}")
+
+    # Save config
+    write_json(os.path.join(run_dir, "train_config.json"), vars(args))
+
+    # Build GT map (id2rles)
+    id2rles = build_id2rles(train_csv)
+    logger.info(f"[DATA] id2rles built: entries={len(id2rles)}")
+
+    # List ALL train ids from directory (important: includes ship-negative images)
+    all_train_ids = list_image_ids(train_img_dir)
+    all_test_ids = list_image_ids(test_img_dir)
+    logger.info(f"[DATA] train_v2 images={len(all_train_ids)}  test_v2 images={len(all_test_ids)}")
+
+    # Load detector
+    det_model, det_out_dim = load_detector(args.det_ckpt, device=device, logger=logger)
+
+    # Detector caches
+    # If recompute requested, delete cache files
+    if args.det_cache_recompute == 1:
+        for sp in ["train", "test"]:
+            cp = detector_cache_path(run_dir, sp)
+            if os.path.isfile(cp):
+                os.remove(cp)
+                logger.info(f"[DETECTOR] Removed cache due to recompute=1: {cp}")
+
+    det_df_train = run_detector_and_cache(
+        split_name="train",
+        img_dir=train_img_dir,
+        image_ids=all_train_ids,
+        run_dir=run_dir,
+        det_model=det_model,
+        det_out_dim=det_out_dim,
+        det_thr=args.det_thr,
+        img_size=args.det_img_size,
+        batch=max(1, args.batch_eval),  # safe
+        num_workers=args.num_workers,
+        device=device,
+        logger=logger
+    )
+    det_df_test = run_detector_and_cache(
+        split_name="test",
+        img_dir=test_img_dir,
+        image_ids=all_test_ids,
+        run_dir=run_dir,
+        det_model=det_model,
+        det_out_dim=det_out_dim,
+        det_thr=args.det_thr,
+        img_size=args.det_img_size,
+        batch=max(1, args.batch_eval),  # safe
+        num_workers=args.num_workers,
+        device=device,
+        logger=logger
+    )
+
+    # Build detector-positive set P_det from train
+    det_pos_ids = det_df_train.loc[det_df_train["det_pred"] == 1, "ImageId"].astype(str).tolist()
+    det_neg_ids = det_df_train.loc[det_df_train["det_pred"] == 0, "ImageId"].astype(str).tolist()
+
+    logger.info(f"[DETECTOR] train det_pos={len(det_pos_ids)}/{len(det_df_train)} ({len(det_pos_ids)/max(1,len(det_df_train)):.3f})")
+    logger.info(f"[DETECTOR] train det_neg={len(det_neg_ids)}")
+
+    # Report: GT-positive missed by detector (recall bottleneck check)
+    gt_pos_all = set([iid for iid, rles in id2rles.items() if gt_has_ship_from_rles(rles) == 1])
+    det_pos_set = set(det_pos_ids)
+    missed = [iid for iid in gt_pos_all if iid in set(all_train_ids) and iid not in det_pos_set]
+    logger.info(f"[DETECTOR] GT-positive total={len(gt_pos_all)}  missed_by_detector={len(missed)}  miss_rate={len(missed)/max(1,len(gt_pos_all)):.4f}")
+
+    # Build Sample list for P_det
+    samples_det = []
+    bad_paths = 0
+    for iid in det_pos_ids:
+        pth = image_id_to_path(train_img_dir, iid)
+        if not os.path.isfile(pth):
+            bad_paths += 1
+            continue
+        rles = id2rles.get(iid, [])
+        samples_det.append(Sample(image_id=iid, img_path=pth, gt_rles=rles))
+    logger.info(f"[DATA] P_det samples={len(samples_det)} bad_paths={bad_paths}")
+
+    if len(samples_det) < 10:
+        raise RuntimeError("Detector-positive training set too small. Consider lowering --det_thr.")
+
+    # Stratified split inside P_det by GT presence (helps stability)
+    labels = [gt_has_ship_from_rles(s.gt_rles) for s in samples_det]
+    idx_pos = [i for i, y in enumerate(labels) if y == 1]
+    idx_neg = [i for i, y in enumerate(labels) if y == 0]
+
+    rng = random.Random(args.seed)
+    rng.shuffle(idx_pos)
+    rng.shuffle(idx_neg)
+
+    n_val_pos = int(round(len(idx_pos) * args.val_frac))
+    n_val_neg = int(round(len(idx_neg) * args.val_frac))
+
+    val_idx = idx_pos[:n_val_pos] + idx_neg[:n_val_neg]
+    trn_idx = idx_pos[n_val_pos:] + idx_neg[n_val_neg:]
+    rng.shuffle(val_idx)
+    rng.shuffle(trn_idx)
+
+    train_samples = [samples_det[i] for i in trn_idx]
+    val_samples = [samples_det[i] for i in val_idx]
+
+    logger.info(f"[SPLIT] train_det_pos={len(train_samples)} val_det_pos={len(val_samples)}")
+    logger.info(f"[SPLIT] train GTpos={sum(gt_has_ship_from_rles(s.gt_rles) for s in train_samples)} / {len(train_samples)}")
+    logger.info(f"[SPLIT] val   GTpos={sum(gt_has_ship_from_rles(s.gt_rles) for s in val_samples)} / {len(val_samples)}")
+
+    write_json(os.path.join(run_dir, "splits.json"), {
+        "seed": args.seed,
+        "det_thr": args.det_thr,
+        "det_pos_ids_n": len(det_pos_ids),
+        "train_ids": [s.image_id for s in train_samples],
+        "val_ids": [s.image_id for s in val_samples],
+        "missed_gt_pos_by_detector": missed[:1000],  # huge list safety cap
+    })
+
+    # DataLoaders
+    ds_train = AirbusSegDataset(train_samples, img_size=args.train_size, augment=True, imagenet_norm=True)
+    ds_val = AirbusSegDataset(val_samples, img_size=args.train_size, augment=False, imagenet_norm=True)
+
+    loader_train = DataLoader(
+        ds_train,
+        batch_size=args.batch_train,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(args.num_workers > 0)
+    )
+    loader_val = DataLoader(
+        ds_val,
+        batch_size=args.batch_eval,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(args.num_workers > 0)
+    )
+
+    # Build segmentation model
+    seg_model = build_deeplabv3_resnet50_binary(pretrained=(args.seg_pretrained == 1), logger=logger)
+    seg_model.to(device)
+
+    optimizer = torch.optim.AdamW(seg_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Training with early stopping (monitor val_soft_tversky)
+    es = EarlyStopping(patience=args.patience, mode="max", min_delta=1e-5)
+    best_epoch = -1
+    best_metric = -1.0
+    best_path = os.path.join(run_dir, "best_model.pt")
+
+    curve = []
+    for epoch in range(1, args.max_epochs + 1):
+        logger.info(f"---- EPOCH {epoch}/{args.max_epochs} ----")
+        tr = train_one_epoch(
+            seg_model, loader_train, optimizer, device,
+            alpha=args.alpha, beta=args.beta, tv_weight=args.tv_weight,
+            bce_pos_weight=args.bce_pos_weight,
+            log_every=args.log_every,
+            detail_logger=detail_logger
+        )
+        # validation batches limit
+        max_batches = args.val_max_batches if args.val_max_batches is not None else -1
+        va = validate(
+            seg_model, loader_val, device,
+            alpha=args.alpha, beta=args.beta,
+            max_batches=max_batches,
+            logger=logger
+        )
+
+        metric = float(va["val_soft_tversky"])
+        row = {
+            "epoch": epoch,
+            **tr,
+            **va,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
+        curve.append(row)
+        pd.DataFrame(curve).to_csv(os.path.join(run_dir, "curve.csv"), index=False)
+
+        # save best
+        if metric > best_metric:
+            best_metric = metric
+            best_epoch = epoch
+            torch.save(seg_model.state_dict(), best_path)
+            logger.info(f"[CKPT] Updated best: epoch={best_epoch} val_soft_tversky={best_metric:.6f} -> {best_path}")
+
+        # early stop
+        if es.step(metric):
+            logger.info(f"[ES] Early stopping triggered at epoch={epoch} best_epoch={best_epoch} best_metric={best_metric:.6f}")
+            break
+
+    # Load best
+    if os.path.isfile(best_path):
+        seg_model.load_state_dict(torch.load(best_path, map_location=device))
+        logger.info(f"[CKPT] Loaded best model from {best_path}")
+    else:
+        logger.warning("[CKPT] best_model.pt not found; using current weights")
+
+    # Threshold tuning (on val_det_pos)
+    thr_info = tune_seg_threshold(
+        model=seg_model,
+        loader=loader_val,
+        device=device,
+        thr_grid_n=args.thr_grid_n,
+        thr_tune_limit=args.thr_tune_limit,
+        min_area=args.min_area,
+        beta_f=args.beta_f,
+        logger=logger
+    )
+    write_json(os.path.join(run_dir, "thr_tuning.json"), thr_info)
+    seg_thr = float(thr_info.get("best_thr", 0.5))
+
+    # Visualization (train/val)
+    vis_dir = os.path.join(run_dir, "vis")
+    ensure_dir(vis_dir)
+    visualize_samples(
+        model=seg_model,
+        samples=train_samples,
+        img_size=args.train_size,
+        infer_size=args.infer_size,
+        seg_thr=seg_thr,
+        min_area=args.min_area,
+        device=device,
+        vis_dir=vis_dir,
+        prefix="train",
+        n_vis=args.vis_n_train,
+        seed=args.seed
+    )
+    visualize_samples(
+        model=seg_model,
+        samples=val_samples,
+        img_size=args.train_size,
+        infer_size=args.infer_size,
+        seg_thr=seg_thr,
+        min_area=args.min_area,
+        device=device,
+        vis_dir=vis_dir,
+        prefix="val",
+        n_vis=args.vis_n_val,
+        seed=args.seed + 999
+    )
+
+    # Submission inference (test gating)
+    out_csv = make_submission(
+        model=seg_model,
+        det_model=det_model,
+        det_out_dim=det_out_dim,
+        test_img_dir=test_img_dir,
+        sample_sub_csv=sample_sub_csv,
+        run_dir=run_dir,
+        device=device,
+        det_thr=args.det_thr,
+        det_img_size=args.det_img_size,
+        seg_thr=seg_thr,
+        infer_size=args.infer_size,
+        min_area=args.min_area,
+        vis_n_test=args.vis_n_test,
+        seed=args.seed + 2026,
+        logger=logger
+    )
+
+    # Final summary
+    summary = {
+        "started_at": now_str(),
+        "run_dir": run_dir,
+        "best_epoch": int(best_epoch),
+        "best_val_soft_tversky": float(best_metric),
+        "det_ckpt": args.det_ckpt,
+        "det_thr": float(args.det_thr),
+        "seg_thr": float(seg_thr),
+        "best_model_pt": best_path,
+        "submission_csv": out_csv,
+        "train_det_pos_n": int(len(train_samples)),
+        "val_det_pos_n": int(len(val_samples)),
+        "missed_gt_pos_by_detector_n": int(len(missed)),
+        "args": vars(args),
+    }
+    write_json(os.path.join(run_dir, "summary.json"), summary)
+    logger.info(f"==== DONE ====")
+    logger.info(f"summary.json: {os.path.join(run_dir, 'summary.json')}")
+    logger.info(f"submission.csv: {out_csv}")
+    logger.info(f"vis_dir: {vis_dir}")
+
+
+if __name__ == "__main__":
+    main()
