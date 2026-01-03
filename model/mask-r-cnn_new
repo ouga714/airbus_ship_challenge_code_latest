@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_maskrcnn_detector_gated_airbus_hades.py
+
+Airbus Ship Detection — Mask R-CNN (torchvision) + Detector-gated sampling/inference
+
+Design goals (DeepLab要件に寄せる):
+- 学習(train)→VALで閾値チューニング→疑似test(ptest)評価→Kaggle test_v2推論→submission.csv生成
+- detector (EfficientNetV2 binary) を使って
+  (a) trainをpos-richにサンプリング（use_detector_gate_train）
+  (b) test推論をスキップして高速化（use_detector_gate_infer, det_strict）
+- 提出は instance-per-row（同一ImageId複数行OK）。予測なしは空文字1行。
+- FP32 only（AMPなし）
+
+想定データ配置:
+  data_dir/
+    train_v2/
+    test_v2/
+    train_ship_segmentations_v2.csv
+    sample_submission_v2.csv
+
+Notes:
+- Mask R-CNNの閾値チューニングを「出力をキャッシュして、thresholdは後段で評価」する方式にして高速化しています。
+- 画像読み込み失敗（壊れ画像等）で学習が落ちないように、失敗時は別IDにフェイルオーバーします（完全skipはDataLoader都合で難しい）。
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import argparse
+import random
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional
+
+import numpy as np
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.transforms import functional as TF
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+
+# ============================================================
+# Utils
+# ============================================================
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def log(msg: str) -> None:
+    print(f"{now_str()} {msg}", flush=True)
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def save_json(path: str, obj: Any) -> None:
+    ensure_dir(str(Path(path).parent))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def load_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def sigmoid(x: torch.Tensor) -> torch.Tensor:
+    return 1.0 / (1.0 + torch.exp(-x))
+
+
+# ============================================================
+# RLE (Kaggle Airbus format: column-major)
+# ============================================================
+
+def rle_decode(rle: str, shape_hw: Tuple[int, int]) -> np.ndarray:
+    h, w = shape_hw
+    s = str(rle).strip()
+    if s == "" or s.lower() == "nan":
+        return np.zeros((h, w), dtype=np.uint8)
+
+    parts = s.split()
+    if len(parts) % 2 != 0:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    starts = np.asarray(parts[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(parts[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    img = np.zeros(h * w, dtype=np.uint8)
+    for st, en in zip(starts, ends):
+        st = int(max(st, 0))
+        en = int(min(en, img.size))
+        if en > st:
+            img[st:en] = 1
+    # column-major -> reshape(w,h).T
+    return img.reshape((w, h)).T
+
+def rle_encode(mask01_hw: np.ndarray) -> str:
+    if mask01_hw is None or mask01_hw.size == 0:
+        return ""
+    m = (mask01_hw > 0).astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    # flatten column-major
+    pixels = m.T.flatten()
+    # pad
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+# ============================================================
+# CSV parsing
+# ============================================================
+
+def load_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None:
+                continue
+            rle = str(rle)
+            if rle.strip() == "" or rle.lower() == "nan":
+                continue
+            id2rles.setdefault(img_id, []).append(rle)
+    return id2rles
+
+def list_image_ids(img_dir: str) -> List[str]:
+    p = Path(img_dir)
+    if not p.exists():
+        return []
+    ids = []
+    for fp in sorted(p.glob("*.jpg")):
+        ids.append(fp.name)
+    return ids
+
+def read_template_ids(sample_submission_csv: str) -> List[str]:
+    ids = []
+    with open(sample_submission_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ids.append(row["ImageId"])
+    return ids
+
+
+# ============================================================
+# Detector (EfficientNetV2 binary)
+# ============================================================
+
+class EffNetV2Binary(nn.Module):
+    def __init__(self, variant: str = "s", pretrained_backbone: int = 0):
+        super().__init__()
+        weights = None
+        if pretrained_backbone:
+            # note: in offline env, this may try to download; keep off by default
+            if variant == "s":
+                weights = torchvision.models.EfficientNet_V2_S_Weights.DEFAULT
+            elif variant == "m":
+                weights = torchvision.models.EfficientNet_V2_M_Weights.DEFAULT
+            elif variant == "l":
+                weights = torchvision.models.EfficientNet_V2_L_Weights.DEFAULT
+            else:
+                raise ValueError(f"Unknown variant={variant}")
+
+        if variant == "s":
+            base = torchvision.models.efficientnet_v2_s(weights=weights)
+        elif variant == "m":
+            base = torchvision.models.efficientnet_v2_m(weights=weights)
+        elif variant == "l":
+            base = torchvision.models.efficientnet_v2_l(weights=weights)
+        else:
+            raise ValueError(f"Unknown variant={variant}")
+
+        in_features = base.classifier[-1].in_features
+        base.classifier[-1] = nn.Linear(in_features, 1)
+        self.model = base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x).squeeze(1)  # [B]
+
+def load_ckpt_flexible(model: nn.Module, ckpt_path: str, device: torch.device) -> None:
+    ckpt = torch.load(ckpt_path, map_location=device)
+    sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    new_sd = {}
+    for k, v in sd.items():
+        kk = k
+        for pref in ["module.", "model.", "net."]:
+            if kk.startswith(pref):
+                kk = kk[len(pref):]
+        new_sd[kk] = v
+    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+    log(f"[ckpt] loaded detector strict=False missing={len(missing)} unexpected={len(unexpected)}")
+    if len(missing) > 0:
+        log(f"[ckpt] missing keys (head): {missing[:5]}{'...' if len(missing)>5 else ''}")
+    if len(unexpected) > 0:
+        log(f"[ckpt] unexpected keys: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+
+def img_to_tensor01(img: Image.Image) -> torch.Tensor:
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    arr = arr[..., :3]
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # [3,H,W]
+    return t
+
+def det_preprocess(img_t: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=img_t.dtype, device=img_t.device)[:, None, None]
+    std  = torch.tensor([0.229, 0.224, 0.225], dtype=img_t.dtype, device=img_t.device)[:, None, None]
+    return (img_t - mean) / std
+
+@torch.no_grad()
+def detector_prob_for_id(det_model: nn.Module, img_path: str, det_img_size: int, device: torch.device) -> float:
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except Exception:
+        return 0.0
+    if det_img_size > 0:
+        img = img.resize((det_img_size, det_img_size), resample=Image.BILINEAR)
+    x = img_to_tensor01(img).to(device)
+    x = det_preprocess(x).unsqueeze(0)
+    logits = det_model(x)
+    prob = float(sigmoid(logits)[0].item())
+    return prob
+
+
+# ============================================================
+# Mask R-CNN build
+# ============================================================
+
+def build_maskrcnn(num_classes: int = 2, pretrained_backbone: int = 0,
+                   min_size: int = 800, max_size: int = 1333) -> nn.Module:
+    weights = None
+    weights_backbone = None
+    if pretrained_backbone:
+        # offline env risk; default off
+        weights_backbone = torchvision.models.ResNet50_Weights.DEFAULT
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+        weights=weights,
+        weights_backbone=weights_backbone,
+        trainable_backbone_layers=3
+    )
+
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden, num_classes)
+
+    model.transform.min_size = (min_size,)
+    model.transform.max_size = max_size
+    return model
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+def masks_to_boxes_xyxy(masks: np.ndarray) -> np.ndarray:
+    n = masks.shape[0]
+    boxes = np.zeros((n, 4), dtype=np.float32)
+    for i in range(n):
+        ys, xs = np.where(masks[i] > 0)
+        if len(xs) == 0:
+            boxes[i] = 0
+        else:
+            x1 = float(xs.min()); x2 = float(xs.max())
+            y1 = float(ys.min()); y2 = float(ys.max())
+            boxes[i] = np.array([x1, y1, x2, y2], dtype=np.float32)
+    return boxes
+
+class AirbusMaskRcnnDataset(Dataset):
+    def __init__(self, img_dir: str, id2rles: Dict[str, List[str]], image_ids: List[str],
+                 train_size: int = 768,
+                 min_instance_area: int = 8,
+                 min_box_hw: int = 2,
+                 augment: int = 1,
+                 max_fallback_tries: int = 10):
+        self.img_dir = img_dir
+        self.id2rles = id2rles
+        self.ids = list(image_ids)
+        self.train_size = int(train_size)
+        self.min_instance_area = int(min_instance_area)
+        self.min_box_hw = int(min_box_hw)
+        self.augment = int(augment)
+        self.max_fallback_tries = int(max_fallback_tries)
+        self._bad_ids = set()
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _try_load(self, image_id: str):
+        path = os.path.join(self.img_dir, image_id)
+        img = Image.open(path).convert("RGB")
+        w0, h0 = img.size
+        if self.train_size > 0 and (w0 != self.train_size or h0 != self.train_size):
+            img = img.resize((self.train_size, self.train_size), resample=Image.BILINEAR)
+        img_t = img_to_tensor01(img)
+
+        rles = self.id2rles.get(image_id, [])
+        masks = []
+        for rle in rles:
+            m = rle_decode(rle, (h0, w0))
+            if self.train_size > 0 and (w0 != self.train_size or h0 != self.train_size):
+                m_img = Image.fromarray((m * 255).astype(np.uint8))
+                m_img = m_img.resize((self.train_size, self.train_size), resample=Image.NEAREST)
+                m = (np.asarray(m_img) > 0).astype(np.uint8)
+            if int(m.sum()) < self.min_instance_area:
+                continue
+            masks.append(m)
+
+        if len(masks) == 0:
+            target = {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros((0,), dtype=torch.int64),
+                "masks": torch.zeros((0, img_t.shape[1], img_t.shape[2]), dtype=torch.uint8),
+                "image_id": torch.tensor([0], dtype=torch.int64),
+            }
+        else:
+            mstack = np.stack(masks, axis=0).astype(np.uint8)
+            boxes = masks_to_boxes_xyxy(mstack)
+            keep = []
+            for i in range(mstack.shape[0]):
+                x1, y1, x2, y2 = boxes[i]
+                if (x2 - x1 + 1) < self.min_box_hw or (y2 - y1 + 1) < self.min_box_hw:
+                    continue
+                keep.append(i)
+            if len(keep) == 0:
+                target = {
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                    "masks": torch.zeros((0, img_t.shape[1], img_t.shape[2]), dtype=torch.uint8),
+                    "image_id": torch.tensor([0], dtype=torch.int64),
+                }
+            else:
+                mstack = mstack[keep]
+                boxes = boxes[keep]
+                target = {
+                    "boxes": torch.from_numpy(boxes).float(),
+                    "labels": torch.ones((mstack.shape[0],), dtype=torch.int64),
+                    "masks": torch.from_numpy(mstack).to(torch.uint8),
+                    "image_id": torch.tensor([0], dtype=torch.int64),
+                }
+
+        if self.augment:
+            if random.random() < 0.5:
+                img_t = TF.hflip(img_t)
+                if target["boxes"].numel() > 0:
+                    W = img_t.shape[2]
+                    boxes = target["boxes"]
+                    x1 = W - 1 - boxes[:, 2]
+                    x2 = W - 1 - boxes[:, 0]
+                    boxes[:, 0] = x1
+                    boxes[:, 2] = x2
+                    target["boxes"] = boxes
+                    target["masks"] = torch.flip(target["masks"], dims=[2])
+            if random.random() < 0.5:
+                img_t = TF.vflip(img_t)
+                if target["boxes"].numel() > 0:
+                    H = img_t.shape[1]
+                    boxes = target["boxes"]
+                    y1 = H - 1 - boxes[:, 3]
+                    y2 = H - 1 - boxes[:, 1]
+                    boxes[:, 1] = y1
+                    boxes[:, 3] = y2
+                    target["boxes"] = boxes
+                    target["masks"] = torch.flip(target["masks"], dims=[1])
+
+        return img_t, target
+
+    def __getitem__(self, idx: int):
+        # 壊れ画像等が混ざると訓練が落ちるのでフェイルオーバーする
+        for t in range(self.max_fallback_tries):
+            image_id = self.ids[idx] if t == 0 else random.choice(self.ids)
+            try:
+                img_t, target = self._try_load(image_id)
+                target["image_id"] = torch.tensor([idx], dtype=torch.int64)
+                return img_t, target, image_id
+            except Exception:
+                if image_id not in self._bad_ids:
+                    self._bad_ids.add(image_id)
+                    log(f"[data] WARNING: failed to read/parse image_id={image_id} -> fallback")
+                continue
+
+        # 最終フォールバック：黒画像 + empty target
+        H = W = max(1, int(self.train_size))
+        img_t = torch.zeros((3, H, W), dtype=torch.float32)
+        target = {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "labels": torch.zeros((0,), dtype=torch.int64),
+            "masks": torch.zeros((0, H, W), dtype=torch.uint8),
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+        }
+        return img_t, target, self.ids[idx]
+
+def collate_fn(batch):
+    imgs = [b[0] for b in batch]
+    targets = [b[1] for b in batch]
+    ids = [b[2] for b in batch]
+    return imgs, targets, ids
+
+
+# ============================================================
+# Metrics (pixel-level on union mask)
+# ============================================================
+
+def union_from_target(target: Dict[str, torch.Tensor], shape_hw: Tuple[int,int]) -> np.ndarray:
+    if "masks" not in target or target["masks"].numel() == 0:
+        H, W = shape_hw
+        return np.zeros((H, W), dtype=np.uint8)
+    m = target["masks"].cpu().numpy().astype(np.uint8)  # [N,H,W]
+    u = (m.sum(axis=0) > 0).astype(np.uint8)
+    return u
+
+def union_from_instances(insts: List[np.ndarray], shape_hw: Tuple[int, int]) -> np.ndarray:
+    H, W = shape_hw
+    if insts is None or len(insts) == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+    u = np.zeros((H, W), dtype=np.uint8)
+    for m in insts:
+        if m.shape != (H, W):
+            m_img = Image.fromarray((m * 255).astype(np.uint8))
+            m_img = m_img.resize((W, H), resample=Image.NEAREST)
+            m = (np.asarray(m_img) > 0).astype(np.uint8)
+        u = np.maximum(u, m.astype(np.uint8))
+    return u
+
+def accumulate_counts(gt: np.ndarray, pr: np.ndarray) -> Tuple[int, int, int]:
+    gt = (gt > 0).astype(np.uint8)
+    pr = (pr > 0).astype(np.uint8)
+    tp = int(((gt == 1) & (pr == 1)).sum())
+    fp = int(((gt == 0) & (pr == 1)).sum())
+    fn = int(((gt == 1) & (pr == 0)).sum())
+    return tp, fp, fn
+
+def compute_metrics(tp: int, fp: int, fn: int, beta: float = 2.0) -> Dict[str, float]:
+    eps = 1e-12
+    prec = tp / (tp + fp + eps)
+    rec  = tp / (tp + fn + eps)
+    f1   = (2 * prec * rec) / (prec + rec + eps)
+    b2 = beta * beta
+    fbeta = (1 + b2) * prec * rec / (b2 * prec + rec + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return {"precision": float(prec), "recall": float(rec), "f1": float(f1), "f2": float(fbeta), "iou": float(iou)}
+
+
+# ============================================================
+# Inference helper (single image -> instance masks)
+# ============================================================
+
+@torch.no_grad()
+def infer_raw_outputs(model: nn.Module, img_t: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
+    model.eval()
+    x = img_t.to(device)
+    out = model([x])[0]
+    # out["masks"] is probability AFTER sigmoid in torchvision? In Mask R-CNN it is logits? -> torchvision returns mask logits.
+    # We'll treat it as logits and apply sigmoid ourselves.
+    scores = out.get("scores", torch.zeros((0,), device=device)).detach()
+    masks  = out.get("masks", torch.zeros((0,1,x.shape[1],x.shape[2]), device=device)).detach()  # [N,1,H,W]
+    return {"scores": scores, "masks": masks}
+
+def insts_from_cached(scores: torch.Tensor, mask_logits: torch.Tensor,
+                      score_thr: float, mask_thr: float) -> List[np.ndarray]:
+    if scores.numel() == 0:
+        return []
+    keep = scores >= float(score_thr)
+    if keep.sum().item() == 0:
+        return []
+    ml = mask_logits[keep]  # [K,1,H,W]
+    probs = ml[:, 0].float().sigmoid()  # [K,H,W]
+    insts = []
+    for k in range(probs.shape[0]):
+        mk = (probs[k].detach().cpu().numpy() >= float(mask_thr)).astype(np.uint8)
+        if mk.sum() > 0:
+            insts.append(mk)
+    return insts
+
+
+# ============================================================
+# Threshold tuning (cache outputs once)
+# ============================================================
+
+@torch.no_grad()
+def tune_thresholds_cached(model: nn.Module, dl: DataLoader, device: torch.device,
+                           thr_grid_n: int,
+                           score_thr_min: float, score_thr_max: float,
+                           mask_thr_min: float,  mask_thr_max: float,
+                           limit: int,
+                           beta: float = 2.0) -> Dict[str, Any]:
+    model.eval()
+    score_thrs = np.linspace(score_thr_min, score_thr_max, int(thr_grid_n))
+    mask_thrs  = np.linspace(mask_thr_min,  mask_thr_max,  int(thr_grid_n))
+
+    best = {"f2": -1.0, "score_thr": float(score_thrs[0]), "mask_thr": float(mask_thrs[0]),
+            "precision": 0.0, "recall": 0.0, "f1": 0.0, "iou": 0.0}
+
+    cache = []  # (gt_union, scores_cpu, masks_cpu)
+    seen = 0
+    for imgs, targets, _ids in dl:
+        for img_t, tgt in zip(imgs, targets):
+            H, W = img_t.shape[1], img_t.shape[2]
+            gt_u = union_from_target(tgt, (H, W))
+            out = infer_raw_outputs(model, img_t, device)
+            scores = out["scores"].detach().cpu()
+            masks  = out["masks"].detach().cpu()
+            cache.append((gt_u, scores, masks, (H, W)))
+            seen += 1
+            if seen >= int(limit):
+                break
+        if seen >= int(limit):
+            break
+
+    if len(cache) == 0:
+        return best
+
+    for st in score_thrs:
+        for mt in mask_thrs:
+            tp = fp = fn = 0
+            for gt_u, scores, masks, shape_hw in cache:
+                insts = insts_from_cached(scores, masks, float(st), float(mt))
+                pr_u = union_from_instances(insts, shape_hw)
+                a, b, c = accumulate_counts(gt_u, pr_u)
+                tp += a; fp += b; fn += c
+            m = compute_metrics(tp, fp, fn, beta=beta)
+            if m["f2"] > best["f2"]:
+                best = {"f2": m["f2"], "score_thr": float(st), "mask_thr": float(mt),
+                        "precision": m["precision"], "recall": m["recall"], "f1": m["f1"], "iou": m["iou"]}
+    return best
+
+
+# ============================================================
+# Detector-gated ranking / sampling
+# ============================================================
+
+def rank_by_detector(det_model: nn.Module, img_dir: str, ids: List[str],
+                     det_img_size: int, device: torch.device,
+                     score_all_limit: int, log_every: int = 200) -> List[Tuple[str, float]]:
+    ids = list(ids)
+    if score_all_limit > 0 and len(ids) > score_all_limit:
+        ids_scoring = random.sample(ids, int(score_all_limit))
+    else:
+        ids_scoring = ids
+
+    scored: List[Tuple[str, float]] = []
+    for k, img_id in enumerate(ids_scoring):
+        p = detector_prob_for_id(det_model, os.path.join(img_dir, img_id), det_img_size, device)
+        scored.append((img_id, float(p)))
+        if (k + 1) % int(max(1, log_every)) == 0:
+            log(f"[det-rank] scored {k+1}/{len(ids_scoring)}")
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+def build_pos_rich_train_ids(candidates: List[str], scored: List[Tuple[str, float]],
+                             train_n: int, pos_rich_frac: float) -> List[str]:
+    candidates_set = set(candidates)
+    scored_ids = [i for i, _p in scored if i in candidates_set]
+    top_n = int(round(train_n * float(pos_rich_frac)))
+    top_n = max(0, min(top_n, len(scored_ids), train_n))
+    top = scored_ids[:top_n]
+
+    remain_pool = list(candidates_set.difference(set(top)))
+    random.shuffle(remain_pool)
+    need = train_n - len(top)
+    if need > 0:
+        top += remain_pool[:need]
+    random.shuffle(top)
+    return top
+
+
+# ============================================================
+# Training / Evaluation
+# ============================================================
+
+def train_one_epoch(model: nn.Module, dl: DataLoader, device: torch.device,
+                    optimizer: optim.Optimizer, epoch: int, log_every: int = 50) -> Dict[str, float]:
+    model.train()
+    running = []
+    for step, (imgs, targets, _ids) in enumerate(dl, start=1):
+        imgs = [x.to(device) for x in imgs]
+        targets2 = []
+        for t in targets:
+            t2 = {}
+            for k, v in t.items():
+                if isinstance(v, torch.Tensor):
+                    t2[k] = v.to(device)
+                else:
+                    t2[k] = v
+            targets2.append(t2)
+
+        loss_dict = model(imgs, targets2)
+        losses = sum(loss for loss in loss_dict.values())
+
+        if not torch.isfinite(losses):
+            log(f"[TRAIN] non-finite loss at epoch={epoch} step={step} -> skip")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
+        losses.backward()
+        optimizer.step()
+
+        d = {k: float(v.item()) for k, v in loss_dict.items()}
+        running.append(float(losses.item()))
+        if step % int(max(1, log_every)) == 0:
+            log(f"[TRAIN] epoch={epoch} step={step}/{len(dl)} loss={float(losses.item()):.6f} detail={d}")
+
+    avg = float(np.mean(running)) if len(running) else 0.0
+    return {"loss": avg}
+
+@torch.no_grad()
+def eval_pixel_union_cached(model: nn.Module, dl: DataLoader, device: torch.device,
+                            score_thr: float, mask_thr: float,
+                            limit: int, beta: float = 2.0) -> Dict[str, float]:
+    model.eval()
+    tp = fp = fn = 0
+    seen = 0
+    for imgs, targets, _ids in dl:
+        for img_t, tgt in zip(imgs, targets):
+            H, W = img_t.shape[1], img_t.shape[2]
+            gt_u = union_from_target(tgt, (H, W))
+            out = infer_raw_outputs(model, img_t, device)
+            insts = insts_from_cached(out["scores"].detach().cpu(), out["masks"].detach().cpu(),
+                                      float(score_thr), float(mask_thr))
+            pr_u = union_from_instances(insts, (H, W))
+            a, b, c = accumulate_counts(gt_u, pr_u)
+            tp += a; fp += b; fn += c
+            seen += 1
+            if seen >= int(limit):
+                break
+        if seen >= int(limit):
+            break
+    return compute_metrics(tp, fp, fn, beta=beta)
+
+
+# ============================================================
+# Submission (instance-per-row)
+# ============================================================
+
+def write_submission_instance_rows(out_csv: str, image_ids_in_order: List[str],
+                                   id2inst_masks: Dict[str, List[np.ndarray]]) -> Tuple[int, int]:
+    ensure_dir(str(Path(out_csv).parent))
+    n_images = 0
+    n_inst_rows = 0
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id in image_ids_in_order:
+            n_images += 1
+            insts = id2inst_masks.get(img_id, [])
+            if insts is None or len(insts) == 0:
+                w.writerow([img_id, ""])
+            else:
+                for m in insts:
+                    rle = rle_encode(m)
+                    w.writerow([img_id, rle])
+                    n_inst_rows += 1
+    return n_images, n_inst_rows
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", type=str, default="train_infer",
+                   choices=["train", "infer", "train_infer"])
+
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--train_n", type=int, default=20000)
+    p.add_argument("--val_n", type=int, default=3000)
+    p.add_argument("--ptest_n", type=int, default=3000)
+    p.add_argument("--pos_frac", type=float, default=0.40)
+
+    p.add_argument("--train_size", type=int, default=768)
+    p.add_argument("--infer_size", type=int, default=768)
+
+    p.add_argument("--batch_train", type=int, default=2)
+    p.add_argument("--batch_eval", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
+
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+
+    p.add_argument("--max_epochs", type=int, default=30)
+    p.add_argument("--patience", type=int, default=6)
+    p.add_argument("--log_every", type=int, default=50)
+
+    p.add_argument("--thr_grid_n", type=int, default=21)
+    p.add_argument("--thr_tune_limit", type=int, default=800)
+    p.add_argument("--score_thr_min", type=float, default=0.05)
+    p.add_argument("--score_thr_max", type=float, default=0.95)
+    p.add_argument("--mask_thr_min", type=float, default=0.20)
+    p.add_argument("--mask_thr_max", type=float, default=0.95)
+
+    p.add_argument("--min_size", type=int, default=800)
+    p.add_argument("--max_size", type=int, default=1333)
+
+    p.add_argument("--min_instance_area", type=int, default=8)
+    p.add_argument("--min_box_hw", type=int, default=2)
+
+    p.add_argument("--maskrcnn_pretrained_backbone", type=int, default=0)
+
+    # detector
+    p.add_argument("--detector_ckpt", type=str, required=True)
+    p.add_argument("--det_variant", type=str, default="s", choices=["s", "m", "l"])
+    p.add_argument("--det_img_size", type=int, default=768)
+    p.add_argument("--det_thr", type=float, default=0.30)
+    p.add_argument("--det_strict", type=int, default=1)
+    p.add_argument("--det_pretrained_backbone", type=int, default=0)
+
+    # gating
+    p.add_argument("--use_detector_gate_infer", type=int, default=1)
+    p.add_argument("--use_detector_gate_train", type=int, default=1)
+    p.add_argument("--train_gate_pos_frac", type=float, default=0.90)
+    p.add_argument("--train_gate_score_all_limit", type=int, default=6000)
+    p.add_argument("--debug_gate_first_k", type=int, default=30)
+
+    # relax
+    p.add_argument("--auto_relax", type=int, default=1)
+    p.add_argument("--relax_steps", type=int, default=4)
+    p.add_argument("--score_gamma", type=float, default=0.65)
+    p.add_argument("--mask_gamma", type=float, default=0.85)
+    return p
+
+
+def main():
+    args = build_argparser().parse_args()
+    set_seed(args.seed)
+
+    # device selection (fix: cuda指定だがcudaが無い場合はcpuへ)
+    if ("cuda" in args.device) and (not torch.cuda.is_available()):
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    data_dir = args.data_dir
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir  = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    assert os.path.isdir(train_img_dir), f"missing: {train_img_dir}"
+    assert os.path.isdir(test_img_dir),  f"missing: {test_img_dir}"
+    assert os.path.isfile(train_csv),    f"missing: {train_csv}"
+    assert os.path.isfile(sample_sub),   f"missing: {sample_sub}"
+
+    run_name = f"run__maskrcnn_detgate__seed{args.seed}__train{args.train_n}__val{args.val_n}__ptest{args.ptest_n}__pos{int(args.pos_frac*100)}__{int(time.time())}"
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+
+    log(f"[run] mode={args.mode}")
+    log(f"[run] run_dir={run_dir}")
+    log(f"[run] device={device}")
+    log(f"[run] data_dir={data_dir}")
+
+    id2rles = load_id2rles(train_csv)
+    all_train_ids = list_image_ids(train_img_dir)
+    all_test_ids = list_image_ids(test_img_dir)
+    template_ids = read_template_ids(sample_sub)
+
+    pos_set = set(id2rles.keys())
+    pos_ids_all = [i for i in all_train_ids if i in pos_set]
+    neg_ids_all = [i for i in all_train_ids if i not in pos_set]
+    log(f"[data] train images={len(all_train_ids)} test images={len(all_test_ids)} pos_ids(csv)={len(pos_ids_all)} neg_ids={len(neg_ids_all)}")
+
+    # split train/val/ptest with target pos_frac
+    def sample_split(train_n: int, val_n: int, ptest_n: int, pos_frac: float) -> Dict[str, List[str]]:
+        pos_frac = float(pos_frac)
+        pos_n_train = int(round(train_n * pos_frac))
+        neg_n_train = train_n - pos_n_train
+        pos_n_val   = int(round(val_n * pos_frac))
+        neg_n_val   = val_n - pos_n_val
+        pos_n_pt    = int(round(ptest_n * pos_frac))
+        neg_n_pt    = ptest_n - pos_n_pt
+
+        pos_pool = pos_ids_all.copy()
+        neg_pool = neg_ids_all.copy()
+        random.shuffle(pos_pool)
+        random.shuffle(neg_pool)
+
+        def take(lst, n):
+            out = lst[:n]
+            del lst[:n]
+            return out
+
+        val = take(pos_pool, pos_n_val) + take(neg_pool, neg_n_val)
+        ptest = take(pos_pool, pos_n_pt) + take(neg_pool, neg_n_pt)
+        train = take(pos_pool, pos_n_train) + take(neg_pool, neg_n_train)
+
+        random.shuffle(train); random.shuffle(val); random.shuffle(ptest)
+        return {"train": train, "val": val, "ptest": ptest}
+
+    splits = sample_split(args.train_n, args.val_n, args.ptest_n, args.pos_frac)
+    save_json(os.path.join(run_dir, "splits.json"), splits)
+    log(f"[split] train={len(splits['train'])} val={len(splits['val'])} ptest={len(splits['ptest'])} (disjoint)")
+
+    # build detector
+    det_model = EffNetV2Binary(variant=args.det_variant, pretrained_backbone=int(args.det_pretrained_backbone)).to(device)
+    det_model.eval()
+    load_ckpt_flexible(det_model, args.detector_ckpt, device)
+
+    # train gating (rebuild train list as pos-rich using detector ranking)
+    train_ids = splits["train"]
+    if int(args.use_detector_gate_train) == 1:
+        log("[train-gate] enabled: building pos-rich train set via detector ranking")
+        cand = splits["train"]
+        scored = rank_by_detector(det_model, train_img_dir, cand, args.det_img_size, device,
+                                  score_all_limit=args.train_gate_score_all_limit,
+                                  log_every=max(50, int(args.log_every)))
+        if len(scored) == 0:
+            log("[train-gate] WARNING: scored empty. fallback to original split.")
+        else:
+            kshow = min(int(args.debug_gate_first_k), len(scored))
+            log("[train-gate] top probs: " + ", ".join([f"{p:.3f}" for _i, p in scored[:min(10, kshow)]]))
+            log("[train-gate] bot probs: " + ", ".join([f"{p:.3f}" for _i, p in scored[-min(10, kshow):]]))
+            train_ids = build_pos_rich_train_ids(cand, scored, args.train_n, args.train_gate_pos_frac)
+            save_json(os.path.join(run_dir, "train_gate_ranked.json"), [{"id": i, "p": p} for i, p in scored])
+            save_json(os.path.join(run_dir, "train_ids_after_gate.json"), train_ids)
+            log(f"[train-gate] built train_ids={len(train_ids)} pos_rich_frac={args.train_gate_pos_frac}")
+
+    # build datasets
+    ds_train = AirbusMaskRcnnDataset(train_img_dir, id2rles, train_ids,
+                                    train_size=args.train_size,
+                                    min_instance_area=args.min_instance_area,
+                                    min_box_hw=args.min_box_hw,
+                                    augment=1)
+    ds_val = AirbusMaskRcnnDataset(train_img_dir, id2rles, splits["val"],
+                                   train_size=args.infer_size,
+                                   min_instance_area=args.min_instance_area,
+                                   min_box_hw=args.min_box_hw,
+                                   augment=0)
+    ds_ptest = AirbusMaskRcnnDataset(train_img_dir, id2rles, splits["ptest"],
+                                     train_size=args.infer_size,
+                                     min_instance_area=args.min_instance_area,
+                                     min_box_hw=args.min_box_hw,
+                                     augment=0)
+
+    dl_train = DataLoader(ds_train, batch_size=args.batch_train, shuffle=True,
+                          num_workers=args.num_workers, pin_memory=True,
+                          collate_fn=collate_fn)
+    dl_val = DataLoader(ds_val, batch_size=args.batch_eval, shuffle=False,
+                        num_workers=args.num_workers, pin_memory=True,
+                        collate_fn=collate_fn)
+    dl_ptest = DataLoader(ds_ptest, batch_size=args.batch_eval, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=True,
+                          collate_fn=collate_fn)
+
+    # build maskrcnn
+    model = build_maskrcnn(num_classes=2,
+                           pretrained_backbone=int(args.maskrcnn_pretrained_backbone),
+                           min_size=args.min_size, max_size=args.max_size).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    ckpt_path = os.path.join(run_dir, "best_model.pt")
+    meta_path = os.path.join(run_dir, "best_meta.json")
+
+    best_f2 = -1.0
+    best_epoch = -1
+    best_thr = {"score_thr": 0.5, "mask_thr": 0.5}
+    patience_left = int(args.patience)
+
+    history = []
+
+    if args.mode in ["train", "train_infer"]:
+        for epoch in range(int(args.max_epochs)):
+            tr = train_one_epoch(model, dl_train, device, optimizer, epoch, log_every=int(args.log_every))
+
+            thr = tune_thresholds_cached(model, dl_val, device,
+                                         thr_grid_n=int(args.thr_grid_n),
+                                         score_thr_min=float(args.score_thr_min),
+                                         score_thr_max=float(args.score_thr_max),
+                                         mask_thr_min=float(args.mask_thr_min),
+                                         mask_thr_max=float(args.mask_thr_max),
+                                         limit=int(args.thr_tune_limit),
+                                         beta=2.0)
+
+            valm = eval_pixel_union_cached(model, dl_val, device,
+                                           thr["score_thr"], thr["mask_thr"],
+                                           limit=int(args.thr_tune_limit), beta=2.0)
+
+            hist = {"epoch": int(epoch), "train_loss": float(tr["loss"]), "val_f2": float(valm["f2"]),
+                    "val_precision": float(valm["precision"]), "val_recall": float(valm["recall"]), "val_iou": float(valm["iou"]),
+                    "score_thr": float(thr["score_thr"]), "mask_thr": float(thr["mask_thr"])}
+            history.append(hist)
+            save_json(os.path.join(run_dir, "history.json"), history)
+
+            log(f"[VAL] epoch={epoch} f2={valm['f2']:.6f} prec={valm['precision']:.4f} rec={valm['recall']:.4f} "
+                f"iou={valm['iou']:.4f} score_thr={thr['score_thr']:.3f} mask_thr={thr['mask_thr']:.3f}")
+
+            if valm["f2"] > best_f2:
+                best_f2 = float(valm["f2"])
+                best_epoch = int(epoch)
+                best_thr = {"score_thr": float(thr["score_thr"]), "mask_thr": float(thr["mask_thr"])}
+                torch.save(model.state_dict(), ckpt_path)
+                save_json(meta_path, {"best_epoch": best_epoch, "best_f2": best_f2, **best_thr})
+                log(f"[CKPT] saved best_model.pt (epoch={best_epoch}, f2={best_f2:.6f})")
+                patience_left = int(args.patience)
+            else:
+                patience_left -= 1
+                log(f"[ES] no improve. patience_left={patience_left}/{args.patience}")
+                if patience_left <= 0:
+                    log("[ES] early stop")
+                    break
+
+        if os.path.isfile(ckpt_path):
+            model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            log("[CKPT] loaded best_model.pt for evaluation/inference")
+        if os.path.isfile(meta_path):
+            meta = load_json(meta_path)
+            best_thr = {"score_thr": float(meta.get("score_thr", best_thr["score_thr"])),
+                        "mask_thr": float(meta.get("mask_thr", best_thr["mask_thr"]))}
+            best_f2 = float(meta.get("best_f2", best_f2))
+            best_epoch = int(meta.get("best_epoch", best_epoch))
+
+    else:
+        assert os.path.isfile(ckpt_path), f"missing ckpt: {ckpt_path}"
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        if os.path.isfile(meta_path):
+            meta = load_json(meta_path)
+            best_thr = {"score_thr": float(meta.get("score_thr", 0.5)),
+                        "mask_thr": float(meta.get("mask_thr", 0.5))}
+        log("[infer] loaded ckpt/meta")
+
+    log(f"[thr] using score_thr={best_thr['score_thr']:.3f} mask_thr={best_thr['mask_thr']:.3f}")
+
+    # ptest eval
+    ptest_metrics = eval_pixel_union_cached(model, dl_ptest, device,
+                                            best_thr["score_thr"], best_thr["mask_thr"],
+                                            limit=int(args.ptest_n), beta=2.0)
+    log(f"[PTEST] pixel F2={ptest_metrics['f2']:.6f} prec={ptest_metrics['precision']:.4f} "
+        f"rec={ptest_metrics['recall']:.4f} iou={ptest_metrics['iou']:.4f}")
+
+    # infer kaggle test_v2
+    if args.mode in ["infer", "train_infer"]:
+        id2inst: Dict[str, List[np.ndarray]] = {}
+
+        det_probs_test: Dict[str, float] = {}
+        if int(args.use_detector_gate_infer) == 1:
+            log(f"[infer-gate] scoring detector probs on test_v2 (n={len(all_test_ids)})")
+            for k, img_id in enumerate(all_test_ids):
+                det_probs_test[img_id] = detector_prob_for_id(det_model, os.path.join(test_img_dir, img_id),
+                                                              int(args.det_img_size), device)
+                if (k + 1) % 500 == 0:
+                    log(f"[infer-gate] scored {k+1}/{len(all_test_ids)}")
+
+        log("[infer] start kaggle test inference")
+        n_run = 0
+        n_skip = 0
+        n_pos_written = 0
+
+        for k, img_id in enumerate(template_ids):
+            img_path = os.path.join(test_img_dir, img_id)
+            if not os.path.isfile(img_path):
+                id2inst[img_id] = []
+                continue
+
+            det_p = det_probs_test.get(img_id, 1.0) if int(args.use_detector_gate_infer) == 1 else 1.0
+            if int(args.use_detector_gate_infer) == 1 and int(args.det_strict) == 1 and det_p < float(args.det_thr):
+                id2inst[img_id] = []
+                n_skip += 1
+                continue
+
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except Exception:
+                id2inst[img_id] = []
+                continue
+
+            if args.infer_size > 0:
+                img = img.resize((args.infer_size, args.infer_size), resample=Image.BILINEAR)
+            img_t = img_to_tensor01(img)
+
+            # raw outputs once
+            out = infer_raw_outputs(model, img_t, device)
+            scores_cpu = out["scores"].detach().cpu()
+            masks_cpu  = out["masks"].detach().cpu()
+
+            insts_final: List[np.ndarray] = []
+            if int(args.auto_relax) == 1:
+                for s in range(int(args.relax_steps)):
+                    cur_score_thr = float(best_thr["score_thr"]) * (float(args.score_gamma) ** s)
+                    cur_mask_thr  = float(best_thr["mask_thr"])  * (float(args.mask_gamma) ** s)
+                    insts = insts_from_cached(scores_cpu, masks_cpu, cur_score_thr, cur_mask_thr)
+                    if len(insts) > 0:
+                        insts_final = insts
+                        break
+            else:
+                insts_final = insts_from_cached(scores_cpu, masks_cpu,
+                                                float(best_thr["score_thr"]), float(best_thr["mask_thr"]))
+
+            id2inst[img_id] = insts_final
+            n_run += 1
+            if len(insts_final) > 0:
+                n_pos_written += 1
+
+            if (k + 1) % 500 == 0:
+                log(f"[infer] done {k+1}/{len(template_ids)} run={n_run} skipped={n_skip} pos_images={n_pos_written}")
+
+        sub_path = os.path.join(run_dir, "submission.csv")
+        n_images, n_inst_rows = write_submission_instance_rows(sub_path, template_ids, id2inst)
+        log(f"[submit] wrote: {sub_path} images={n_images} inst_rows={n_inst_rows}")
+
+        pos_only_path = os.path.join(run_dir, "submission_positive_only.csv")
+        pos_template = [i for i in template_ids if len(id2inst.get(i, [])) > 0]
+        n_images2, n_inst_rows2 = write_submission_instance_rows(pos_only_path, pos_template, id2inst)
+        log(f"[submit] wrote (analysis-only): {pos_only_path} images={n_images2} inst_rows={n_inst_rows2}")
+
+        summary = {
+            "run_dir": run_dir,
+            "best_epoch": int(best_epoch),
+            "best_val_f2": float(best_f2),
+            "score_thr": float(best_thr["score_thr"]),
+            "mask_thr": float(best_thr["mask_thr"]),
+            "ptest_pixel_metrics": ptest_metrics,
+            "infer_template_n": int(len(template_ids)),
+            "infer_skipped_by_detector": int(n_skip),
+            "infer_pos_images": int(n_pos_written),
+            "submission": sub_path,
+            "submission_positive_only": pos_only_path,
+        }
+        save_json(os.path.join(run_dir, "summary.json"), summary)
+        log("[done] summary.json saved")
+
+
+if __name__ == "__main__":
+    main()
