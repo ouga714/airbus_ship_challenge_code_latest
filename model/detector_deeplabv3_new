@@ -1,0 +1,1235 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_deeplabv3_airbus_momos_v512.py
+
+Airbus Ship Detection (momos / docker) — DeepLabV3 binary segmentation (union mask)
+- train_size=512 (training resize)
+- infer_size=768 (Airbus fixed size, test submission)
+- Robustness:
+  * Integrity scan: PIL decode all images and exclude broken files (cacheable)
+  * FP32 only (no AMP)
+  * NaN guards: eps smoothing, prob clamp, safe divisions
+- Evaluation:
+  * Early stopping on VAL (soft tversky, threshold-free) with mandatory TTA(flip4)
+  * Operating point tuning on VAL_TUNE subset: (thr, min_area) grid maximize pixel F2 (proxy)
+- Outputs:
+  <out_dir>/<run_name>/
+    - best_model.pt / last_model.pt
+    - splits.json / config.json
+    - tune_result.json
+    - submission.csv
+    - logs.txt
+    - vis/ (up to vis_n images)
+    - bad_images.json + image_integrity_cache.json
+
+Dataset layout (data_dir):
+  train_v2/
+  test_v2/
+  train_ship_segmentations_v2.csv
+  sample_submission_v2.csv
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import hashlib
+import argparse
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision import transforms
+
+try:
+    from PIL import Image, ImageFile
+except Exception:
+    print("PIL(Pillow) is required.", file=sys.stderr)
+    raise
+
+# OpenCV optional (for connected components)
+_HAS_CV2 = False
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+
+# =========================
+# Logger / utils
+# =========================
+class Logger:
+    def __init__(self, path: str, also_stdout: bool = True):
+        self.path = path
+        self.also_stdout = also_stdout
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.f = open(path, "w", encoding="utf-8")
+
+    def log(self, msg: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} {msg}"
+        self.f.write(line + "\n")
+        self.f.flush()
+        if self.also_stdout:
+            print(line, flush=True)
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def safe_mkdir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def sha1_of_file_head(path: str, nbytes: int = 1024 * 1024) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()
+
+
+# =========================
+# RLE (Airbus)
+# =========================
+def load_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    """
+    Airbus CSV has rows: ImageId, EncodedPixels
+    ImageId may appear multiple rows (instances). Here we build UNION mask => list of rles per image.
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in r.fieldnames or "EncodedPixels" not in r.fieldnames:
+            raise RuntimeError(f"Unexpected CSV header: {r.fieldnames}")
+        for row in r:
+            img_id = str(row["ImageId"]).strip()
+            enc = row["EncodedPixels"]
+            if enc is None:
+                continue
+            enc = str(enc).strip()
+            if enc == "" or enc.lower() == "nan":
+                continue
+            id2rles.setdefault(img_id, []).append(enc)
+    return id2rles
+
+
+def rle_decode_union(rles: List[str], height: int, width: int) -> np.ndarray:
+    """
+    Decode multiple RLEs into UNION mask (H,W) uint8 {0,1}
+    Airbus uses column-major (Fortran order) flatten.
+    """
+    if not rles:
+        return np.zeros((height, width), dtype=np.uint8)
+
+    m = np.zeros(height * width, dtype=np.uint8)
+    for rle in rles:
+        s = rle.split()
+        if len(s) % 2 != 0:
+            # malformed -> ignore that instance
+            continue
+        starts = np.asarray(s[0::2], dtype=np.int64) - 1
+        lengths = np.asarray(s[1::2], dtype=np.int64)
+        ends = starts + lengths
+        for st, en in zip(starts, ends):
+            if st < 0:
+                st = 0
+            if en > m.size:
+                en = m.size
+            if en > st:
+                m[st:en] = 1
+    return m.reshape((width, height)).T  # Fortran reshape then transpose -> (H,W)
+
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    Encode binary mask (H,W) to Airbus RLE (Fortran order).
+    Return "" if empty.
+    """
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() == 0:
+        return ""
+    pixels = mask.T.flatten()  # Fortran order flatten
+    # pad
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs.tolist())
+
+
+# =========================
+# Dataset listing / integrity
+# =========================
+def list_image_ids(img_dir: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png")
+    ids = [fn for fn in os.listdir(img_dir) if fn.lower().endswith(exts)]
+    ids.sort()
+    if not ids:
+        raise RuntimeError(f"No images found in: {img_dir}")
+    return ids
+
+
+def check_images_decode(
+    img_dir: str,
+    image_ids: List[str],
+    log: Logger,
+    cache_path: str,
+    use_cache: bool = True
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    Real decode test using PIL.Image.open(...).load() and exclude corrupted images.
+    """
+    ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+    if use_cache and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            valid = cache.get("valid_ids", None)
+            bad = cache.get("bad_images", None)
+            if isinstance(valid, list) and isinstance(bad, list):
+                log.log(f"[INTEGRITY] cache hit: {cache_path} (valid={len(valid)} bad={len(bad)})")
+                return valid, bad
+        except Exception as e:
+            log.log(f"[INTEGRITY] cache read failed: {repr(e)} -> fallback to rescan")
+
+    t0 = time.time()
+    valid_ids: List[str] = []
+    bad: List[Dict[str, str]] = []
+
+    n = len(image_ids)
+    log_every = max(2000, n // 50) if n > 0 else 2000
+    log.log(f"[INTEGRITY] start full decode scan: n={n}")
+
+    for i, img_id in enumerate(image_ids, start=1):
+        p = os.path.join(img_dir, img_id)
+        try:
+            with Image.open(p) as im:
+                im.load()
+            valid_ids.append(img_id)
+        except Exception as e:
+            try:
+                sz = os.path.getsize(p)
+            except Exception:
+                sz = -1
+            bad.append({"image_id": img_id, "path": p, "bytes": str(sz), "error": repr(e)})
+
+        if (i % log_every) == 0:
+            log.log(f"[INTEGRITY] progress {i}/{n} valid={len(valid_ids)} bad={len(bad)}")
+
+    dt = time.time() - t0
+    log.log(f"[INTEGRITY] done: valid={len(valid_ids)} bad={len(bad)} sec={dt:.1f}")
+
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "img_dir": img_dir,
+                "total": n,
+                "valid": len(valid_ids),
+                "bad": len(bad),
+                "valid_ids": valid_ids,
+                "bad_images": bad,
+            }, f, indent=2, ensure_ascii=False)
+        log.log(f"[INTEGRITY] cache written: {cache_path}")
+    except Exception as e:
+        log.log(f"[INTEGRITY] cache write failed: {repr(e)} (ignored)")
+
+    return valid_ids, bad
+
+
+# =========================
+# Splitting / sampling
+# =========================
+def make_pos_set_from_id2rles(id2rles: Dict[str, List[str]]) -> set:
+    return set(id2rles.keys())
+
+
+def sample_stratified(ids: List[str], pos_set: set, n: int, pos_frac: float, rng: np.random.Generator) -> List[str]:
+    pos_ids = [i for i in ids if i in pos_set]
+    neg_ids = [i for i in ids if i not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    n = int(n)
+    if n <= 0:
+        return []
+
+    pos_frac = float(pos_frac)
+    pos_frac = max(0.0, min(1.0, pos_frac))
+    n_pos = int(round(n * pos_frac))
+    n_neg = n - n_pos
+
+    # clamp by availability
+    n_pos = min(n_pos, len(pos_ids))
+    n_neg = min(n_neg, len(neg_ids))
+    # if shortfall, fill from the other side
+    while (n_pos + n_neg) < n:
+        if len(pos_ids) > n_pos:
+            n_pos += 1
+        elif len(neg_ids) > n_neg:
+            n_neg += 1
+        else:
+            break
+
+    out = pos_ids[:n_pos] + neg_ids[:n_neg]
+    rng.shuffle(out)
+    return out
+
+
+def build_splits(
+    all_ids: List[str],
+    pos_set: set,
+    seed: int,
+    val_ratio: float,
+    train_n: int,
+    val_n: int,
+    ptest_n: int,
+    pos_frac: float,
+) -> Dict[str, List[str]]:
+    """
+    - Start from all_ids (valid only)
+    - Create VAL_POOL as val_ratio of all_ids (stratified approx)
+    - From remaining: sample train_n with pos_frac
+    - From VAL_POOL: sample val_n with natural ratio, and ptest_n from remaining pool (natural ratio)
+    - Also split VAL into val_seg and val_tune (half-half)
+    """
+    rng = np.random.default_rng(seed)
+    ids = list(all_ids)
+    rng.shuffle(ids)
+
+    pos_ids = [i for i in ids if i in pos_set]
+    neg_ids = [i for i in ids if i not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    n_pos = len(pos_ids)
+    n_neg = len(neg_ids)
+
+    n_pos_valpool = int(round(n_pos * float(val_ratio)))
+    n_neg_valpool = int(round(n_neg * float(val_ratio)))
+
+    val_pool = pos_ids[:n_pos_valpool] + neg_ids[:n_neg_valpool]
+    rem_pool = pos_ids[n_pos_valpool:] + neg_ids[n_neg_valpool:]
+    rng.shuffle(val_pool)
+    rng.shuffle(rem_pool)
+
+    # train from rem_pool with desired pos_frac
+    train_ids = sample_stratified(rem_pool, pos_set, train_n, pos_frac, rng)
+
+    # remove train from rem_pool (no overlap)
+    train_set = set(train_ids)
+    rem2 = [i for i in rem_pool if i not in train_set]
+
+    # val/ptest from val_pool then rem2 if needed
+    # natural pos frac in val_pool is okay; we'll just sample without forcing
+    def sample_any(pool: List[str], n: int) -> List[str]:
+        pool = list(pool)
+        rng.shuffle(pool)
+        return pool[:min(len(pool), int(n))]
+
+    val_ids = sample_any(val_pool, val_n)
+    val_set = set(val_ids)
+    val_pool2 = [i for i in val_pool if i not in val_set]
+
+    ptest_ids = sample_any(val_pool2 + rem2, ptest_n)
+
+    # split val into seg/tune
+    rng.shuffle(val_ids)
+    mid = len(val_ids) // 2
+    val_seg = val_ids[:mid]
+    val_tune = val_ids[mid:]
+
+    return {
+        "train": train_ids,
+        "val_seg": val_seg,
+        "val_tune": val_tune,
+        "ptest": ptest_ids,
+    }
+
+
+# =========================
+# Transforms
+# =========================
+_IMNET_MEAN = (0.485, 0.456, 0.406)
+_IMNET_STD  = (0.229, 0.224, 0.225)
+
+
+def build_tfm_train(size: int):
+    return transforms.Compose([
+        transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.25),
+        transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.06, hue=0.01),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+    ])
+
+
+def build_tfm_infer(size: int):
+    return transforms.Compose([
+        transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+    ])
+
+
+# =========================
+# Dataset
+# =========================
+class AirbusSegDataset(Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        image_ids: List[str],
+        id2rles: Dict[str, List[str]],
+        out_size: int,
+        tfm_img,
+        train: bool,
+        strict_rle: bool,
+        log: Optional[Logger] = None,
+    ):
+        self.img_dir = img_dir
+        self.ids = image_ids
+        self.id2rles = id2rles
+        self.out_size = int(out_size)
+        self.tfm_img = tfm_img
+        self.train = bool(train)
+        self.strict_rle = bool(strict_rle)
+        self.log = log
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            raise RuntimeError(f"[DATA] image open failed: {path} err={repr(e)}") from e
+
+        w, h = img.size
+        rles = self.id2rles.get(img_id, [])
+        try:
+            mask = rle_decode_union(rles, height=h, width=w)  # (H,W) uint8
+        except Exception as e:
+            if self.strict_rle:
+                raise RuntimeError(f"[DATA] RLE decode failed: {img_id} err={repr(e)}") from e
+            # fallback to empty
+            if self.log is not None:
+                self.log.log(f"[WARN] RLE decode failed -> empty: {img_id} err={repr(e)}")
+            mask = np.zeros((h, w), dtype=np.uint8)
+
+        # resize mask to out_size (NEAREST)
+        mask_pil = Image.fromarray(mask * 255)
+        mask_rs = mask_pil.resize((self.out_size, self.out_size), resample=Image.NEAREST)
+        mask_rs = (np.array(mask_rs) > 127).astype(np.uint8)
+
+        x = self.tfm_img(img)  # (3, out, out) float
+        y = torch.from_numpy(mask_rs).unsqueeze(0).float()  # (1,out,out)
+        return x, y, img_id
+
+
+# =========================
+# Model (IMPORTANT: head replacement)
+# =========================
+def build_deeplabv3(model_name: str, pretrained: bool, aux_loss: bool, log: Optional[Logger] = None) -> nn.Module:
+    """
+    Use torchvision DeepLabV3, then REPLACE heads deterministically to 1 channel.
+    This avoids the common bug where classifier structure differs across torchvision versions.
+    """
+    from torchvision.models.segmentation.deeplabv3 import DeepLabHead
+    from torchvision.models.segmentation.fcn import FCNHead
+
+    model_name = model_name.strip().lower()
+    weights = None
+
+    if pretrained:
+        if model_name == "deeplabv3_resnet50":
+            weights = torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT
+        elif model_name == "deeplabv3_resnet101":
+            weights = torchvision.models.segmentation.DeepLabV3_ResNet101_Weights.DEFAULT
+        else:
+            raise ValueError(f"Unsupported model_name: {model_name}")
+
+    if model_name == "deeplabv3_resnet50":
+        m = torchvision.models.segmentation.deeplabv3_resnet50(weights=weights, aux_loss=aux_loss)
+    elif model_name == "deeplabv3_resnet101":
+        m = torchvision.models.segmentation.deeplabv3_resnet101(weights=weights, aux_loss=aux_loss)
+    else:
+        raise ValueError(f"Unsupported model_name: {model_name}")
+
+    # ---- CRITICAL: replace heads to 1 channel ----
+    m.classifier = DeepLabHead(2048, 1)
+    if aux_loss:
+        m.aux_classifier = FCNHead(1024, 1)
+
+    if log is not None:
+        log.log(f"[MODEL] built {model_name} pretrained={pretrained} aux_loss={aux_loss} -> head=1ch (DeepLabHead/FCNHead)")
+    return m
+
+
+# =========================
+# Loss (BCE + soft Tversky)
+# =========================
+def soft_tversky_score(prob: torch.Tensor, target: torch.Tensor, alpha: float, beta: float, eps: float) -> torch.Tensor:
+    """
+    prob, target: (B,1,H,W) in [0,1]
+    score in [0,1]
+    """
+    prob = prob.clamp(min=eps, max=1.0 - eps)
+    target = target.clamp(min=0.0, max=1.0)
+
+    tp = (prob * target).sum(dim=(1,2,3))
+    fp = (prob * (1.0 - target)).sum(dim=(1,2,3))
+    fn = ((1.0 - prob) * target).sum(dim=(1,2,3))
+
+    denom = tp + alpha * fp + beta * fn + eps
+    return (tp + eps) / denom
+
+
+def loss_bce_tversky(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    bce_pos_weight: float,
+    tversky_alpha: float,
+    tversky_beta: float,
+    eps: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    logits: (B,1,H,W)
+    target: (B,1,H,W)
+    """
+    bce = F.binary_cross_entropy_with_logits(
+        logits, target,
+        pos_weight=torch.tensor([bce_pos_weight], device=logits.device, dtype=logits.dtype)
+    )
+    prob = torch.sigmoid(logits)
+    tv = soft_tversky_score(prob, target, alpha=tversky_alpha, beta=tversky_beta, eps=eps).mean()
+    tv_loss = 1.0 - tv
+    loss = bce + tv_loss
+    return loss, {"bce": float(bce.detach().cpu()), "tversky": float(tv.detach().cpu()), "tv_loss": float(tv_loss.detach().cpu())}
+
+
+# =========================
+# TTA forward
+# =========================
+@torch.no_grad()
+def forward_logits_tta(model: nn.Module, x: torch.Tensor, use_tta: bool) -> torch.Tensor:
+    """
+    x: (B,3,H,W)
+    return logits: (B,1,H,W)
+    """
+    if not use_tta:
+        out = model(x)["out"]
+        return out
+
+    def f(inp: torch.Tensor) -> torch.Tensor:
+        return model(inp)["out"]
+
+    logits0 = f(x)
+    logits1 = torch.flip(f(torch.flip(x, dims=[3])), dims=[3])  # hflip
+    logits2 = torch.flip(f(torch.flip(x, dims=[2])), dims=[2])  # vflip
+    logits3 = torch.flip(f(torch.flip(x, dims=[2,3])), dims=[2,3])  # hv
+    return (logits0 + logits1 + logits2 + logits3) / 4.0
+
+
+# =========================
+# Postprocess
+# =========================
+def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    """
+    mask: (H,W) uint8 {0,1}
+    """
+    min_area = int(min_area)
+    if min_area <= 0:
+        return mask
+    if not _HAS_CV2:
+        return mask
+
+    m = (mask > 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num <= 1:
+        return m
+
+    out = np.zeros_like(m)
+    for k in range(1, num):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            out[labels == k] = 1
+    return out
+
+
+# =========================
+# Metrics (pixel F2 proxy)
+# =========================
+def fbeta_from_counts(tp: float, fp: float, fn: float, beta: float) -> float:
+    beta2 = beta * beta
+    denom = (1.0 + beta2) * tp + beta2 * fn + fp
+    if denom <= 0:
+        return 0.0
+    return (1.0 + beta2) * tp / denom
+
+
+def accumulate_pixel_counts(pred: np.ndarray, gt: np.ndarray) -> Tuple[float,float,float]:
+    """
+    pred, gt: (H,W) uint8 {0,1}
+    """
+    pred = (pred > 0).astype(np.uint8)
+    gt = (gt > 0).astype(np.uint8)
+    tp = float(((pred == 1) & (gt == 1)).sum())
+    fp = float(((pred == 1) & (gt == 0)).sum())
+    fn = float(((pred == 0) & (gt == 1)).sum())
+    return tp, fp, fn
+
+
+# =========================
+# Train / Eval
+# =========================
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    args,
+    log: Logger,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+) -> Dict[str, float]:
+    model.train()
+    loss_sum = 0.0
+    n = 0
+    t0 = time.time()
+
+    for it, (x, y, _) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)["out"]  # (B,1,H,W)
+        loss, pack = loss_bce_tversky(
+            logits, y,
+            bce_pos_weight=float(args.bce_pos_weight),
+            tversky_alpha=float(args.tversky_alpha),
+            tversky_beta=float(args.tversky_beta),
+            eps=float(args.eps),
+        )
+        loss.backward()
+
+        if float(args.grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        bs = int(x.shape[0])
+        loss_sum += float(loss.detach().cpu()) * bs
+        n += bs
+
+        if int(args.log_every) > 0 and (it % int(args.log_every) == 0):
+            lr_now = optimizer.param_groups[0]["lr"]
+            log.log(f"[TRAIN] iter={it}/{len(loader)} loss={float(loss.detach().cpu()):.6f} bce={pack['bce']:.6f} tv={pack['tversky']:.6f} lr={lr_now:.6e}")
+
+    dt = time.time() - t0
+    return {"train_loss": float(loss_sum / max(1, n)), "train_n": float(n), "sec": float(dt)}
+
+
+@torch.no_grad()
+def eval_soft_tversky(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    args,
+    use_tta: bool,
+) -> float:
+    """
+    Threshold-free score for early stopping: mean soft Tversky
+    """
+    model.eval()
+    scores = []
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = forward_logits_tta(model, x, use_tta=use_tta)
+        prob = torch.sigmoid(logits)
+        tv = soft_tversky_score(prob, y, alpha=float(args.tversky_alpha), beta=float(args.tversky_beta), eps=float(args.eps)).mean()
+        scores.append(float(tv.detach().cpu()))
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
+@torch.no_grad()
+def predict_prob_map_single(
+    model: nn.Module,
+    img_path: str,
+    tfm_infer,
+    device: torch.device,
+    use_tta: bool,
+    infer_size: int,
+) -> np.ndarray:
+    """
+    Return prob map (infer_size,infer_size) float32
+    """
+    img = Image.open(img_path).convert("RGB")
+    x = tfm_infer(img).unsqueeze(0).to(device)
+    logits = forward_logits_tta(model, x, use_tta=use_tta)
+    prob = torch.sigmoid(logits)[0,0].detach().cpu().numpy().astype(np.float32)
+    if prob.shape[0] != infer_size:
+        # safety (should not happen because tfm_infer resize)
+        prob = cv2.resize(prob, (infer_size, infer_size), interpolation=cv2.INTER_LINEAR) if _HAS_CV2 else np.array(Image.fromarray((prob*255).astype(np.uint8)).resize((infer_size,infer_size)))
+        prob = prob.astype(np.float32) / (255.0 if prob.max() > 1.0 else 1.0)
+    return prob
+
+
+# =========================
+# Tuning (thr, min_area)
+# =========================
+def tune_operating_point(
+    model: nn.Module,
+    img_dir: str,
+    ids: List[str],
+    id2rles: Dict[str, List[str]],
+    tfm_infer,
+    device: torch.device,
+    args,
+    log: Logger,
+) -> Dict[str, object]:
+    """
+    Grid search over thr and min_area to maximize pixel F2 on a subset (thr_tune_limit).
+    This is a proxy objective (not exact Kaggle metric), but works as a practical operating-point tuner.
+    """
+    infer_size = int(args.infer_size)
+    use_tta = (int(args.tta) == 1)
+
+    # grid
+    thr_grid_n = int(args.thr_grid_n)
+    thr_grid = np.linspace(0.0, 1.0, thr_grid_n).astype(np.float32)
+    min_area_grid = [int(x) for x in str(args.min_area_grid).split(",") if str(x).strip() != ""]
+    if not min_area_grid:
+        min_area_grid = [0]
+
+    rng = np.random.default_rng(int(args.seed) + 999)
+    ids0 = list(ids)
+    rng.shuffle(ids0)
+    ids0 = ids0[:min(len(ids0), int(args.thr_tune_limit))]
+
+    log.log(f"[TUNE] start: n={len(ids0)} thr_grid_n={thr_grid_n} min_area_grid={min_area_grid} tta={use_tta} infer_size={infer_size}")
+
+    # precompute GT masks at infer_size
+    gt_masks: Dict[str, np.ndarray] = {}
+    for img_id in ids0:
+        p = os.path.join(img_dir, img_id)
+        with Image.open(p) as im:
+            w, h = im.size
+        gt = rle_decode_union(id2rles.get(img_id, []), height=h, width=w)
+        gt_pil = Image.fromarray(gt * 255).resize((infer_size, infer_size), resample=Image.NEAREST)
+        gt_rs = (np.array(gt_pil) > 127).astype(np.uint8)
+        gt_masks[img_id] = gt_rs
+
+    # precompute prob maps
+    prob_maps: Dict[str, np.ndarray] = {}
+    model.eval()
+    for i, img_id in enumerate(ids0, start=1):
+        p = os.path.join(img_dir, img_id)
+        prob = predict_prob_map_single(model, p, tfm_infer, device, use_tta=use_tta, infer_size=infer_size)
+        prob_maps[img_id] = prob
+        if (i % 200) == 0:
+            log.log(f"[TUNE] probmaps {i}/{len(ids0)}")
+
+    best = {"f2": -1.0, "thr": 0.5, "min_area": 0, "tp": 0.0, "fp": 0.0, "fn": 0.0}
+    beta = 2.0
+
+    for min_area in min_area_grid:
+        for thr in thr_grid:
+            tp = fp = fn = 0.0
+            for img_id in ids0:
+                prob = prob_maps[img_id]
+                pred = (prob >= float(thr)).astype(np.uint8)
+                pred = remove_small_components(pred, min_area=min_area)
+                gt = gt_masks[img_id]
+                a, b, c = accumulate_pixel_counts(pred, gt)
+                tp += a; fp += b; fn += c
+
+            f2 = fbeta_from_counts(tp, fp, fn, beta=beta)
+            if f2 > best["f2"] + 1e-12:
+                best = {"f2": float(f2), "thr": float(thr), "min_area": int(min_area), "tp": float(tp), "fp": float(fp), "fn": float(fn)}
+
+    log.log(f"[TUNE] best: f2={best['f2']:.6f} thr={best['thr']:.4f} min_area={best['min_area']} (tp={best['tp']:.0f} fp={best['fp']:.0f} fn={best['fn']:.0f})")
+    return {"best": best, "thr_grid_n": thr_grid_n, "min_area_grid": min_area_grid, "n_used": len(ids0)}
+
+
+# =========================
+# Visualization
+# =========================
+def save_visualizations(
+    model: nn.Module,
+    img_dir: str,
+    ids: List[str],
+    id2rles: Dict[str, List[str]],
+    tfm_infer,
+    device: torch.device,
+    args,
+    vis_dir: str,
+    thr: float,
+    min_area: int,
+    log: Logger,
+):
+    safe_mkdir(vis_dir)
+    infer_size = int(args.infer_size)
+    use_tta = (int(args.tta) == 1)
+
+    n = min(len(ids), int(args.vis_n))
+    ids0 = ids[:n]
+    log.log(f"[VIS] start: n={n} dir={vis_dir}")
+
+    for i, img_id in enumerate(ids0, start=1):
+        img_path = os.path.join(img_dir, img_id)
+        img = Image.open(img_path).convert("RGB").resize((infer_size, infer_size), resample=Image.BILINEAR)
+
+        # GT
+        with Image.open(os.path.join(img_dir, img_id)) as im0:
+            w, h = im0.size
+        gt = rle_decode_union(id2rles.get(img_id, []), height=h, width=w)
+        gt_rs = Image.fromarray(gt * 255).resize((infer_size, infer_size), resample=Image.NEAREST)
+        gt_rs_np = (np.array(gt_rs) > 127).astype(np.uint8)
+
+        # prob/pred
+        prob = predict_prob_map_single(model, img_path, tfm_infer, device, use_tta=use_tta, infer_size=infer_size)
+        pred = (prob >= float(thr)).astype(np.uint8)
+        pred = remove_small_components(pred, min_area=min_area)
+
+        # build panel (RGB, GT overlay, Prob heat, Pred overlay)
+        rgb = np.array(img).astype(np.uint8)
+
+        def overlay(mask01: np.ndarray) -> np.ndarray:
+            m = (mask01 > 0).astype(np.uint8)
+            out = rgb.copy()
+            # red overlay
+            out[m == 1, 0] = np.clip(out[m == 1, 0] * 0.4 + 255 * 0.6, 0, 255).astype(np.uint8)
+            out[m == 1, 1] = (out[m == 1, 1] * 0.4).astype(np.uint8)
+            out[m == 1, 2] = (out[m == 1, 2] * 0.4).astype(np.uint8)
+            return out
+
+        gt_ov = overlay(gt_rs_np)
+        pred_ov = overlay(pred)
+
+        prob_img = (np.clip(prob, 0, 1) * 255).astype(np.uint8)
+        prob_rgb = np.stack([prob_img, prob_img, prob_img], axis=-1)
+
+        top = np.concatenate([rgb, gt_ov], axis=1)
+        bot = np.concatenate([prob_rgb, pred_ov], axis=1)
+        panel = np.concatenate([top, bot], axis=0)
+
+        out_path = os.path.join(vis_dir, f"vis_{i:04d}__{img_id}")
+        Image.fromarray(panel).save(out_path, quality=95)
+
+        if (i % 50) == 0:
+            log.log(f"[VIS] {i}/{n}")
+
+    log.log("[VIS] done")
+
+
+# =========================
+# Submission
+# =========================
+def infer_and_write_submission(
+    model: nn.Module,
+    test_img_dir: str,
+    sample_sub_csv: str,
+    tfm_infer,
+    device: torch.device,
+    args,
+    out_csv: str,
+    thr: float,
+    min_area: int,
+    log: Logger,
+):
+    infer_size = int(args.infer_size)
+    if infer_size != 768:
+        raise RuntimeError("Airbus test images are 768x768; set --infer_size 768 for submission.")
+    use_tta = (int(args.tta) == 1)
+
+    # read template order
+    rows = []
+    with open(sample_sub_csv, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in r.fieldnames:
+            raise RuntimeError(f"Unexpected submission header: {r.fieldnames}")
+        for row in r:
+            rows.append({"ImageId": row["ImageId"], "EncodedPixels": ""})
+
+    log.log(f"[SUB] template rows={len(rows)} thr={thr:.5f} min_area={min_area} tta={use_tta}")
+
+    for i, row in enumerate(rows, start=1):
+        img_id = row["ImageId"]
+        img_path = os.path.join(test_img_dir, img_id)
+        prob = predict_prob_map_single(model, img_path, tfm_infer, device, use_tta=use_tta, infer_size=infer_size)
+        pred = (prob >= float(thr)).astype(np.uint8)
+        pred = remove_small_components(pred, min_area=min_area)
+        row["EncodedPixels"] = rle_encode(pred)
+
+        if (i % 500) == 0:
+            log.log(f"[SUB] {i}/{len(rows)} done")
+
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["ImageId", "EncodedPixels"])
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+    non_empty = sum(1 for r in rows if str(r["EncodedPixels"]).strip() != "")
+    log.log(f"[SUB] written: {out_csv} non_empty={non_empty}/{len(rows)}")
+
+
+# =========================
+# Main
+# =========================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--model", type=str, default="deeplabv3_resnet50")
+    ap.add_argument("--pretrained", type=int, default=1)
+    ap.add_argument("--aux_loss", type=int, default=1)
+
+    ap.add_argument("--train_size", type=int, default=512)
+    ap.add_argument("--infer_size", type=int, default=768)
+
+    ap.add_argument("--train_n", type=int, default=20000)
+    ap.add_argument("--val_n", type=int, default=3000)
+    ap.add_argument("--ptest_n", type=int, default=3000)
+    ap.add_argument("--pos_frac", type=float, default=0.40)
+    ap.add_argument("--val_ratio", type=float, default=0.15)
+
+    ap.add_argument("--batch_train", type=int, default=4)
+    ap.add_argument("--batch_eval", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--max_epochs", type=int, default=50)
+    ap.add_argument("--patience", type=int, default=6)
+
+    ap.add_argument("--bce_pos_weight", type=float, default=1.0)
+    ap.add_argument("--tversky_alpha", type=float, default=0.60)
+    ap.add_argument("--tversky_beta", type=float, default=0.40)
+    ap.add_argument("--eps", type=float, default=1e-6)
+
+    ap.add_argument("--tta", type=int, default=1)
+
+    ap.add_argument("--thr_grid_n", type=int, default=41)
+    ap.add_argument("--min_area_grid", type=str, default="0,25,50,75,100")
+    ap.add_argument("--thr_tune_limit", type=int, default=1200)
+
+    ap.add_argument("--vis_n", type=int, default=200)
+
+    ap.add_argument("--integrity_check", type=int, default=1)
+    ap.add_argument("--integrity_cache", type=int, default=1)
+    ap.add_argument("--integrity_fail_if_bad", type=int, default=0)
+
+    ap.add_argument("--strict_rle_check", type=int, default=0)
+
+    ap.add_argument("--grad_clip", type=float, default=0.0)
+    ap.add_argument("--log_every", type=int, default=50)
+
+    args = ap.parse_args()
+
+    seed_everything(int(args.seed))
+
+    data_dir = os.path.abspath(args.data_dir)
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    # sanity
+    if not os.path.isdir(train_img_dir):
+        raise RuntimeError(f"train_v2 not found: {train_img_dir}")
+    if not os.path.isdir(test_img_dir):
+        raise RuntimeError(f"test_v2 not found: {test_img_dir}")
+    if not os.path.exists(train_csv):
+        raise RuntimeError(f"train_ship_segmentations_v2.csv not found: {train_csv}")
+    if not os.path.exists(sample_sub):
+        raise RuntimeError(f"sample_submission_v2.csv not found: {sample_sub}")
+
+    # load labels
+    id2rles = load_id2rles(train_csv)
+    pos_set = make_pos_set_from_id2rles(id2rles)
+
+    # list ids from directory (important!)
+    all_ids = list_image_ids(train_img_dir)
+
+    run_name = (
+        f"run__seg__{args.model}__train{args.train_size}__infer{args.infer_size}"
+        f"__seed{args.seed}__trainN{args.train_n}__valN{args.val_n}__ptestN{args.ptest_n}"
+        f"__pos{args.pos_frac:.2f}__valr{args.val_ratio:.2f}"
+        f"__tta{int(args.tta)}__ic{int(args.integrity_check)}__cache{int(args.integrity_cache)}"
+    )
+    run_dir = os.path.join(os.path.abspath(args.out_dir), run_name)
+    safe_mkdir(run_dir)
+
+    log = Logger(os.path.join(run_dir, "logs.txt"), also_stdout=True)
+    log.log("==== START: DeepLabV3 Airbus (union mask) ====")
+    log.log(f"run_dir={run_dir}")
+    log.log(f"data_dir={data_dir}")
+    log.log(f"train_img_dir={train_img_dir}")
+    log.log(f"test_img_dir={test_img_dir}")
+    log.log(f"train_csv={train_csv}")
+    log.log(f"sample_sub={sample_sub}")
+    log.log(f"all_ids(dir)={len(all_ids)} pos(CSV)={len(pos_set)} pos_rate={len(pos_set)/len(all_ids):.4f}")
+    log.log(f"cv2_available={_HAS_CV2}")
+
+    # integrity
+    valid_ids = all_ids
+    bad_records: List[Dict[str, str]] = []
+    integrity_cache_path = os.path.join(run_dir, "image_integrity_cache.json")
+    if int(args.integrity_check) == 1:
+        valid_ids, bad_records = check_images_decode(
+            img_dir=train_img_dir,
+            image_ids=all_ids,
+            log=log,
+            cache_path=integrity_cache_path,
+            use_cache=(int(args.integrity_cache) == 1),
+        )
+        bad_json = os.path.join(run_dir, "bad_images.json")
+        with open(bad_json, "w", encoding="utf-8") as f:
+            json.dump({"bad_count": len(bad_records), "bad_images": bad_records}, f, indent=2, ensure_ascii=False)
+        log.log(f"[INTEGRITY] bad_images.json written: {bad_json}")
+        if len(bad_records) > 0 and int(args.integrity_fail_if_bad) == 1:
+            log.log("[INTEGRITY] abort due to bad images and integrity_fail_if_bad=1")
+            log.close()
+            raise RuntimeError(f"Integrity check found bad images: {len(bad_records)}")
+
+    if len(valid_ids) == 0:
+        log.close()
+        raise RuntimeError("No valid images after integrity filtering.")
+
+    # splits
+    splits = build_splits(
+        all_ids=valid_ids,
+        pos_set=pos_set,
+        seed=int(args.seed),
+        val_ratio=float(args.val_ratio),
+        train_n=int(args.train_n),
+        val_n=int(args.val_n),
+        ptest_n=int(args.ptest_n),
+        pos_frac=float(args.pos_frac),
+    )
+    train_ids = splits["train"]
+    val_seg_ids = splits["val_seg"]
+    val_tune_ids = splits["val_tune"]
+    ptest_ids = splits["ptest"]
+
+    def pos_rate(ids: List[str]) -> float:
+        if not ids:
+            return 0.0
+        return float(sum(1 for i in ids if i in pos_set) / len(ids))
+
+    log.log(f"[SPLIT] train={len(train_ids)} pos_rate={pos_rate(train_ids):.4f}")
+    log.log(f"[SPLIT] val_seg={len(val_seg_ids)} pos_rate={pos_rate(val_seg_ids):.4f}")
+    log.log(f"[SPLIT] val_tune={len(val_tune_ids)} pos_rate={pos_rate(val_tune_ids):.4f}")
+    log.log(f"[SPLIT] ptest={len(ptest_ids)} pos_rate={pos_rate(ptest_ids):.4f}")
+
+    # save config/splits
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+    with open(os.path.join(run_dir, "splits.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "seed": int(args.seed),
+            "valid_n": len(valid_ids),
+            "bad_n": len(bad_records),
+            "train": train_ids,
+            "val_seg": val_seg_ids,
+            "val_tune": val_tune_ids,
+            "ptest": ptest_ids,
+        }, f, indent=2, ensure_ascii=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.log(f"device={device}")
+
+    # datasets/loaders
+    tfm_train = build_tfm_train(int(args.train_size))
+    tfm_eval_train = build_tfm_infer(int(args.train_size))
+    tfm_infer = build_tfm_infer(int(args.infer_size))
+
+    ds_train = AirbusSegDataset(train_img_dir, train_ids, id2rles, int(args.train_size), tfm_train, True, int(args.strict_rle_check) == 1, log=log)
+    ds_val_seg = AirbusSegDataset(train_img_dir, val_seg_ids, id2rles, int(args.train_size), tfm_eval_train, False, int(args.strict_rle_check) == 1, log=log)
+
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=int(args.batch_train),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=(int(args.num_workers) > 0),
+    )
+    dl_val_seg = DataLoader(
+        ds_val_seg,
+        batch_size=max(1, int(args.batch_eval)),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(int(args.num_workers) > 0),
+    )
+
+    # model
+    model = build_deeplabv3(
+        model_name=str(args.model),
+        pretrained=(int(args.pretrained) == 1),
+        aux_loss=(int(args.aux_loss) == 1),
+        log=log
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    total_steps = max(1, int(args.max_epochs) * max(1, len(dl_train)))
+    eta_min = float(args.lr) * 0.05
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
+    log.log(f"[SCHED] CosineAnnealingLR: total_steps={total_steps} eta_min={eta_min:.6e}")
+
+    best_epoch = -1
+    best_score = -1.0
+    no_improve = 0
+
+    best_path = os.path.join(run_dir, "best_model.pt")
+    last_path = os.path.join(run_dir, "last_model.pt")
+
+    # train loop
+    for epoch in range(1, int(args.max_epochs) + 1):
+        tr = train_one_epoch(model, dl_train, device, optimizer, args, log, scheduler=scheduler)
+
+        # early-stop metric: soft tversky on val_seg (TTA mandatory)
+        val_tv = eval_soft_tversky(model, dl_val_seg, device, args, use_tta=(int(args.tta) == 1))
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        log.log(f"[EPOCH] {epoch}/{args.max_epochs} train_loss={tr['train_loss']:.6f} sec={tr['sec']:.1f} lr={lr_now:.6e} val_soft_tversky={val_tv:.6f}")
+
+        # save last
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "config": vars(args),
+            "val_soft_tversky": float(val_tv),
+        }, last_path)
+
+        # best
+        if val_tv > best_score + 1e-12:
+            best_score = float(val_tv)
+            best_epoch = int(epoch)
+            no_improve = 0
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "config": vars(args),
+                "val_soft_tversky": float(val_tv),
+                "integrity": {"valid_n": len(valid_ids), "bad_n": len(bad_records), "cache_path": integrity_cache_path},
+            }, best_path)
+            log.log(f"[BEST] epoch={best_epoch} best_val_soft_tversky={best_score:.6f} saved={best_path}")
+        else:
+            no_improve += 1
+            log.log(f"[EARLYSTOP] no_improve={no_improve}/{int(args.patience)}")
+            if int(args.patience) > 0 and no_improve >= int(args.patience):
+                log.log("[EARLYSTOP] triggered -> stop")
+                break
+
+    # load best for tuning/infer
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    # tune operating point on val_tune (infer_size)
+    tune = tune_operating_point(
+        model=model,
+        img_dir=train_img_dir,
+        ids=val_tune_ids,
+        id2rles=id2rles,
+        tfm_infer=tfm_infer,
+        device=device,
+        args=args,
+        log=log,
+    )
+    tune_path = os.path.join(run_dir, "tune_result.json")
+    with open(tune_path, "w", encoding="utf-8") as f:
+        json.dump(tune, f, indent=2, ensure_ascii=False)
+
+    best_thr = float(tune["best"]["thr"])
+    best_min_area = int(tune["best"]["min_area"])
+
+    # visualization (200)
+    rng = np.random.default_rng(int(args.seed) + 2026)
+    vis_ids = list(val_tune_ids) + list(ptest_ids)
+    rng.shuffle(vis_ids)
+    vis_dir = os.path.join(run_dir, "vis")
+    save_visualizations(
+        model=model,
+        img_dir=train_img_dir,
+        ids=vis_ids,
+        id2rles=id2rles,
+        tfm_infer=tfm_infer,
+        device=device,
+        args=args,
+        vis_dir=vis_dir,
+        thr=best_thr,
+        min_area=best_min_area,
+        log=log,
+    )
+
+    # submission
+    sub_path = os.path.join(run_dir, "submission.csv")
+    infer_and_write_submission(
+        model=model,
+        test_img_dir=test_img_dir,
+        sample_sub_csv=sample_sub,
+        tfm_infer=tfm_infer,
+        device=device,
+        args=args,
+        out_csv=sub_path,
+        thr=best_thr,
+        min_area=best_min_area,
+        log=log,
+    )
+
+    # done
+    head_sha1 = sha1_of_file_head(best_path) if os.path.exists(best_path) else "NA"
+    log.log("==== DONE ====")
+    log.log(f"run_dir={run_dir}")
+    log.log(f"best_epoch={best_epoch} best_val_soft_tversky={best_score:.6f}")
+    log.log(f"best_model.pt sha1(first1MB)={head_sha1}")
+    log.log(f"tune_best={json.dumps(tune.get('best', {}), ensure_ascii=False)}")
+    log.close()
+
+
+if __name__ == "__main__":
+    main()
