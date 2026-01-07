@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+infer_maskrcnn_morph_merge_nms_submit_tta.py
+
+Mask R-CNN inference with TTA(flip4) -> morphology -> merge same-instance candidates (IoU clustering)
+-> mask IoU NMS -> optional split -> final ownership -> submission.csv
+
+Common requirements included:
+- Morphology BEFORE NMS
+- NMS uses mask IoU (with bbox IoU gate)
+- Final overlap safety: pixel ownership enforcement (no pixel belongs to 2 instances)
+- Submission in sample_submission_v2.csv order (variable rows allowed)
+
+Example:
+python3 infer_maskrcnn_morph_merge_nms_submit_tta.py \
+  --data_dir /workspace/kaggle_competition/dataset/airbus_ship_detection \
+  --out_csv  /workspace/kaggle_competition/submission_tta_merge.csv \
+  --device cuda:0 \
+  --score_thr 0.35 \
+  --mask_thr 0.50 \
+  --opening_radius 2 \
+  --closing_radius 1 \
+  --min_area 120 \
+  --merge_iou_thr 0.70 \
+  --mask_iou_thr 0.60 \
+  --split_components 1 \
+  --component_topk 15 \
+  --max_instances_per_image 25
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import cv2
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torchvision
+from torchvision.ops import nms
+
+
+# -----------------------------
+# Repro / utils
+# -----------------------------
+
+def set_seed(seed: int) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def ensure_parent_dir(p: str | Path) -> None:
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# RLE (Airbus: column-major)
+# -----------------------------
+
+def rle_encode(mask01_hw: np.ndarray) -> str:
+    if mask01_hw.dtype != np.uint8:
+        mask01_hw = mask01_hw.astype(np.uint8)
+
+    pixels = mask01_hw.flatten(order="F")
+    if pixels.sum() == 0:
+        return ""
+
+    pixels = np.concatenate([[0], pixels, [0]])
+    changes = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    starts = changes[0::2]
+    ends = changes[1::2]
+    lengths = ends - starts
+
+    rle = []
+    for s, l in zip(starts, lengths):
+        rle.append(str(int(s)))
+        rle.append(str(int(l)))
+    return " ".join(rle)
+
+
+# -----------------------------
+# Template order
+# -----------------------------
+
+def read_template_ids(sample_csv: str) -> List[str]:
+    ids = []
+    with open(sample_csv, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if r.fieldnames is None or "ImageId" not in r.fieldnames:
+            raise ValueError(f"sample_submission missing ImageId column: {r.fieldnames}")
+        for row in r:
+            ids.append(row["ImageId"])
+    if not ids:
+        raise ValueError("sample_submission_v2.csv is empty.")
+    return ids
+
+
+# -----------------------------
+# Image loading
+# -----------------------------
+
+def load_test_image_tensor(img_path: Path, infer_size: int) -> torch.Tensor:
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        if infer_size > 0:
+            im = im.resize((infer_size, infer_size), resample=Image.BILINEAR)
+        arr = np.asarray(im, dtype=np.float32) / 255.0
+    x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    return x
+
+
+# -----------------------------
+# Flip TTA utilities
+# -----------------------------
+
+def flip_image(x: torch.Tensor, mode: int) -> torch.Tensor:
+    if mode == 0:
+        return x
+    if mode == 1:
+        return torch.flip(x, dims=[2])  # W
+    if mode == 2:
+        return torch.flip(x, dims=[1])  # H
+    if mode == 3:
+        return torch.flip(x, dims=[1, 2])
+    raise ValueError(mode)
+
+
+def unflip_boxes_xyxy(boxes: torch.Tensor, mode: int, H: int, W: int) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes
+    x1, y1, x2, y2 = boxes[:, 0].clone(), boxes[:, 1].clone(), boxes[:, 2].clone(), boxes[:, 3].clone()
+
+    if mode in (1, 3):  # hflip
+        nx1 = (W - 1) - x2
+        nx2 = (W - 1) - x1
+        x1, x2 = nx1, nx2
+
+    if mode in (2, 3):  # vflip
+        ny1 = (H - 1) - y2
+        ny2 = (H - 1) - y1
+        y1, y2 = ny1, ny2
+
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
+def unflip_masks(masks: torch.Tensor, mode: int) -> torch.Tensor:
+    if masks.numel() == 0:
+        return masks
+    if mode == 0:
+        return masks
+    if mode == 1:
+        return torch.flip(masks, dims=[3])
+    if mode == 2:
+        return torch.flip(masks, dims=[2])
+    if mode == 3:
+        return torch.flip(masks, dims=[2, 3])
+    raise ValueError(mode)
+
+
+# -----------------------------
+# Morphology / components
+# -----------------------------
+
+def morph_opening(mask01_hw: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask01_hw
+    k = 2 * radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.morphologyEx(mask01_hw, cv2.MORPH_OPEN, kernel, iterations=1)
+
+
+def morph_closing(mask01_hw: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask01_hw
+    k = 2 * radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.morphologyEx(mask01_hw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+
+def keep_large_components(mask01_hw: np.ndarray, min_area: int) -> np.ndarray:
+    mask01_hw = mask01_hw.astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask01_hw, connectivity=8)
+    out = np.zeros_like(mask01_hw, dtype=np.uint8)
+    for k in range(1, num):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area >= int(min_area):
+            out[labels == k] = 1
+    return out
+
+
+def split_into_instances_topk(mask01_hw: np.ndarray, min_area: int, topk: int) -> List[np.ndarray]:
+    mask01_hw = mask01_hw.astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask01_hw, connectivity=8)
+    comps = []
+    for k in range(1, num):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area < int(min_area):
+            continue
+        comps.append((area, k))
+    if not comps:
+        return []
+    comps.sort(key=lambda x: x[0], reverse=True)
+    if topk > 0:
+        comps = comps[: int(topk)]
+    insts = []
+    for _, k in comps:
+        insts.append((labels == k).astype(np.uint8))
+    return insts
+
+
+# -----------------------------
+# Model build / load
+# -----------------------------
+
+def strip_module_prefix(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if not sd:
+        return sd
+    if not any(k.startswith("module.") for k in sd.keys()):
+        return sd
+    return {k[len("module."):]: v for k, v in sd.items()}
+
+
+def load_state_dict_flexible(ckpt_path: str, map_location: str = "cpu") -> Dict[str, torch.Tensor]:
+    obj = torch.load(ckpt_path, map_location=map_location)
+    if isinstance(obj, dict):
+        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            sd = obj["state_dict"]
+        elif "model" in obj and isinstance(obj["model"], dict):
+            sd = obj["model"]
+        else:
+            sd = obj
+    else:
+        raise ValueError(f"Unsupported ckpt type: {type(obj)}")
+    sd = strip_module_prefix(sd)
+    return sd
+
+
+def build_maskrcnn(num_classes: int = 2) -> nn.Module:
+    from torchvision.models.detection import maskrcnn_resnet50_fpn
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+    from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+    model = maskrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden, num_classes)
+
+    return model
+
+
+# -----------------------------
+# IoU helpers
+# -----------------------------
+
+def bbox_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+def masks_iou_cropped(mask1: np.ndarray, mask2: np.ndarray, box1: np.ndarray, box2: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = box1
+    bx1, by1, bx2, by2 = box2
+
+    ux1 = int(max(0, min(ax1, bx1)))
+    uy1 = int(max(0, min(ay1, by1)))
+    ux2 = int(max(ax2, bx2))
+    uy2 = int(max(ay2, by2))
+
+    H, W = mask1.shape
+    ux2 = int(min(W, ux2))
+    uy2 = int(min(H, uy2))
+    if ux2 <= ux1 or uy2 <= uy1:
+        return 0.0
+
+    m1 = mask1[uy1:uy2, ux1:ux2]
+    m2 = mask2[uy1:uy2, ux1:ux2]
+
+    inter = int(np.logical_and(m1 == 1, m2 == 1).sum())
+    if inter == 0:
+        return 0.0
+    union = int(np.logical_or(m1 == 1, m2 == 1).sum())
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+# -----------------------------
+# Candidate struct
+# -----------------------------
+
+@dataclass
+class Cand:
+    box: np.ndarray
+    score: float
+    mask01: np.ndarray
+    area: int
+
+
+# -----------------------------
+# Inference with TTA (flip4)
+# -----------------------------
+
+@torch.no_grad()
+def infer_one_image_tta(model: nn.Module, x_3hw: torch.Tensor, score_thr: float) -> Dict[str, torch.Tensor]:
+    model.eval()
+    device = x_3hw.device
+    _, H, W = x_3hw.shape
+
+    tta_modes = [0, 1, 2, 3]
+
+    all_boxes = []
+    all_scores = []
+    all_labels = []
+    all_masks = []
+
+    for mode in tta_modes:
+        x_t = flip_image(x_3hw, mode)
+        out = model([x_t])[0]
+
+        boxes = out.get("boxes", torch.empty((0, 4), device=device))
+        scores = out.get("scores", torch.empty((0,), device=device))
+        labels = out.get("labels", torch.empty((0,), device=device, dtype=torch.long))
+        masks = out.get("masks", torch.empty((0, 1, H, W), device=device))
+
+        if scores.numel() > 0:
+            keep = scores >= float(score_thr)
+            boxes, scores, labels, masks = boxes[keep], scores[keep], labels[keep], masks[keep]
+
+        boxes = unflip_boxes_xyxy(boxes, mode, H, W)
+        masks = unflip_masks(masks, mode)
+
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_labels.append(labels)
+        all_masks.append(masks)
+
+    boxes = torch.cat(all_boxes, dim=0) if all_boxes else torch.empty((0, 4), device=device)
+    scores = torch.cat(all_scores, dim=0) if all_scores else torch.empty((0,), device=device)
+    labels = torch.cat(all_labels, dim=0) if all_labels else torch.empty((0,), device=device, dtype=torch.long)
+    masks = torch.cat(all_masks, dim=0) if all_masks else torch.empty((0, 1, H, W), device=device)
+
+    return {"boxes": boxes, "scores": scores, "labels": labels, "masks": masks}
+
+
+# -----------------------------
+# bbox NMS prefilter (optional)
+# -----------------------------
+
+def bbox_nms_ship_only(boxes: torch.Tensor, scores: torch.Tensor, labels: torch.Tensor, masks: torch.Tensor, nms_iou: float):
+    if scores.numel() == 0:
+        return boxes, scores, labels, masks
+    ship_idx = torch.where(labels == 1)[0]
+    if ship_idx.numel() == 0:
+        return (
+            torch.empty((0, 4), device=boxes.device),
+            torch.empty((0,), device=scores.device),
+            torch.empty((0,), device=labels.device, dtype=torch.long),
+            torch.empty((0, *masks.shape[1:]), device=masks.device),
+        )
+    keep = nms(boxes[ship_idx], scores[ship_idx], float(nms_iou))
+    idx = ship_idx[keep]
+    idx = idx[torch.argsort(scores[idx], descending=True)]
+    return boxes[idx], scores[idx], labels[idx], masks[idx]
+
+
+# -----------------------------
+# Build morphed candidates (morphology BEFORE merge/NMS)
+# -----------------------------
+
+def build_morphed_candidates(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    masks: torch.Tensor,
+    mask_thr: float,
+    opening_radius: int,
+    closing_radius: int,
+    min_area: int,
+    max_candidates: int,
+) -> List[Cand]:
+    if scores.numel() == 0:
+        return []
+    ship_idx = torch.where(labels == 1)[0]
+    if ship_idx.numel() == 0:
+        return []
+
+    boxes_np = boxes[ship_idx].detach().float().cpu().numpy().astype(np.float32)
+    scores_np = scores[ship_idx].detach().float().cpu().numpy().astype(np.float32)
+    probs_np = masks[ship_idx][:, 0].detach().float().cpu().numpy().astype(np.float32)
+
+    order = np.argsort(-scores_np)
+    if max_candidates > 0:
+        order = order[: int(max_candidates)]
+
+    cands: List[Cand] = []
+    for j in order.tolist():
+        prob = np.clip(probs_np[j], 0.0, 1.0)
+        m01 = (prob >= float(mask_thr)).astype(np.uint8)
+
+        # morphology (BEFORE merge/NMS)
+        m01 = morph_opening(m01, int(opening_radius))
+        m01 = morph_closing(m01, int(closing_radius))
+        m01 = keep_large_components(m01, int(min_area))
+
+        area = int(m01.sum())
+        if area <= 0:
+            continue
+
+        cands.append(Cand(box=boxes_np[j], score=float(scores_np[j]), mask01=m01, area=area))
+    return cands
+
+
+# -----------------------------
+# Merge same-instance candidates (IoU clustering on morphed masks)
+# -----------------------------
+
+def merge_same_instances(
+    cands: List[Cand],
+    merge_iou_thr: float,
+    fast_bbox_iou_gate: float,
+    max_after_merge: int,
+) -> List[Cand]:
+    """
+    Cluster candidates by mask IoU >= merge_iou_thr (with bbox gate), then merge each cluster:
+    - score: max score in cluster
+    - box: union box
+    - mask: union of masks (binary)
+    """
+    if not cands:
+        return []
+
+    cands = sorted(cands, key=lambda x: x.score, reverse=True)
+    used = [False] * len(cands)
+    merged: List[Cand] = []
+
+    for i in range(len(cands)):
+        if used[i]:
+            continue
+        leader = cands[i]
+        used[i] = True
+        group = [i]
+
+        for j in range(i + 1, len(cands)):
+            if used[j]:
+                continue
+            cj = cands[j]
+            biou = bbox_iou_xyxy(leader.box, cj.box)
+            if biou < float(fast_bbox_iou_gate):
+                continue
+            miou = masks_iou_cropped(leader.mask01, cj.mask01, leader.box, cj.box)
+            if miou >= float(merge_iou_thr):
+                used[j] = True
+                group.append(j)
+
+        if len(group) == 1:
+            merged.append(leader)
+        else:
+            # union mask
+            m = np.zeros_like(leader.mask01, dtype=np.uint8)
+            sc = 0.0
+            boxes = []
+            for k in group:
+                m = np.logical_or(m, cands[k].mask01.astype(bool))
+                sc = max(sc, float(cands[k].score))
+                boxes.append(cands[k].box)
+            m = m.astype(np.uint8)
+            boxes_np = np.stack(boxes, axis=0).astype(np.float32)
+            box = np.asarray([boxes_np[:, 0].min(), boxes_np[:, 1].min(), boxes_np[:, 2].max(), boxes_np[:, 3].max()], dtype=np.float32)
+            area = int(m.sum())
+            if area > 0:
+                merged.append(Cand(box=box, score=sc, mask01=m, area=area))
+
+        if max_after_merge > 0 and len(merged) >= int(max_after_merge):
+            break
+
+    merged.sort(key=lambda x: x.score, reverse=True)
+    return merged
+
+
+# -----------------------------
+# Mask IoU NMS on (morphed + merged) masks
+# -----------------------------
+
+def mask_iou_nms(cands: List[Cand], mask_iou_thr: float, fast_bbox_iou_gate: float) -> List[Cand]:
+    if not cands:
+        return []
+    cands = sorted(cands, key=lambda x: x.score, reverse=True)
+    kept: List[Cand] = []
+    suppressed = [False] * len(cands)
+
+    for i in range(len(cands)):
+        if suppressed[i]:
+            continue
+        ci = cands[i]
+        kept.append(ci)
+        for j in range(i + 1, len(cands)):
+            if suppressed[j]:
+                continue
+            cj = cands[j]
+            biou = bbox_iou_xyxy(ci.box, cj.box)
+            if biou < float(fast_bbox_iou_gate):
+                continue
+            miou = masks_iou_cropped(ci.mask01, cj.mask01, ci.box, cj.box)
+            if miou >= float(mask_iou_thr):
+                suppressed[j] = True
+    return kept
+
+
+# -----------------------------
+# Final ownership (pixel-exclusive) safety layer
+# -----------------------------
+
+def enforce_pixel_ownership(
+    inst_masks: List[Tuple[float, np.ndarray]],
+    min_area: int,
+    max_instances: int,
+) -> List[np.ndarray]:
+    if not inst_masks:
+        return []
+    inst_masks = sorted(inst_masks, key=lambda x: x[0], reverse=True)
+    H, W = inst_masks[0][1].shape
+    occupied = np.zeros((H, W), dtype=bool)
+
+    out: List[np.ndarray] = []
+    for score, m in inst_masks:
+        if max_instances > 0 and len(out) >= int(max_instances):
+            break
+        m = (m.astype(np.uint8) > 0)
+        if not m.any():
+            continue
+        m = np.logical_and(m, ~occupied)
+        area = int(m.sum())
+        if area < int(min_area):
+            continue
+        occupied |= m
+        out.append(m.astype(np.uint8))
+    return out
+
+
+# -----------------------------
+# Submission writing
+# -----------------------------
+
+def write_submission_variable_rows(out_csv: str, template_ids: List[str], id_to_rles: Dict[str, List[str]]) -> None:
+    ensure_parent_dir(out_csv)
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id in template_ids:
+            rles = id_to_rles.get(img_id, [])
+            if not rles:
+                w.writerow([img_id, ""])
+            else:
+                for rle in rles:
+                    w.writerow([img_id, rle])
+
+
+# -----------------------------
+# Argparse
+# -----------------------------
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--out_csv", type=str, required=True)
+
+    p.add_argument(
+        "--maskrcnn_ckpt",
+        type=str,
+        default="/home/ouga/kaggle_competition/outputs_airbus_maskrcnn_detector_gated/run__maskrcnn_detgate__seed42__train20000__val3000__ptest3000__pos40__1767441256/best_model.pt",
+    )
+
+    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--infer_size", type=int, default=768)
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--log_every", type=int, default=200)
+
+    p.add_argument("--score_thr", type=float, default=0.35)
+    p.add_argument("--mask_thr", type=float, default=0.50)
+
+    # optional bbox NMS prefilter
+    p.add_argument("--use_bbox_nms", type=int, default=1, choices=[0, 1])
+    p.add_argument("--bbox_nms_iou", type=float, default=0.50)
+
+    # morphology (BEFORE merge/NMS)
+    p.add_argument("--opening_radius", type=int, default=2)
+    p.add_argument("--closing_radius", type=int, default=1)
+    p.add_argument("--min_area", type=int, default=120)
+
+    # merge same instances (TTA duplicates)
+    p.add_argument("--merge_iou_thr", type=float, default=0.70)
+    p.add_argument("--max_after_merge", type=int, default=300)
+
+    # mask IoU NMS (after morphology + merge)
+    p.add_argument("--mask_iou_thr", type=float, default=0.60)
+    p.add_argument("--fast_bbox_iou_gate", type=float, default=0.01)
+
+    # split
+    p.add_argument("--split_components", type=int, default=1, choices=[0, 1])
+    p.add_argument("--component_topk", type=int, default=15)
+
+    # caps
+    p.add_argument("--max_candidates", type=int, default=400)
+    p.add_argument("--max_instances_per_image", type=int, default=25, help="Hard cap after final ownership (0 disables)")
+
+    return p
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    set_seed(args.seed)
+
+    data_dir = Path(args.data_dir)
+    test_dir = data_dir / "test_v2"
+    sample_csv = data_dir / "sample_submission_v2.csv"
+
+    if not test_dir.exists():
+        raise FileNotFoundError(f"Missing test_v2: {test_dir}")
+    if not sample_csv.exists():
+        raise FileNotFoundError(f"Missing sample_submission_v2.csv: {sample_csv}")
+
+    template_ids = read_template_ids(str(sample_csv))
+
+    test_paths = {p.name: p for p in test_dir.glob("*.jpg")}
+    if not test_paths:
+        raise FileNotFoundError(f"No .jpg found in: {test_dir}")
+
+    if args.limit and int(args.limit) > 0:
+        template_ids_run = [x for x in template_ids if x in test_paths][: int(args.limit)]
+    else:
+        template_ids_run = [x for x in template_ids if x in test_paths]
+
+    device = torch.device(args.device if (torch.cuda.is_available() or "cpu" in args.device) else "cpu")
+
+    model = build_maskrcnn(num_classes=2)
+    sd = load_state_dict_flexible(args.maskrcnn_ckpt, map_location="cpu")
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+
+    if any("roi_heads.box_predictor" in k for k in missing) or any("roi_heads.mask_predictor" in k for k in missing):
+        raise RuntimeError(
+            "Checkpoint incompatible with this Mask R-CNN build. "
+            f"missing(sample)={missing[:30]} unexpected(sample)={unexpected[:30]}"
+        )
+
+    model.to(device)
+    model.eval()
+
+    id_to_rles: Dict[str, List[str]] = {}
+    nonempty_images = 0
+    total_instances = 0
+
+    for i, img_id in enumerate(template_ids_run, start=1):
+        img_path = test_paths[img_id]
+        x = load_test_image_tensor(img_path, infer_size=int(args.infer_size)).to(device)
+
+        pred = infer_one_image_tta(model, x, score_thr=float(args.score_thr))
+
+        boxes, scores, labels, masks = pred["boxes"], pred["scores"], pred["labels"], pred["masks"]
+
+        # optional bbox NMS prefilter (before morphology)
+        if int(args.use_bbox_nms) == 1 and scores.numel() > 0:
+            boxes, scores, labels, masks = bbox_nms_ship_only(
+                boxes, scores, labels, masks, nms_iou=float(args.bbox_nms_iou)
+            )
+
+        # morphology BEFORE merge/NMS
+        cands = build_morphed_candidates(
+            boxes=boxes, scores=scores, labels=labels, masks=masks,
+            mask_thr=float(args.mask_thr),
+            opening_radius=int(args.opening_radius),
+            closing_radius=int(args.closing_radius),
+            min_area=int(args.min_area),
+            max_candidates=int(args.max_candidates),
+        )
+
+        # merge same-instance (TTA duplicates) on morphed masks
+        cands = merge_same_instances(
+            cands,
+            merge_iou_thr=float(args.merge_iou_thr),
+            fast_bbox_iou_gate=float(args.fast_bbox_iou_gate),
+            max_after_merge=int(args.max_after_merge),
+        )
+
+        # mask IoU NMS on merged masks
+        cands = mask_iou_nms(
+            cands,
+            mask_iou_thr=float(args.mask_iou_thr),
+            fast_bbox_iou_gate=float(args.fast_bbox_iou_gate),
+        )
+
+        # split -> collect instance masks with score
+        inst_with_score: List[Tuple[float, np.ndarray]] = []
+        for c in cands:
+            m01 = c.mask01
+            if int(args.split_components) == 1:
+                insts = split_into_instances_topk(m01, min_area=int(args.min_area), topk=int(args.component_topk))
+                for inst in insts:
+                    if int(inst.sum()) >= int(args.min_area):
+                        inst_with_score.append((c.score, inst.astype(np.uint8)))
+            else:
+                inst_with_score.append((c.score, m01.astype(np.uint8)))
+
+        # final safety: pixel-exclusive ownership
+        final_insts = enforce_pixel_ownership(
+            inst_masks=inst_with_score,
+            min_area=int(args.min_area),
+            max_instances=int(args.max_instances_per_image),
+        )
+
+        # encode
+        rles: List[str] = []
+        for inst in final_insts:
+            rle = rle_encode(inst)
+            if rle:
+                rles.append(rle)
+
+        id_to_rles[img_id] = rles
+
+        if rles:
+            nonempty_images += 1
+            total_instances += len(rles)
+
+        if args.log_every > 0 and i % int(args.log_every) == 0:
+            print(
+                f"[INFO] {i}/{len(template_ids_run)} done | nonempty_images={nonempty_images} total_instances={total_instances} | "
+                f"TTA=flip4 morph(open={args.opening_radius},close={args.closing_radius}) min_area={args.min_area} "
+                f"merge_iou_thr={args.merge_iou_thr} mask_iou_thr={args.mask_iou_thr} split={args.split_components} topk={args.component_topk}"
+            )
+
+    write_submission_variable_rows(args.out_csv, template_ids, id_to_rles)
+
+    print(f"[DONE] out_csv={args.out_csv}")
+    print(f"[INFO] processed_images={len(template_ids_run)} / template_images={len(template_ids)}")
+    print(f"[INFO] nonempty_images={nonempty_images} total_instances={total_instances}")
+    print(f"[INFO] ckpt={args.maskrcnn_ckpt}")
+
+
+if __name__ == "__main__":
+    main()
