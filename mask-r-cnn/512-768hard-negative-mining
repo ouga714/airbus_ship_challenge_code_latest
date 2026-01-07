@@ -1,0 +1,1660 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+airbus_detector_twostage_ddp_hem.py
+
+Airbus Ship Detection — Image-level detector (ship-present vs absent)
+
+Two-stage training + DDP + Hard Example Mining (HEM) for Stage2:
+  Stage1:
+    - train at img_size=stage1_img_size (e.g., 512)
+    - early stopping
+    - save best/last ckpt
+    - inference on train/val/(test optional) -> probs CSV
+  Stage2:
+    - build stage2 train_ids using Stage1 train probs:
+        * "hard positives"  = label=1 but prob is LOW  (suspected FN)
+        * "hard negatives"  = label=0 but prob is HIGH (suspected FP)
+      then fill the rest by stratified sampling to match pos_frac
+    - (optional) focal loss (gamma/alpha)
+    - train at img_size=stage2_img_size (e.g., 712/768)
+    - early stopping
+    - save best/last
+    - inference on train/val/(test optional) -> probs CSV
+    - (optional) Platt scaling calibration on val, and output calibrated CSVs
+
+DDP:
+  - use torchrun --nproc_per_node=2 ...
+  - DistributedSampler for training
+  - train loss aggregated by all_reduce
+  - val metrics computed on rank0 by gathering (all_gather_object) for moderate val sizes
+
+Outputs (run_dir):
+  config.json
+  splits.json
+  summary.json
+  integrity_train_v2.json (copy)
+  stage1/
+    global_rank0.log
+    detail_rank*.log
+    best_model.pt / last_model.pt
+    summary_stage.json
+    probs_train.csv / probs_val.csv / probs_test.csv (optional)
+  stage2/
+    ... + stage2_train_ids.json + hard_sets.json
+    ... + calib_platt.json (optional) + probs_*_calibrated.csv (optional)
+
+Important:
+  - ALL_TRAIN_IDS is from train_v2 directory enumeration => negatives are not dropped.
+  - labels from CSV-positive set (id2rles keys) ; not from CSV rows-only
+  - FP32 only (no AMP)
+"""
+
+import os
+import re
+import csv
+import json
+import time
+import math
+import random
+import argparse
+import datetime
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+import torchvision
+from torchvision import transforms
+
+
+# ============================================================
+# Utils: reproducibility, DDP, IO
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def is_ddp() -> bool:
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def ddp_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def ddp_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def ddp_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def ddp_init() -> Tuple[torch.device, int, int, int]:
+    if is_ddp():
+        dist.init_process_group(backend="nccl", init_method="env://")
+        rank = ddp_rank()
+        local_rank = ddp_local_rank()
+        world = ddp_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank = 0
+        local_rank = 0
+        world = 1
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return device, rank, local_rank, world
+
+
+def ddp_barrier():
+    if is_ddp():
+        dist.barrier()
+
+
+def ddp_all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
+    if is_ddp():
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    return x
+
+
+def mkdir_p(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def save_json(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def human_time() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_ratio_str(s: str) -> Optional[float]:
+    """
+    Parse "pos:neg" like "1:3" into pos_frac = pos / (pos+neg).
+    Returns None if s empty.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "":
+        return None
+    m = re.match(r"^\s*(\d+)\s*:\s*(\d+)\s*$", s)
+    if not m:
+        raise ValueError(f"Invalid --pos_neg_ratio '{s}'. Expected like '1:3'.")
+    pos = int(m.group(1))
+    neg = int(m.group(2))
+    if pos < 0 or neg < 0:
+        raise ValueError("pos and neg must be >=0 in ratio.")
+    tot = pos + neg
+    if tot <= 0:
+        raise ValueError("pos+neg must be > 0.")
+    if pos == 0:
+        return 0.0
+    return float(pos) / float(tot)
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+class SimpleLogger:
+    def __init__(self, path: str, also_stdout: bool = False):
+        self.path = path
+        self.also_stdout = also_stdout
+        mkdir_p(os.path.dirname(path))
+        self._f = open(path, "a", encoding="utf-8")
+
+    def log(self, msg: str):
+        line = f"{human_time()} {msg}"
+        self._f.write(line + "\n")
+        self._f.flush()
+        if self.also_stdout:
+            print(line, flush=True)
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Dataset labeling and integrity
+# ============================================================
+
+def read_airbus_csv_pos_set(csv_path: str) -> set:
+    """
+    train_ship_segmentations_v2.csv contains only ship-positive rows typically.
+    Return set of ImageId that have non-empty EncodedPixels.
+    """
+    pos = set()
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = (row.get("ImageId") or "").strip()
+            rle = row.get("EncodedPixels", "")
+            if img_id == "":
+                continue
+            if rle is None:
+                continue
+            rle_s = str(rle).strip()
+            if rle_s != "" and rle_s.lower() != "nan":
+                pos.add(img_id)
+    return pos
+
+
+def list_images(dir_path: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    files = []
+    for name in os.listdir(dir_path):
+        if name.lower().endswith(exts):
+            files.append(name)
+    files.sort()
+    return files
+
+
+def integrity_scan_image_dir(img_dir: str, cache_path: str, limit: int = 0) -> Dict[str, Any]:
+    """
+    Decode-scan images; return dict with keys: valid, bad, scanned.
+    Cache to json. If cache exists, reuse it.
+    """
+    if os.path.isfile(cache_path):
+        return load_json(cache_path)
+
+    names = list_images(img_dir)
+    if limit and limit > 0:
+        names = names[:limit]
+
+    valid, bad = [], []
+    for fn in names:
+        p = os.path.join(img_dir, fn)
+        try:
+            with Image.open(p) as im:
+                im.verify()
+            with Image.open(p) as im2:
+                im2.convert("RGB")
+            valid.append(fn)
+        except Exception:
+            bad.append(fn)
+
+    out = {"valid": valid, "bad": bad, "scanned": len(names)}
+    save_json(cache_path, out)
+    return out
+
+
+def build_splits(
+    all_ids: List[str],
+    pos_set: set,
+    train_n: int,
+    val_n: int,
+    pos_frac: float,
+    seed: int
+) -> Dict[str, Any]:
+    """
+    Stratified splits from directory-enumerated IDs.
+    """
+    rng = np.random.RandomState(seed)
+
+    pos_ids = [x for x in all_ids if x in pos_set]
+    neg_ids = [x for x in all_ids if x not in pos_set]
+
+    if len(pos_ids) == 0:
+        raise RuntimeError("No positive ids found. Check CSV path and train_v2 dir.")
+    if len(neg_ids) == 0:
+        raise RuntimeError("No negative ids found. Check train_v2 dir and CSV path.")
+
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    def sample_strat(n_total: int, pos_pool: List[str], neg_pool: List[str]) -> Tuple[List[str], List[str]]:
+        n_pos = int(round(n_total * pos_frac))
+        n_pos = max(1, min(n_pos, len(pos_pool)))
+        n_neg = n_total - n_pos
+        n_neg = max(1, min(n_neg, len(neg_pool)))
+
+        if n_pos + n_neg != n_total:
+            n_neg = n_total - n_pos
+            if n_neg <= 0:
+                n_neg = 1
+                n_pos = n_total - 1
+
+        if n_pos > len(pos_pool) or n_neg > len(neg_pool):
+            raise RuntimeError(
+                f"Not enough samples: need pos={n_pos}/{len(pos_pool)} neg={n_neg}/{len(neg_pool)}. "
+                f"Reduce train_n/val_n or change pos_frac."
+            )
+        return pos_pool[:n_pos], neg_pool[:n_neg]
+
+    tr_pos, tr_neg = sample_strat(train_n, pos_ids, neg_ids)
+    used_pos = set(tr_pos)
+    used_neg = set(tr_neg)
+
+    rem_pos = [x for x in pos_ids if x not in used_pos]
+    rem_neg = [x for x in neg_ids if x not in used_neg]
+
+    va_pos, va_neg = sample_strat(val_n, rem_pos, rem_neg)
+
+    train_ids = tr_pos + tr_neg
+    val_ids = va_pos + va_neg
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+
+    stats = {
+        "all": len(all_ids),
+        "pos_all": len(pos_ids),
+        "neg_all": len(neg_ids),
+        "train": len(train_ids),
+        "train_pos": sum([1 for x in train_ids if x in pos_set]),
+        "train_neg": sum([1 for x in train_ids if x not in pos_set]),
+        "val": len(val_ids),
+        "val_pos": sum([1 for x in val_ids if x in pos_set]),
+        "val_neg": sum([1 for x in val_ids if x not in pos_set]),
+        "pos_frac_target": pos_frac,
+    }
+
+    return {"train": train_ids, "val": val_ids, "stats": stats}
+
+
+# ============================================================
+# Transforms (fixed or multi-scale)
+# ============================================================
+
+class MultiScaleResize:
+    """
+    Randomly choose size in [min_size, max_size] per call and resize to square.
+    """
+    def __init__(self, min_size: int, max_size: int):
+        self.min_size = int(min_size)
+        self.max_size = int(max_size)
+        assert self.min_size > 0 and self.max_size >= self.min_size
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        s = random.randint(self.min_size, self.max_size)
+        return img.resize((s, s), resample=Image.BILINEAR)
+
+
+# ============================================================
+# Torch Dataset
+# ============================================================
+
+class AirbusDetDataset(Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        ids: List[str],
+        pos_set: set,
+        img_size: int,
+        augment: bool,
+        multiscale_min: int = 0,
+        multiscale_max: int = 0,
+    ):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.pos_set = pos_set
+        self.img_size = int(img_size)
+        self.augment = bool(augment)
+        self.ms_min = int(multiscale_min)
+        self.ms_max = int(multiscale_max)
+
+        mean = [0.485, 0.456, 0.406]
+        std  = [0.229, 0.224, 0.225]
+
+        # resize op
+        if self.ms_min > 0 and self.ms_max >= self.ms_min:
+            resize_op = MultiScaleResize(self.ms_min, self.ms_max)
+        else:
+            resize_op = transforms.Resize((self.img_size, self.img_size))
+
+        if self.augment:
+            self.tf = transforms.Compose([
+                resize_op,
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ])
+        else:
+            self.tf = transforms.Compose([
+                resize_op,
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ])
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, i: int):
+        fn = self.ids[i]
+        path = os.path.join(self.img_dir, fn)
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+        x = self.tf(im)
+        y = 1.0 if fn in self.pos_set else 0.0
+        y = torch.tensor([y], dtype=torch.float32)
+        return fn, x, y
+
+
+# ============================================================
+# Model
+# ============================================================
+
+def build_model(model_name: str, pretrained: bool) -> nn.Module:
+    name = model_name.lower().strip()
+
+    if name in ["effnetv2_s", "efficientnet_v2_s", "efficientnetv2_s"]:
+        weights = torchvision.models.EfficientNet_V2_S_Weights.DEFAULT if pretrained else None
+        m = torchvision.models.efficientnet_v2_s(weights=weights)
+        in_f = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_f, 1)
+        return m
+
+    if name in ["effnetv2_m", "efficientnet_v2_m", "efficientnetv2_m"]:
+        weights = torchvision.models.EfficientNet_V2_M_Weights.DEFAULT if pretrained else None
+        m = torchvision.models.efficientnet_v2_m(weights=weights)
+        in_f = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_f, 1)
+        return m
+
+    if name in ["resnet50"]:
+        weights = torchvision.models.ResNet50_Weights.DEFAULT if pretrained else None
+        m = torchvision.models.resnet50(weights=weights)
+        in_f = m.fc.in_features
+        m.fc = nn.Linear(in_f, 1)
+        return m
+
+    raise ValueError(f"Unknown model_name='{model_name}'. Try effnetv2_s / effnetv2_m / resnet50.")
+
+
+# ============================================================
+# Metrics
+# ============================================================
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -60, 60)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def auroc_fast(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y = (y_true >= 0.5).astype(np.int32)
+    n_pos = int(np.sum(y == 1))
+    n_neg = int(np.sum(y == 0))
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    order = np.argsort(y_prob)
+    sorted_prob = y_prob[order]
+    sorted_y = y[order]
+
+    i = 0
+    rank_sum_pos = 0.0
+    while i < len(sorted_prob):
+        j = i + 1
+        while j < len(sorted_prob) and sorted_prob[j] == sorted_prob[i]:
+            j += 1
+        avg_rank = 0.5 * (i + (j - 1))
+        pos_in_block = int(np.sum(sorted_y[i:j] == 1))
+        rank_sum_pos += float(pos_in_block) * float(avg_rank)
+        i = j
+
+    u = rank_sum_pos - (n_pos * (n_pos - 1) / 2.0)
+    auc = u / float(n_pos * n_neg)
+    return float(auc)
+
+
+def compute_confusion(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Dict[str, int]:
+    y_pred = (y_prob >= thr).astype(np.int32)
+    y_true_i = (y_true >= 0.5).astype(np.int32)
+    tp = int(np.sum((y_pred == 1) & (y_true_i == 1)))
+    fp = int(np.sum((y_pred == 1) & (y_true_i == 0)))
+    fn = int(np.sum((y_pred == 0) & (y_true_i == 1)))
+    tn = int(np.sum((y_pred == 0) & (y_true_i == 0)))
+    return {"TP": tp, "FP": fp, "FN": fn, "TN": tn}
+
+
+def fbeta_from_conf(tp: int, fp: int, fn: int, beta: float) -> float:
+    beta2 = beta * beta
+    denom = (1 + beta2) * tp + beta2 * fn + fp
+    if denom <= 0:
+        return 0.0
+    return float((1 + beta2) * tp) / float(denom)
+
+
+def precision_recall_f1_from_conf(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
+    prec = float(tp) / float(tp + fp) if (tp + fp) > 0 else 0.0
+    rec  = float(tp) / float(tp + fn) if (tp + fn) > 0 else 0.0
+    f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    return prec, rec, f1
+
+
+def tune_threshold_max_fbeta(y_true: np.ndarray, y_prob: np.ndarray, beta: float, grid_n: int) -> Dict[str, Any]:
+    best_thr = 0.5
+    best_f = -1.0
+    best_conf = None
+
+    if grid_n <= 1:
+        grid = [0.5]
+    else:
+        grid = [k / float(grid_n - 1) for k in range(grid_n)]
+
+    for thr in grid:
+        conf = compute_confusion(y_true, y_prob, thr)
+        f = fbeta_from_conf(conf["TP"], conf["FP"], conf["FN"], beta)
+        if f > best_f:
+            best_f = f
+            best_thr = thr
+            best_conf = conf
+
+    prec, rec, f1 = precision_recall_f1_from_conf(best_conf["TP"], best_conf["FP"], best_conf["FN"])
+    return {
+        "best_thr": float(best_thr),
+        "best_fbeta": float(best_f),
+        "best_precision": float(prec),
+        "best_recall": float(rec),
+        "best_f1": float(f1),
+        "conf": best_conf,
+    }
+
+
+# ============================================================
+# Losses (BCE / Focal)
+# ============================================================
+
+def bce_with_logits_loss(logits: torch.Tensor, targets: torch.Tensor, pos_weight: float = 1.0) -> torch.Tensor:
+    """
+    logits: [B,1], targets: [B,1]
+    pos_weight: >1.0 increases positive loss weight
+    """
+    if pos_weight is not None and float(pos_weight) != 1.0:
+        pw = torch.tensor([float(pos_weight)], device=logits.device, dtype=logits.dtype)
+        return nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
+    return nn.functional.binary_cross_entropy_with_logits(logits, targets)
+
+
+def focal_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+    pos_weight: float = 1.0
+) -> torch.Tensor:
+    """
+    Focal loss (binary) on logits.
+    alpha: weight for positive class (common default 0.25)
+    gamma: focusing parameter
+    """
+    # base BCE (per-sample)
+    if pos_weight is not None and float(pos_weight) != 1.0:
+        pw = torch.tensor([float(pos_weight)], device=logits.device, dtype=logits.dtype)
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw, reduction="none")
+    else:
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+
+    p = torch.sigmoid(logits)
+    pt = p * targets + (1.0 - p) * (1.0 - targets)  # prob of true class
+    w = (alpha * targets + (1.0 - alpha) * (1.0 - targets)) * torch.pow((1.0 - pt).clamp_min(1e-8), gamma)
+    loss = (w * bce).mean()
+    return loss
+
+
+# ============================================================
+# Train / Eval
+# ============================================================
+
+@dataclass
+class EpochResult:
+    loss: float
+    auroc: float
+    tuned_thr: float
+    tuned_fbeta: float
+    tuned_precision: float
+    tuned_recall: float
+    tuned_f1: float
+    conf: Dict[str, int]
+
+
+@torch.no_grad()
+def eval_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    beta: float,
+    thr_grid_n: int,
+    rank: int
+) -> Tuple[EpochResult, np.ndarray, np.ndarray, List[str]]:
+    model.eval()
+
+    all_logits = []
+    all_targets = []
+    all_names = []
+    loss_sum = 0.0
+    n_sum = 0
+
+    for names, x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        loss = bce_with_logits_loss(logits, y)
+
+        bs = x.size(0)
+        loss_sum += float(loss.item()) * bs
+        n_sum += bs
+
+        all_logits.append(logits.detach().float().cpu().numpy().reshape(-1))
+        all_targets.append(y.detach().float().cpu().numpy().reshape(-1))
+        all_names.extend(list(names))
+
+    local_loss = torch.tensor([loss_sum, n_sum], dtype=torch.float64, device=device)
+    ddp_all_reduce_sum(local_loss)
+    global_loss = float(local_loss[0].item() / max(1.0, local_loss[1].item()))
+
+    y_logit = np.concatenate(all_logits, axis=0) if len(all_logits) else np.zeros((0,), dtype=np.float32)
+    y_true  = np.concatenate(all_targets, axis=0) if len(all_targets) else np.zeros((0,), dtype=np.float32)
+    y_prob  = sigmoid_np(y_logit)
+
+    if is_ddp():
+        gathered = [None for _ in range(ddp_world_size())]
+        dist.all_gather_object(gathered, (all_names, y_true, y_prob))
+        if rank == 0:
+            names_m, ytrue_m, yprob_m = [], [], []
+            for (nm, yt, yp) in gathered:
+                names_m.extend(nm)
+                ytrue_m.append(yt)
+                yprob_m.append(yp)
+            y_true = np.concatenate(ytrue_m, axis=0) if len(ytrue_m) else np.zeros((0,), dtype=np.float32)
+            y_prob = np.concatenate(yprob_m, axis=0) if len(yprob_m) else np.zeros((0,), dtype=np.float32)
+            all_names = names_m
+        ddp_barrier()
+
+    if (not is_ddp()) or rank == 0:
+        auc = auroc_fast(y_true, y_prob)
+        tune = tune_threshold_max_fbeta(y_true, y_prob, beta=beta, grid_n=thr_grid_n)
+        res = EpochResult(
+            loss=global_loss,
+            auroc=float(auc),
+            tuned_thr=float(tune["best_thr"]),
+            tuned_fbeta=float(tune["best_fbeta"]),
+            tuned_precision=float(tune["best_precision"]),
+            tuned_recall=float(tune["best_recall"]),
+            tuned_f1=float(tune["best_f1"]),
+            conf=tune["conf"],
+        )
+    else:
+        res = EpochResult(
+            loss=global_loss,
+            auroc=0.0,
+            tuned_thr=0.5,
+            tuned_fbeta=0.0,
+            tuned_precision=0.0,
+            tuned_recall=0.0,
+            tuned_f1=0.0,
+            conf={"TP": 0, "FP": 0, "FN": 0, "TN": 0},
+        )
+
+    return res, y_true, y_prob, all_names
+
+
+def train_one_stage(
+    stage_dir: str,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    rank: int,
+    world: int,
+    max_epochs: int,
+    patience: int,
+    lr: float,
+    weight_decay: float,
+    beta: float,
+    thr_grid_n: int,
+    log_every: int,
+    clip_grad: float,
+    warmup_epochs: int,
+    pretrained_ckpt: Optional[str] = None,
+    use_focal: int = 0,
+    focal_gamma: float = 2.0,
+    focal_alpha: float = 0.25,
+    pos_weight: float = 1.0,
+) -> Dict[str, Any]:
+    mkdir_p(stage_dir)
+
+    global_logger = None
+    detail_logger = SimpleLogger(os.path.join(stage_dir, f"detail_rank{rank}.log"), also_stdout=False)
+    if rank == 0:
+        global_logger = SimpleLogger(os.path.join(stage_dir, "global_rank0.log"), also_stdout=True)
+
+    if pretrained_ckpt is not None and pretrained_ckpt.strip() != "":
+        map_loc = {"cuda:0": str(device)}
+        sd = torch.load(pretrained_ckpt, map_location=map_loc)
+        model.load_state_dict(sd, strict=True)
+        if rank == 0:
+            global_logger.log(f"[init] loaded pretrained_ckpt={pretrained_ckpt}")
+
+    model = model.to(device)
+    if is_ddp():
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[ddp_local_rank()], output_device=ddp_local_rank(), find_unused_parameters=False
+        )
+
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def lr_lambda(epoch: int):
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)
+        t = (epoch - warmup_epochs) / float(max(1, (max_epochs - warmup_epochs)))
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
+
+    scheduler = optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+    best_metric = -1e9
+    best_epoch = -1
+    best_path = os.path.join(stage_dir, "best_model.pt")
+    last_path = os.path.join(stage_dir, "last_model.pt")
+
+    bad_epochs = 0
+    history = []
+
+    if rank == 0:
+        global_logger.log(f"[train] stage_dir={stage_dir}")
+        global_logger.log(f"[train] max_epochs={max_epochs} patience={patience} beta={beta} thr_grid_n={thr_grid_n}")
+        global_logger.log(f"[train] lr={lr} weight_decay={weight_decay} clip_grad={clip_grad} warmup_epochs={warmup_epochs}")
+        global_logger.log(f"[train] ddp=({is_ddp()}) world={world}")
+        global_logger.log(f"[loss] use_focal={use_focal} focal_gamma={focal_gamma} focal_alpha={focal_alpha} pos_weight={pos_weight}")
+
+    for epoch in range(int(max_epochs)):
+        if is_ddp():
+            assert isinstance(train_loader.sampler, DistributedSampler)
+            train_loader.sampler.set_epoch(epoch)
+
+        model.train()
+        t0 = time.time()
+        loss_sum = 0.0
+        n_sum = 0
+
+        for step, (names, x, y) in enumerate(train_loader):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+
+            logits = model(x)
+
+            if int(use_focal) == 1:
+                loss = focal_bce_with_logits(
+                    logits, y,
+                    gamma=float(focal_gamma),
+                    alpha=float(focal_alpha),
+                    pos_weight=float(pos_weight)
+                )
+            else:
+                loss = bce_with_logits_loss(logits, y, pos_weight=float(pos_weight))
+
+            if not torch.isfinite(loss):
+                detail_logger.log(f"[WARN] non-finite loss at epoch={epoch} step={step} loss={loss.item()}")
+                continue
+
+            loss.backward()
+            if clip_grad and float(clip_grad) > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_grad))
+            opt.step()
+
+            bs = x.size(0)
+            loss_sum += float(loss.item()) * bs
+            n_sum += bs
+
+            if (step % max(1, int(log_every)) == 0) or (step + 1 == len(train_loader)):
+                cur_lr = opt.param_groups[0]["lr"]
+                detail_logger.log(f"[TRAIN] epoch={epoch} step={step}/{len(train_loader)} loss={loss.item():.6f} lr={cur_lr:.3e}")
+
+        scheduler.step()
+
+        tr_local = torch.tensor([loss_sum, n_sum], dtype=torch.float64, device=device)
+        ddp_all_reduce_sum(tr_local)
+        tr_loss = float(tr_local[0].item() / max(1.0, tr_local[1].item()))
+
+        val_res, y_true, y_prob, y_names = eval_one_epoch(
+            model.module if hasattr(model, "module") else model,
+            val_loader, device, beta=float(beta), thr_grid_n=int(thr_grid_n), rank=rank
+        )
+
+        metric = val_res.auroc if rank == 0 else 0.0
+
+        if rank == 0:
+            dt = time.time() - t0
+            global_logger.log(
+                f"[EPOCH] epoch={epoch} "
+                f"train_loss={tr_loss:.6f} val_loss={val_res.loss:.6f} "
+                f"val_auroc={val_res.auroc:.6f} "
+                f"tuned_thr={val_res.tuned_thr:.4f} tuned_fbeta={val_res.tuned_fbeta:.6f} "
+                f"prec={val_res.tuned_precision:.6f} rec={val_res.tuned_recall:.6f} f1={val_res.tuned_f1:.6f} "
+                f"conf={val_res.conf} time={dt:.1f}s"
+            )
+
+            history.append({
+                "epoch": int(epoch),
+                "train_loss": float(tr_loss),
+                "val_loss": float(val_res.loss),
+                "val_auroc": float(val_res.auroc),
+                "tuned_thr": float(val_res.tuned_thr),
+                "tuned_fbeta": float(val_res.tuned_fbeta),
+                "tuned_precision": float(val_res.tuned_precision),
+                "tuned_recall": float(val_res.tuned_recall),
+                "tuned_f1": float(val_res.tuned_f1),
+                "conf": dict(val_res.conf),
+                "lr": float(opt.param_groups[0]["lr"]),
+            })
+
+            if metric > best_metric:
+                best_metric = metric
+                best_epoch = int(epoch)
+                bad_epochs = 0
+
+                sd = (model.module if hasattr(model, "module") else model).state_dict()
+                torch.save(sd, best_path)
+                global_logger.log(f"[CKPT] saved best_model.pt at epoch={epoch} best_auroc={best_metric:.6f}")
+            else:
+                bad_epochs += 1
+
+            sd = (model.module if hasattr(model, "module") else model).state_dict()
+            torch.save(sd, last_path)
+
+            if bad_epochs >= int(patience):
+                global_logger.log(f"[ES] early stopping at epoch={epoch} (best_epoch={best_epoch} best_auroc={best_metric:.6f})")
+                break
+
+        ddp_barrier()
+
+    stage_summary = {}
+    if rank == 0:
+        stage_summary = {
+            "stage_dir": stage_dir,
+            "best_epoch": int(best_epoch),
+            "best_metric_auroc": float(best_metric),
+            "best_model_path": best_path,
+            "last_model_path": last_path,
+            "history": history,
+        }
+        save_json(os.path.join(stage_dir, "summary_stage.json"), stage_summary)
+
+    ddp_barrier()
+    if global_logger is not None:
+        global_logger.close()
+    detail_logger.close()
+    return stage_summary
+
+
+# ============================================================
+# Inference (DDP temp file merge)
+# ============================================================
+
+@torch.no_grad()
+def infer_probs_to_csv(
+    stage_dir: str,
+    tag: str,
+    model: nn.Module,
+    device: torch.device,
+    rank: int,
+    world: int,
+    ds: AirbusDetDataset,
+    batch: int,
+    num_workers: int,
+    ckpt_path: str,
+) -> str:
+    """
+    Write probs CSV:
+      ImageId,Label,Prob
+    """
+    mkdir_p(stage_dir)
+
+    map_loc = {"cuda:0": str(device)}
+    sd = torch.load(ckpt_path, map_location=map_loc)
+    model.load_state_dict(sd, strict=True)
+    model = model.to(device)
+    model.eval()
+
+    sampler = None
+    if is_ddp():
+        sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False)
+
+    loader = DataLoader(
+        ds, batch_size=int(batch), shuffle=False, sampler=sampler,
+        num_workers=int(num_workers), pin_memory=True, drop_last=False
+    )
+
+    tmp_csv = os.path.join(stage_dir, f"_tmp_probs_{tag}_rank{rank}.csv")
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "Label", "Prob"])
+        for names, x, y in loader:
+            x = x.to(device, non_blocking=True)
+            logits = model(x).detach().float().cpu().numpy().reshape(-1)
+            prob = sigmoid_np(logits)
+            y_np = y.detach().float().cpu().numpy().reshape(-1)
+            for nm, yy, pp in zip(names, y_np, prob):
+                w.writerow([nm, int(yy >= 0.5), float(pp)])
+
+    ddp_barrier()
+
+    out_csv = os.path.join(stage_dir, f"probs_{tag}.csv")
+    if rank == 0:
+        with open(out_csv, "w", newline="", encoding="utf-8") as fo:
+            wout = csv.writer(fo)
+            wout.writerow(["ImageId", "Label", "Prob"])
+            for r in range(int(world)):
+                p = os.path.join(stage_dir, f"_tmp_probs_{tag}_rank{r}.csv")
+                with open(p, "r", encoding="utf-8") as fi:
+                    rr = csv.reader(fi)
+                    _ = next(rr, None)
+                    for row in rr:
+                        wout.writerow(row)
+        for r in range(int(world)):
+            p = os.path.join(stage_dir, f"_tmp_probs_{tag}_rank{r}.csv")
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+    ddp_barrier()
+    return out_csv
+
+
+def read_probs_csv(path: str) -> Dict[str, Tuple[int, float]]:
+    """
+    Return map: ImageId -> (Label, Prob)
+    """
+    m = {}
+    with open(path, "r", encoding="utf-8") as f:
+        rr = csv.DictReader(f)
+        for row in rr:
+            img = (row.get("ImageId") or "").strip()
+            if img == "":
+                continue
+            lab = int(float(row.get("Label", "0")))
+            prob = float(row.get("Prob", "nan"))
+            m[img] = (lab, prob)
+    return m
+
+
+# ============================================================
+# Hard Example Mining for Stage2
+# ============================================================
+
+def build_stage2_train_ids_hem(
+    train_ids_base: List[str],
+    pos_set: set,
+    probs_map: Dict[str, Tuple[int, float]],
+    train_n: int,
+    pos_frac: float,
+    seed: int,
+    hem_enable: int,
+    hem_pos_k: int,
+    hem_neg_k: int,
+    hem_pos_frac: float,
+    hem_neg_frac: float,
+    hem_keep_hard_always: int,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    HEM:
+      - hard_pos: label=1 and low prob (ascending)
+      - hard_neg: label=0 and high prob (descending)
+    Then fill remaining to match pos_frac on the final stage2 train set.
+
+    Returns: (stage2_train_ids, info)
+    """
+    rng = np.random.RandomState(seed)
+
+    # split pos/neg from base
+    pos_ids = [i for i in train_ids_base if i in pos_set]
+    neg_ids = [i for i in train_ids_base if i not in pos_set]
+
+    # if HEM disabled: just stratified sample from base
+    if int(hem_enable) != 1:
+        rng.shuffle(pos_ids)
+        rng.shuffle(neg_ids)
+        n_pos = int(round(train_n * pos_frac))
+        n_pos = max(1, min(n_pos, len(pos_ids)))
+        n_neg = train_n - n_pos
+        n_neg = max(1, min(n_neg, len(neg_ids)))
+        if n_pos + n_neg != train_n:
+            n_neg = train_n - n_pos
+            if n_neg <= 0:
+                n_neg = 1
+                n_pos = train_n - 1
+        out = pos_ids[:n_pos] + neg_ids[:n_neg]
+        rng.shuffle(out)
+        info = {
+            "hem_enable": 0,
+            "train_n": int(train_n),
+            "pos_frac_target": float(pos_frac),
+            "selected_pos": int(sum([1 for x in out if x in pos_set])),
+            "selected_neg": int(sum([1 for x in out if x not in pos_set])),
+        }
+        return out, info
+
+    # build (id, prob)
+    pos_pairs, neg_pairs = [], []
+    missing = 0
+    for i in train_ids_base:
+        if i not in probs_map:
+            missing += 1
+            continue
+        lab, p = probs_map[i]
+        if i in pos_set:
+            pos_pairs.append((i, float(p)))
+        else:
+            neg_pairs.append((i, float(p)))
+
+    # sort for hardness
+    pos_pairs.sort(key=lambda x: x[1])      # low prob = hard pos
+    neg_pairs.sort(key=lambda x: x[1], reverse=True)  # high prob = hard neg
+
+    # determine k
+    if int(hem_pos_k) > 0:
+        k_pos = min(int(hem_pos_k), len(pos_pairs))
+    else:
+        k_pos = int(round(len(pos_pairs) * float(hem_pos_frac)))
+        k_pos = max(0, min(k_pos, len(pos_pairs)))
+
+    if int(hem_neg_k) > 0:
+        k_neg = min(int(hem_neg_k), len(neg_pairs))
+    else:
+        k_neg = int(round(len(neg_pairs) * float(hem_neg_frac)))
+        k_neg = max(0, min(k_neg, len(neg_pairs)))
+
+    hard_pos = [i for (i, _p) in pos_pairs[:k_pos]]
+    hard_neg = [i for (i, _p) in neg_pairs[:k_neg]]
+    hard_set = set(hard_pos + hard_neg)
+
+    # if hard exceeds train_n, we must cut (prefer keep_hard_always=1 -> cut by hardness ordering)
+    if len(hard_set) > int(train_n):
+        # keep most hard among pos (lowest) and neg (highest)
+        hp = hard_pos
+        hn = hard_neg
+        keep = []
+        # interleave to avoid single-class domination
+        a = 0
+        b = 0
+        while len(keep) < int(train_n) and (a < len(hp) or b < len(hn)):
+            if a < len(hp):
+                keep.append(hp[a]); a += 1
+                if len(keep) >= int(train_n):
+                    break
+            if b < len(hn):
+                keep.append(hn[b]); b += 1
+        hard_set = set(keep)
+
+    # fill remaining to match pos_frac
+    n_pos_target = int(round(train_n * pos_frac))
+    n_pos_target = max(0, min(n_pos_target, len(pos_ids)))
+    n_neg_target = train_n - n_pos_target
+    n_neg_target = max(0, min(n_neg_target, len(neg_ids)))
+    if n_pos_target + n_neg_target != train_n:
+        n_neg_target = train_n - n_pos_target
+        if n_neg_target < 0:
+            n_neg_target = 0
+            n_pos_target = train_n
+
+    # count hard already
+    hard_pos_cnt = sum([1 for x in hard_set if x in pos_set])
+    hard_neg_cnt = sum([1 for x in hard_set if x not in pos_set])
+
+    # required additional
+    need_pos = max(0, n_pos_target - hard_pos_cnt)
+    need_neg = max(0, n_neg_target - hard_neg_cnt)
+
+    # pools excluding hard
+    pos_pool = [x for x in pos_ids if x not in hard_set]
+    neg_pool = [x for x in neg_ids if x not in hard_set]
+    rng.shuffle(pos_pool)
+    rng.shuffle(neg_pool)
+
+    add_pos = pos_pool[:need_pos]
+    add_neg = neg_pool[:need_neg]
+
+    stage2 = list(hard_set) + add_pos + add_neg
+    # if still short (due to lack), fill from remaining any class
+    if len(stage2) < int(train_n):
+        rem = [x for x in (pos_pool[need_pos:] + neg_pool[need_neg:]) if x not in set(stage2)]
+        rng.shuffle(rem)
+        stage2.extend(rem[:(int(train_n) - len(stage2))])
+
+    # if overshoot, cut (prefer keep hard)
+    if len(stage2) > int(train_n):
+        if int(hem_keep_hard_always) == 1:
+            # keep hard + trim extras
+            hard_list = [x for x in stage2 if x in hard_set]
+            other_list = [x for x in stage2 if x not in hard_set]
+            rng.shuffle(other_list)
+            stage2 = hard_list + other_list
+            stage2 = stage2[:int(train_n)]
+        else:
+            rng.shuffle(stage2)
+            stage2 = stage2[:int(train_n)]
+
+    rng.shuffle(stage2)
+
+    info = {
+        "hem_enable": 1,
+        "missing_in_probs": int(missing),
+        "train_n": int(train_n),
+        "pos_frac_target": float(pos_frac),
+        "base_train_ids": int(len(train_ids_base)),
+        "base_pos": int(len(pos_ids)),
+        "base_neg": int(len(neg_ids)),
+        "k_pos": int(k_pos),
+        "k_neg": int(k_neg),
+        "hard_pos_cnt": int(hard_pos_cnt),
+        "hard_neg_cnt": int(hard_neg_cnt),
+        "selected_pos": int(sum([1 for x in stage2 if x in pos_set])),
+        "selected_neg": int(sum([1 for x in stage2 if x not in pos_set])),
+    }
+    hard_info = {
+        "hard_pos": hard_pos,
+        "hard_neg": hard_neg,
+    }
+    return stage2, {"info": info, "hard": hard_info}
+
+
+# ============================================================
+# Platt scaling calibration (rank0)
+# ============================================================
+
+def platt_fit(y_true: np.ndarray, y_prob: np.ndarray, max_iter: int = 2000, lr: float = 0.05) -> Dict[str, float]:
+    """
+    Fit Platt scaling: calibrated = sigmoid(A * logit(p) + B)
+    We optimize A,B with torch on CPU for simplicity.
+    """
+    # clip to avoid inf
+    eps = 1e-6
+    p = np.clip(y_prob.astype(np.float32), eps, 1.0 - eps)
+    logit = np.log(p / (1.0 - p)).astype(np.float32)
+    y = (y_true >= 0.5).astype(np.float32)
+
+    X = torch.tensor(logit, dtype=torch.float32)
+    Y = torch.tensor(y, dtype=torch.float32)
+
+    A = torch.tensor(1.0, dtype=torch.float32, requires_grad=True)
+    B = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+
+    opt = torch.optim.Adam([A, B], lr=float(lr))
+
+    for _ in range(int(max_iter)):
+        opt.zero_grad(set_to_none=True)
+        z = A * X + B
+        loss = nn.functional.binary_cross_entropy_with_logits(z, Y)
+        loss.backward()
+        opt.step()
+
+    return {"A": float(A.detach().item()), "B": float(B.detach().item())}
+
+
+def platt_apply(prob: np.ndarray, A: float, B: float) -> np.ndarray:
+    eps = 1e-6
+    p = np.clip(prob.astype(np.float32), eps, 1.0 - eps)
+    logit = np.log(p / (1.0 - p)).astype(np.float32)
+    z = A * logit + B
+    return sigmoid_np(z.astype(np.float32))
+
+
+def write_probs_calibrated_csv(in_csv: str, out_csv: str, A: float, B: float) -> None:
+    with open(in_csv, "r", encoding="utf-8") as fi:
+        rr = csv.DictReader(fi)
+        rows = []
+        for row in rr:
+            img = (row.get("ImageId") or "").strip()
+            lab = row.get("Label", "")
+            p = float(row.get("Prob", "nan"))
+            pc = float(platt_apply(np.array([p], dtype=np.float32), A, B)[0])
+            rows.append((img, lab, p, pc))
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as fo:
+        w = csv.writer(fo)
+        w.writerow(["ImageId", "Label", "Prob", "ProbCal"])
+        for (img, lab, p, pc) in rows:
+            w.writerow([img, lab, p, pc])
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def build_run_name(args) -> str:
+    ts = now_ts()
+    return (
+        f"run__detector_twostage_hem__{args.model_name}"
+        f"__seed{args.seed}"
+        f"__train{args.train_n}__val{args.val_n}"
+        f"__pos{args.pos_frac:.3f}"
+        f"__s1{args.stage1_img_size}__s2{args.stage2_img_size}"
+        f"__{ts}"
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--mode", type=str, default="two_stage",
+                    choices=["two_stage", "stage1_only", "stage2_only", "infer_only"])
+
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+
+    # model
+    ap.add_argument("--model_name", type=str, default="effnetv2_s")
+    ap.add_argument("--pretrained", type=int, default=1)
+
+    # sampling
+    ap.add_argument("--train_n", type=int, default=20000)
+    ap.add_argument("--val_n", type=int, default=3000)
+    ap.add_argument("--pos_frac", type=float, default=0.35,
+                    help="Target pos fraction in splits / stage2 strat fill (ignored if pos_neg_ratio set)")
+    ap.add_argument("--pos_neg_ratio", type=str, default="",
+                    help="Override pos_frac by ratio like '1:3'")
+
+    # stage sizes
+    ap.add_argument("--stage1_img_size", type=int, default=512)
+    ap.add_argument("--stage2_img_size", type=int, default=712)
+
+    # stage2 multi-scale (optional)
+    ap.add_argument("--stage2_multiscale", type=int, default=0,
+                    help="1 enables random resize in [ms_min, ms_max] for stage2 training")
+    ap.add_argument("--stage2_ms_min", type=int, default=640)
+    ap.add_argument("--stage2_ms_max", type=int, default=768)
+
+    # training
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--batch_train", type=int, default=32)
+    ap.add_argument("--batch_eval", type=int, default=64)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--max_epochs1", type=int, default=30)
+    ap.add_argument("--patience1", type=int, default=6)
+    ap.add_argument("--max_epochs2", type=int, default=20)
+    ap.add_argument("--patience2", type=int, default=6)
+    ap.add_argument("--warmup_epochs", type=int, default=2)
+    ap.add_argument("--clip_grad", type=float, default=1.0)
+    ap.add_argument("--log_every", type=int, default=50)
+
+    # threshold tuning log (not training objective)
+    ap.add_argument("--beta", type=float, default=1.0)
+    ap.add_argument("--thr_grid_n", type=int, default=101)
+
+    # integrity scan
+    ap.add_argument("--integrity_limit", type=int, default=0)
+
+    # Stage2 HEM
+    ap.add_argument("--hem_enable", type=int, default=1,
+                    help="1 enables hard example mining to build stage2 train set")
+    ap.add_argument("--hem_pos_k", type=int, default=0,
+                    help="Number of hard positives (label=1 low prob). If 0, use hem_pos_frac.")
+    ap.add_argument("--hem_neg_k", type=int, default=0,
+                    help="Number of hard negatives (label=0 high prob). If 0, use hem_neg_frac.")
+    ap.add_argument("--hem_pos_frac", type=float, default=0.20,
+                    help="Fraction of pos in base train_ids to include as hard positives (if hem_pos_k=0).")
+    ap.add_argument("--hem_neg_frac", type=float, default=0.20,
+                    help="Fraction of neg in base train_ids to include as hard negatives (if hem_neg_k=0).")
+    ap.add_argument("--hem_keep_hard_always", type=int, default=1,
+                    help="If hard_set exceeds train_n, keep hardest first rather than random cut.")
+
+    # Stage2 focal loss (optional)
+    ap.add_argument("--stage2_use_focal", type=int, default=0)
+    ap.add_argument("--focal_gamma", type=float, default=2.0)
+    ap.add_argument("--focal_alpha", type=float, default=0.25)
+
+    # loss weight (optional)
+    ap.add_argument("--pos_weight", type=float, default=1.0,
+                    help="pos_weight for BCE/focal. >1 boosts positives.")
+
+    # calibration (optional)
+    ap.add_argument("--calibrate_platt", type=int, default=0,
+                    help="1 fits Platt scaling on stage2 val probs and writes calibrated CSVs")
+
+    args = ap.parse_args()
+
+    device, rank, local_rank, world = ddp_init()
+    set_seed(int(args.seed) + int(rank))
+
+    # ratio override
+    ratio_pf = parse_ratio_str(args.pos_neg_ratio)
+    if ratio_pf is not None:
+        args.pos_frac = float(ratio_pf)
+
+    # paths
+    train_dir = os.path.join(args.data_dir, "train_v2")
+    test_dir = os.path.join(args.data_dir, "test_v2")
+    csv_path = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+
+    if not os.path.isdir(train_dir):
+        raise FileNotFoundError(f"train_v2 dir not found: {train_dir}")
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"train_ship_segmentations_v2.csv not found: {csv_path}")
+
+    run_name = build_run_name(args)
+    run_dir = os.path.join(args.out_dir, run_name)
+    stage1_dir = os.path.join(run_dir, "stage1")
+    stage2_dir = os.path.join(run_dir, "stage2")
+
+    if rank == 0:
+        mkdir_p(run_dir)
+        save_json(os.path.join(run_dir, "config.json"), vars(args))
+
+    # integrity scan cache in data_dir (shared across runs)
+    integrity_cache_train = os.path.join(args.data_dir, "_integrity_cache_train_v2.json")
+    if rank == 0:
+        scan = integrity_scan_image_dir(train_dir, integrity_cache_train, limit=int(args.integrity_limit))
+        save_json(os.path.join(run_dir, "integrity_train_v2.json"), scan)
+    ddp_barrier()
+
+    scan = load_json(integrity_cache_train)
+    valid_train_files = scan["valid"]
+
+    # label set
+    pos_set = read_airbus_csv_pos_set(csv_path)
+
+    # splits (rank0 decides)
+    splits_path = os.path.join(run_dir, "splits.json")
+    if rank == 0:
+        splits = build_splits(
+            all_ids=valid_train_files,
+            pos_set=pos_set,
+            train_n=int(args.train_n),
+            val_n=int(args.val_n),
+            pos_frac=float(args.pos_frac),
+            seed=int(args.seed)
+        )
+        save_json(splits_path, splits)
+    ddp_barrier()
+    splits = load_json(splits_path)
+
+    train_ids = splits["train"]
+    val_ids = splits["val"]
+
+    overall_summary = {
+        "run_dir": run_dir,
+        "data_dir": args.data_dir,
+        "device": str(device),
+        "ddp": bool(is_ddp()),
+        "world_size": int(world),
+        "local_rank": int(local_rank),
+        "splits_stats": splits.get("stats", {}),
+        "stage1": {},
+        "stage2": {},
+    }
+
+    # -------------------------
+    # Stage1 train + infer
+    # -------------------------
+    if args.mode in ["two_stage", "stage1_only"]:
+        ds_tr1 = AirbusDetDataset(train_dir, train_ids, pos_set, img_size=int(args.stage1_img_size), augment=True)
+        ds_va1 = AirbusDetDataset(train_dir, val_ids,   pos_set, img_size=int(args.stage1_img_size), augment=False)
+
+        sampler_tr1 = None
+        if is_ddp():
+            sampler_tr1 = DistributedSampler(ds_tr1, num_replicas=world, rank=rank, shuffle=True, drop_last=False)
+
+        dl_tr1 = DataLoader(
+            ds_tr1, batch_size=int(args.batch_train), shuffle=(sampler_tr1 is None),
+            sampler=sampler_tr1, num_workers=int(args.num_workers), pin_memory=True, drop_last=False
+        )
+        dl_va1 = DataLoader(
+            ds_va1, batch_size=int(args.batch_eval), shuffle=False,
+            num_workers=int(args.num_workers), pin_memory=True, drop_last=False
+        )
+
+        model1 = build_model(args.model_name, pretrained=(int(args.pretrained) == 1))
+
+        stage1_summary = train_one_stage(
+            stage_dir=stage1_dir,
+            model=model1,
+            train_loader=dl_tr1,
+            val_loader=dl_va1,
+            device=device,
+            rank=rank,
+            world=world,
+            max_epochs=int(args.max_epochs1),
+            patience=int(args.patience1),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+            beta=float(args.beta),
+            thr_grid_n=int(args.thr_grid_n),
+            log_every=int(args.log_every),
+            clip_grad=float(args.clip_grad),
+            warmup_epochs=int(args.warmup_epochs),
+            pretrained_ckpt=None,
+            use_focal=0,
+            focal_gamma=float(args.focal_gamma),
+            focal_alpha=float(args.focal_alpha),
+            pos_weight=float(args.pos_weight),
+        )
+
+        if rank == 0:
+            overall_summary["stage1"] = stage1_summary
+
+        ddp_barrier()
+
+        # inference stage1
+        inf_model1 = build_model(args.model_name, pretrained=False)
+        ckpt1 = os.path.join(stage1_dir, "best_model.pt")
+
+        ds_train_inf1 = AirbusDetDataset(train_dir, train_ids, pos_set, img_size=int(args.stage1_img_size), augment=False)
+        ds_val_inf1   = AirbusDetDataset(train_dir, val_ids,   pos_set, img_size=int(args.stage1_img_size), augment=False)
+
+        p_train1 = infer_probs_to_csv(stage1_dir, "train", inf_model1, device, rank, world, ds_train_inf1,
+                                      int(args.batch_eval), int(args.num_workers), ckpt1)
+        p_val1   = infer_probs_to_csv(stage1_dir, "val",   inf_model1, device, rank, world, ds_val_inf1,
+                                      int(args.batch_eval), int(args.num_workers), ckpt1)
+
+        if os.path.isdir(test_dir):
+            test_ids = list_images(test_dir)
+            ds_test_inf1 = AirbusDetDataset(test_dir, test_ids, set(), img_size=int(args.stage1_img_size), augment=False)
+            _ = infer_probs_to_csv(stage1_dir, "test", inf_model1, device, rank, world, ds_test_inf1,
+                                   int(args.batch_eval), int(args.num_workers), ckpt1)
+
+        ddp_barrier()
+
+    # -------------------------
+    # Stage2 build train ids by HEM + train + infer (+ optional calibration)
+    # -------------------------
+    if args.mode in ["two_stage", "stage2_only"]:
+        # stage1 ckpt must exist for stage2 init
+        stage1_best = os.path.join(stage1_dir, "best_model.pt")
+        if not os.path.isfile(stage1_best):
+            raise FileNotFoundError(f"Stage1 best_model.pt not found: {stage1_best}")
+
+        # stage1 train probs must exist (for HEM)
+        stage1_probs_train_csv = os.path.join(stage1_dir, "probs_train.csv")
+        if not os.path.isfile(stage1_probs_train_csv):
+            raise FileNotFoundError(
+                f"Stage1 probs_train.csv not found: {stage1_probs_train_csv}. "
+                f"Run stage1 (mode=two_stage or stage1_only) first."
+            )
+
+        # rank0 builds stage2_train_ids.json
+        stage2_train_ids_path = os.path.join(stage2_dir, "stage2_train_ids.json")
+        hard_sets_path = os.path.join(stage2_dir, "hard_sets.json")
+        if rank == 0:
+            mkdir_p(stage2_dir)
+            probs_map = read_probs_csv(stage1_probs_train_csv)
+            stage2_train_ids, hem_pack = build_stage2_train_ids_hem(
+                train_ids_base=train_ids,
+                pos_set=pos_set,
+                probs_map=probs_map,
+                train_n=int(args.train_n),
+                pos_frac=float(args.pos_frac),
+                seed=int(args.seed),
+                hem_enable=int(args.hem_enable),
+                hem_pos_k=int(args.hem_pos_k),
+                hem_neg_k=int(args.hem_neg_k),
+                hem_pos_frac=float(args.hem_pos_frac),
+                hem_neg_frac=float(args.hem_neg_frac),
+                hem_keep_hard_always=int(args.hem_keep_hard_always),
+            )
+            save_json(stage2_train_ids_path, stage2_train_ids)
+            save_json(hard_sets_path, hem_pack)
+        ddp_barrier()
+
+        stage2_train_ids = load_json(stage2_train_ids_path)
+        hem_pack = load_json(hard_sets_path) if os.path.isfile(hard_sets_path) else {}
+
+        # stage2 datasets
+        if int(args.stage2_multiscale) == 1:
+            ms_min = int(args.stage2_ms_min)
+            ms_max = int(args.stage2_ms_max)
+        else:
+            ms_min = 0
+            ms_max = 0
+
+        ds_tr2 = AirbusDetDataset(
+            train_dir, stage2_train_ids, pos_set,
+            img_size=int(args.stage2_img_size),
+            augment=True,
+            multiscale_min=ms_min,
+            multiscale_max=ms_max,
+        )
+        ds_va2 = AirbusDetDataset(
+            train_dir, val_ids, pos_set,
+            img_size=int(args.stage2_img_size),
+            augment=False
+        )
+
+        sampler_tr2 = None
+        if is_ddp():
+            sampler_tr2 = DistributedSampler(ds_tr2, num_replicas=world, rank=rank, shuffle=True, drop_last=False)
+
+        dl_tr2 = DataLoader(
+            ds_tr2, batch_size=int(args.batch_train), shuffle=(sampler_tr2 is None),
+            sampler=sampler_tr2, num_workers=int(args.num_workers), pin_memory=True, drop_last=False
+        )
+        dl_va2 = DataLoader(
+            ds_va2, batch_size=int(args.batch_eval), shuffle=False,
+            num_workers=int(args.num_workers), pin_memory=True, drop_last=False
+        )
+
+        model2 = build_model(args.model_name, pretrained=False)
+
+        # a bit smaller warmup for stage2 is usually fine
+        warm2 = max(0, int(args.warmup_epochs) // 2)
+
+        stage2_summary = train_one_stage(
+            stage_dir=stage2_dir,
+            model=model2,
+            train_loader=dl_tr2,
+            val_loader=dl_va2,
+            device=device,
+            rank=rank,
+            world=world,
+            max_epochs=int(args.max_epochs2),
+            patience=int(args.patience2),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+            beta=float(args.beta),
+            thr_grid_n=int(args.thr_grid_n),
+            log_every=int(args.log_every),
+            clip_grad=float(args.clip_grad),
+            warmup_epochs=warm2,
+            pretrained_ckpt=stage1_best,
+            use_focal=int(args.stage2_use_focal),
+            focal_gamma=float(args.focal_gamma),
+            focal_alpha=float(args.focal_alpha),
+            pos_weight=float(args.pos_weight),
+        )
+
+        if rank == 0:
+            stage2_summary["hem"] = hem_pack.get("info", hem_pack)
+            stage2_summary["stage2_train_ids_path"] = stage2_train_ids_path
+            stage2_summary["hard_sets_path"] = hard_sets_path
+            overall_summary["stage2"] = stage2_summary
+
+        ddp_barrier()
+
+        # inference stage2
+        inf_model2 = build_model(args.model_name, pretrained=False)
+        ckpt2 = os.path.join(stage2_dir, "best_model.pt")
+
+        ds_train_inf2 = AirbusDetDataset(train_dir, stage2_train_ids, pos_set, img_size=int(args.stage2_img_size), augment=False)
+        ds_val_inf2   = AirbusDetDataset(train_dir, val_ids,         pos_set, img_size=int(args.stage2_img_size), augment=False)
+
+        p_train2 = infer_probs_to_csv(stage2_dir, "train", inf_model2, device, rank, world, ds_train_inf2,
+                                      int(args.batch_eval), int(args.num_workers), ckpt2)
+        p_val2   = infer_probs_to_csv(stage2_dir, "val",   inf_model2, device, rank, world, ds_val_inf2,
+                                      int(args.batch_eval), int(args.num_workers), ckpt2)
+
+        p_test2 = ""
+        if os.path.isdir(test_dir):
+            test_ids = list_images(test_dir)
+            ds_test_inf2 = AirbusDetDataset(test_dir, test_ids, set(), img_size=int(args.stage2_img_size), augment=False)
+            p_test2 = infer_probs_to_csv(stage2_dir, "test", inf_model2, device, rank, world, ds_test_inf2,
+                                         int(args.batch_eval), int(args.num_workers), ckpt2)
+
+        ddp_barrier()
+
+        # optional calibration (rank0 only)
+        if rank == 0 and int(args.calibrate_platt) == 1:
+            probs_val_map = read_probs_csv(os.path.join(stage2_dir, "probs_val.csv"))
+            y_true = []
+            y_prob = []
+            for img, (lab, prob) in probs_val_map.items():
+                if not math.isfinite(prob):
+                    continue
+                y_true.append(float(lab))
+                y_prob.append(float(prob))
+            y_true = np.array(y_true, dtype=np.float32)
+            y_prob = np.array(y_prob, dtype=np.float32)
+            calib = platt_fit(y_true, y_prob, max_iter=2000, lr=0.05)
+            save_json(os.path.join(stage2_dir, "calib_platt.json"), calib)
+
+            A, B = float(calib["A"]), float(calib["B"])
+            write_probs_calibrated_csv(os.path.join(stage2_dir, "probs_train.csv"),
+                                       os.path.join(stage2_dir, "probs_train_calibrated.csv"),
+                                       A, B)
+            write_probs_calibrated_csv(os.path.join(stage2_dir, "probs_val.csv"),
+                                       os.path.join(stage2_dir, "probs_val_calibrated.csv"),
+                                       A, B)
+            if p_test2 and os.path.isfile(os.path.join(stage2_dir, "probs_test.csv")):
+                write_probs_calibrated_csv(os.path.join(stage2_dir, "probs_test.csv"),
+                                           os.path.join(stage2_dir, "probs_test_calibrated.csv"),
+                                           A, B)
+
+        ddp_barrier()
+
+    # infer_only
+    if args.mode == "infer_only":
+        # use stage2 best if exists else stage1 best
+        ckpt2 = os.path.join(stage2_dir, "best_model.pt")
+        ckpt1 = os.path.join(stage1_dir, "best_model.pt")
+        if os.path.isfile(ckpt2):
+            ckpt = ckpt2
+            img_size = int(args.stage2_img_size)
+            out_stage = stage2_dir
+            ids_for_train = load_json(os.path.join(stage2_dir, "stage2_train_ids.json")) if os.path.isfile(os.path.join(stage2_dir, "stage2_train_ids.json")) else train_ids
+        elif os.path.isfile(ckpt1):
+            ckpt = ckpt1
+            img_size = int(args.stage1_img_size)
+            out_stage = stage1_dir
+            ids_for_train = train_ids
+        else:
+            raise FileNotFoundError("No best_model.pt found under stage1/ or stage2/.")
+
+        inf_model = build_model(args.model_name, pretrained=False)
+        ds_train_inf = AirbusDetDataset(train_dir, ids_for_train, pos_set, img_size=img_size, augment=False)
+        ds_val_inf   = AirbusDetDataset(train_dir, val_ids,      pos_set, img_size=img_size, augment=False)
+        _ = infer_probs_to_csv(out_stage, "train_inferonly", inf_model, device, rank, world, ds_train_inf,
+                               int(args.batch_eval), int(args.num_workers), ckpt)
+        _ = infer_probs_to_csv(out_stage, "val_inferonly", inf_model, device, rank, world, ds_val_inf,
+                               int(args.batch_eval), int(args.num_workers), ckpt)
+        if os.path.isdir(test_dir):
+            test_ids = list_images(test_dir)
+            ds_test_inf = AirbusDetDataset(test_dir, test_ids, set(), img_size=img_size, augment=False)
+            _ = infer_probs_to_csv(out_stage, "test_inferonly", inf_model, device, rank, world, ds_test_inf,
+                                   int(args.batch_eval), int(args.num_workers), ckpt)
+        ddp_barrier()
+
+    # overall summary
+    if rank == 0:
+        save_json(os.path.join(run_dir, "summary.json"), overall_summary)
+        print(f"\n[DONE] run_dir={run_dir}", flush=True)
+        if overall_summary.get("stage1"):
+            print(f"[DONE] stage1_best={os.path.join(stage1_dir,'best_model.pt')}", flush=True)
+        if overall_summary.get("stage2"):
+            print(f"[DONE] stage2_best={os.path.join(stage2_dir,'best_model.pt')}", flush=True)
+
+    ddp_barrier()
+    if is_ddp():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
