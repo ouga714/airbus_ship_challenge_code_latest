@@ -1,0 +1,2080 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_maskrcnn_detfuse_ddp_phased.py
+
+Airbus Ship Detection — Detector(EfficientNetV2) + Mask R-CNN (torchvision) with DDP, phased training, and joint tuning.
+
+✅ Requirements covered (as requested):
+- DDP (torchrun) training
+- Phase1 (e.g., 512) -> Phase2 (e.g., 768) -> optional Phase3 (multi-scale train)
+- Early stopping per phase (rank0 decides, synchronized across ranks)
+- Rank0-only file I/O logging: log_global.txt, log_detail.txt
+- Detector probability outputs:
+  * train ranking (phase1/phase2 ranked)
+  * train used ids det probs (phase1/phase2)
+  * infer(test template ids) det probs
+- summary.json output
+- Integrity scan (rank0 -> json -> all ranks load)
+- Pos:Neg ratio selectable by CLI:
+  * --pos_frac 0.40
+  * OR --pos_neg_ratio "40:60"
+- No AMP (FP32)
+
+Notes:
+- This code purposely avoids submission generation/postprocess (per your instruction: “推論→提出の精緻化は不要”).
+- The “overfitting-to-val” risk is mitigated by splitting VAL into:
+  * val_tune (used for joint tuning)
+  * val_es   (used for early-stopping decision)
+  You can control split via --val_tune_frac.
+"""
+
+import os
+import time
+import math
+import json
+import csv
+import random
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+import torchvision
+import torchvision.transforms.functional as TF
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+
+# ============================================================
+# DDP utils
+# ============================================================
+
+def is_dist_avail_and_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+def ddp_barrier() -> None:
+    if is_dist_avail_and_initialized():
+        dist.barrier()
+
+def ddp_setup(backend: str = "nccl") -> None:
+    # torchrun sets env vars: RANK, WORLD_SIZE, LOCAL_RANK
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+
+def ddp_cleanup() -> None:
+    if is_dist_avail_and_initialized():
+        dist.destroy_process_group()
+
+
+# ============================================================
+# Logging (rank0 file I/O only)
+# ============================================================
+
+class RunLogger:
+    def __init__(self, run_dir: str):
+        self.run_dir = run_dir
+        self.fh_global = None
+        self.fh_detail = None
+        if is_main_process():
+            Path(run_dir).mkdir(parents=True, exist_ok=True)
+            self.fh_global = open(os.path.join(run_dir, "log_global.txt"), "w", encoding="utf-8")
+            self.fh_detail = open(os.path.join(run_dir, "log_detail.txt"), "w", encoding="utf-8")
+
+    def _ts(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def g(self, msg: str) -> None:
+        line = f"{self._ts()} {msg}"
+        if is_main_process():
+            print(line, flush=True)
+            if self.fh_global:
+                self.fh_global.write(line + "\n")
+                self.fh_global.flush()
+
+    def d(self, msg: str) -> None:
+        line = f"{self._ts()} {msg}"
+        if is_main_process():
+            if self.fh_detail:
+                self.fh_detail.write(line + "\n")
+                self.fh_detail.flush()
+
+    def close(self) -> None:
+        if is_main_process():
+            try:
+                if self.fh_global:
+                    self.fh_global.close()
+                if self.fh_detail:
+                    self.fh_detail.close()
+            except Exception:
+                pass
+
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def save_json(path: str, obj: Any) -> None:
+    ensure_dir(str(Path(path).parent))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def load_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def write_csv_rows(path: str, header: List[str], rows: List[List[Any]]) -> None:
+    ensure_dir(str(Path(path).parent))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+# ============================================================
+# Repro
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def seed_for_rank(seed: int) -> int:
+    return int(seed) + 1000 * int(get_rank())
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def parse_csv_floats(s: str) -> List[float]:
+    out = []
+    for x in str(s).split(","):
+        x = x.strip()
+        if x == "":
+            continue
+        out.append(float(x))
+    return out
+
+def parse_ratio_to_pos_frac(pos_neg_ratio: str) -> Optional[float]:
+    """
+    "40:60" -> 0.4
+    """
+    if pos_neg_ratio is None:
+        return None
+    s = str(pos_neg_ratio).strip()
+    if s == "":
+        return None
+    if ":" not in s:
+        return None
+    a, b = s.split(":")
+    a = float(a.strip())
+    b = float(b.strip())
+    den = a + b
+    if den <= 0:
+        return None
+    return float(a / den)
+
+
+# ============================================================
+# Image / list / template
+# ============================================================
+
+def img_to_tensor01(img: Image.Image) -> torch.Tensor:
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"bad image shape: {arr.shape}")
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    return t
+
+def list_image_ids(img_dir: str) -> List[str]:
+    out = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith(".jpg") or fn.lower().endswith(".jpeg") or fn.lower().endswith(".png"):
+            out.append(fn)
+    out.sort()
+    return out
+
+def read_template_ids(sample_submission_csv: str) -> List[str]:
+    ids = []
+    with open(sample_submission_csv, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            ids.append(row["ImageId"])
+    return ids
+
+
+# ============================================================
+# RLE (Kaggle Airbus format: column-major)
+# ============================================================
+
+def rle_decode(rle: str, shape_hw: Tuple[int, int]) -> np.ndarray:
+    h, w = shape_hw
+    s = str(rle).strip()
+    if s == "" or s.lower() == "nan":
+        return np.zeros((h, w), dtype=np.uint8)
+    parts = s.split()
+    if len(parts) % 2 != 0:
+        return np.zeros((h, w), dtype=np.uint8)
+    starts = np.asarray([int(x) for x in parts[0::2]], dtype=np.int64) - 1
+    lengths = np.asarray([int(x) for x in parts[1::2]], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros((h * w,), dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        lo2 = max(0, int(lo))
+        hi2 = min(int(hi), h * w)
+        if hi2 > lo2:
+            img[lo2:hi2] = 1
+    img = img.reshape((w, h)).T
+    return img
+
+def load_id2rles(train_csv: str) -> Dict[str, List[str]]:
+    id2rles: Dict[str, List[str]] = {}
+    with open(train_csv, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None:
+                continue
+            s = str(rle).strip()
+            if s == "" or s.lower() == "nan":
+                continue
+            id2rles.setdefault(img_id, []).append(s)
+    return id2rles
+
+
+# ============================================================
+# Detector (EfficientNetV2) — image-level binary classifier
+# ============================================================
+
+class EffNetV2Binary(nn.Module):
+    def __init__(self, variant: str = "s", pretrained_backbone: int = 0):
+        super().__init__()
+        variant = str(variant).lower()
+        if variant == "s":
+            weights = torchvision.models.EfficientNet_V2_S_Weights.DEFAULT if pretrained_backbone else None
+            m = torchvision.models.efficientnet_v2_s(weights=weights)
+        elif variant == "m":
+            weights = torchvision.models.EfficientNet_V2_M_Weights.DEFAULT if pretrained_backbone else None
+            m = torchvision.models.efficientnet_v2_m(weights=weights)
+        elif variant == "l":
+            weights = torchvision.models.EfficientNet_V2_L_Weights.DEFAULT if pretrained_backbone else None
+            m = torchvision.models.efficientnet_v2_l(weights=weights)
+        else:
+            raise ValueError(f"unknown det_variant: {variant}")
+
+        in_f = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_f, 1)
+        self.net = m
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+def imagenet_normalize(x: torch.Tensor) -> torch.Tensor:
+    # NOTE: creating new tensors repeatedly is fine here because detector runs limited times.
+    mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+def load_ckpt_flexible(model: nn.Module, ckpt_path: str, device: torch.device) -> None:
+    sd = torch.load(ckpt_path, map_location=device)
+    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        sd = sd["state_dict"]
+    new_sd = {}
+    for k, v in sd.items():
+        if k.startswith("module."):
+            new_sd[k[len("module."):]] = v
+        else:
+            new_sd[k] = v
+    model.load_state_dict(new_sd, strict=False)
+
+@torch.no_grad()
+def detector_prob_for_path(det_model: nn.Module, img_path: str, det_img_size: int, device: torch.device) -> float:
+    det_model.eval()
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except Exception:
+        return 0.0
+    if int(det_img_size) > 0:
+        img = img.resize((int(det_img_size), int(det_img_size)), resample=Image.BILINEAR)
+    x = img_to_tensor01(img).unsqueeze(0).to(device)
+    x = imagenet_normalize(x)
+    logit = det_model(x)
+    p = torch.sigmoid(logit).item()
+    return float(p)
+
+
+# ============================================================
+# Mask R-CNN build
+# ============================================================
+
+def set_maskrcnn_transform_size(model: nn.Module, min_size: int, max_size: int) -> None:
+    """
+    Fixed-size training/inference:
+      model.transform.min_size = (min_size,)
+      model.transform.max_size = max_size
+    """
+    min_size = int(min_size)
+    max_size = int(max_size)
+    if min_size <= 0 or max_size <= 0:
+        return
+    model.transform.min_size = (min_size,)
+    model.transform.max_size = max_size
+
+def set_maskrcnn_transform_multiscale(model: nn.Module, min_sizes: List[int], max_size: int) -> None:
+    """
+    Multi-scale training:
+      model.transform.min_size = tuple(min_sizes)
+      model.transform.max_size = max_size
+
+    torchvision detection will randomly pick one min_size at each forward during training.
+    """
+    ms = [int(x) for x in min_sizes if int(x) > 0]
+    if len(ms) == 0:
+        return
+    model.transform.min_size = tuple(ms)
+    model.transform.max_size = int(max_size)
+
+def build_maskrcnn(
+    num_classes: int = 2,
+    pretrained_coco: int = 0,
+    pretrained_backbone: int = 0,
+    trainable_backbone_layers: int = 3,
+    init_min_size: int = 768,
+    init_max_size: int = 768
+) -> nn.Module:
+    """
+    - pretrained_coco=1: start from COCO pretrained Mask R-CNN weights
+    - pretrained_backbone=1: ImageNet backbone only (ResNet50 weights)
+    If both are 1, COCO weights take precedence.
+    """
+    weights = None
+    weights_backbone = None
+    if int(pretrained_coco) == 1:
+        weights = torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+        weights_backbone = None
+    else:
+        if int(pretrained_backbone) == 1:
+            weights_backbone = torchvision.models.ResNet50_Weights.DEFAULT
+
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+        weights=weights,
+        weights_backbone=weights_backbone,
+        trainable_backbone_layers=int(trainable_backbone_layers),
+    )
+
+    # Replace box head
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # Replace mask head
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden, num_classes)
+
+    # Init transform size
+    set_maskrcnn_transform_size(model, int(init_min_size), int(init_max_size))
+    return model
+
+
+# ============================================================
+# Integrity scan (rank0 -> json -> all ranks use)
+# ============================================================
+
+def integrity_scan_image_ids(img_dir: str, image_ids: List[str], logger: RunLogger,
+                             out_json: str, limit: int = 0) -> Dict[str, Any]:
+    """
+    Decode-scan images to exclude broken files.
+    rank0 executes and saves JSON; other ranks wait and load.
+    """
+    if not is_main_process():
+        ddp_barrier()
+        return load_json(out_json)
+
+    t0 = time.time()
+    ok = []
+    bad = []
+    ids = list(image_ids)
+    if int(limit) > 0 and len(ids) > int(limit):
+        ids = random.sample(ids, int(limit))
+
+    for i, fn in enumerate(ids, start=1):
+        p = os.path.join(img_dir, fn)
+        try:
+            im = Image.open(p).convert("RGB")
+            _ = im.size
+            ok.append(fn)
+        except Exception:
+            bad.append(fn)
+        if i % 5000 == 0:
+            logger.g(f"[integrity] scanned {i}/{len(ids)} ok={len(ok)} bad={len(bad)}")
+
+    res = {
+        "img_dir": img_dir,
+        "scanned_n": len(ids),
+        "total_ids_n": len(image_ids),
+        "bad_ids": sorted(list(set(bad))),
+        "elapsed_sec": float(time.time() - t0),
+        "note": "If scanned_n < total_ids_n, only bad_ids are authoritative; others assumed ok."
+    }
+    save_json(out_json, res)
+    logger.g(f"[integrity] saved {out_json} scanned_n={res['scanned_n']} bad={len(res['bad_ids'])} elapsed={res['elapsed_sec']:.1f}s")
+    ddp_barrier()
+    return res
+
+
+# ============================================================
+# Dataset (no resize; resize only via model.transform)
+# ============================================================
+
+def masks_to_boxes_xyxy(masks: np.ndarray) -> np.ndarray:
+    n = masks.shape[0]
+    boxes = np.zeros((n, 4), dtype=np.float32)
+    for i in range(n):
+        ys, xs = np.where(masks[i] > 0)
+        if len(xs) == 0:
+            boxes[i] = 0
+        else:
+            x1 = float(xs.min()); x2 = float(xs.max())
+            y1 = float(ys.min()); y2 = float(ys.max())
+            boxes[i] = np.array([x1, y1, x2, y2], dtype=np.float32)
+    return boxes
+
+class AirbusMaskRcnnDataset(Dataset):
+    """
+    IMPORTANT:
+    - no resize here (keep raw size); Mask R-CNN transform handles resizing.
+    - augmentations are basic flips with sync for image/boxes/masks.
+    """
+    def __init__(
+        self,
+        img_dir: str,
+        id2rles: Dict[str, List[str]],
+        image_ids: List[str],
+        bad_ids: Optional[set] = None,
+        min_instance_area: int = 8,
+        min_box_hw: int = 2,
+        augment: int = 1,
+        max_fallback_tries: int = 10
+    ):
+        self.img_dir = img_dir
+        self.id2rles = id2rles
+        self.ids = list(image_ids)
+        self.bad_ids = bad_ids if bad_ids is not None else set()
+        self.min_instance_area = int(min_instance_area)
+        self.min_box_hw = int(min_box_hw)
+        self.augment = int(augment)
+        self.max_fallback_tries = int(max_fallback_tries)
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _try_load(self, image_id: str):
+        if image_id in self.bad_ids:
+            raise ValueError("bad image_id (integrity)")
+
+        path = os.path.join(self.img_dir, image_id)
+        img = Image.open(path).convert("RGB")
+        w0, h0 = img.size
+        img_t = img_to_tensor01(img)
+
+        rles = self.id2rles.get(image_id, [])
+        masks = []
+        for rle in rles:
+            m = rle_decode(rle, (h0, w0))
+            if int(m.sum()) < self.min_instance_area:
+                continue
+            masks.append(m)
+
+        if len(masks) == 0:
+            target = {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros((0,), dtype=torch.int64),
+                "masks": torch.zeros((0, img_t.shape[1], img_t.shape[2]), dtype=torch.uint8),
+                "image_id": torch.tensor([0], dtype=torch.int64),
+            }
+        else:
+            mstack = np.stack(masks, axis=0).astype(np.uint8)
+            boxes = masks_to_boxes_xyxy(mstack)
+
+            keep = []
+            for i in range(mstack.shape[0]):
+                x1, y1, x2, y2 = boxes[i]
+                if (x2 - x1 + 1) < self.min_box_hw or (y2 - y1 + 1) < self.min_box_hw:
+                    continue
+                keep.append(i)
+
+            if len(keep) == 0:
+                target = {
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                    "masks": torch.zeros((0, img_t.shape[1], img_t.shape[2]), dtype=torch.uint8),
+                    "image_id": torch.tensor([0], dtype=torch.int64),
+                }
+            else:
+                mstack = mstack[keep]
+                boxes = boxes[keep]
+                target = {
+                    "boxes": torch.from_numpy(boxes).float(),
+                    "labels": torch.ones((mstack.shape[0],), dtype=torch.int64),
+                    "masks": torch.from_numpy(mstack).to(torch.uint8),
+                    "image_id": torch.tensor([0], dtype=torch.int64),
+                }
+
+        # basic augmentations (sync)
+        if self.augment:
+            if random.random() < 0.5:
+                img_t = TF.hflip(img_t)
+                if target["boxes"].numel() > 0:
+                    W = img_t.shape[2]
+                    boxes_t = target["boxes"]
+                    x1 = W - 1 - boxes_t[:, 2]
+                    x2 = W - 1 - boxes_t[:, 0]
+                    boxes_t[:, 0] = x1
+                    boxes_t[:, 2] = x2
+                    target["boxes"] = boxes_t
+                    target["masks"] = torch.flip(target["masks"], dims=[2])
+            if random.random() < 0.5:
+                img_t = TF.vflip(img_t)
+                if target["boxes"].numel() > 0:
+                    H = img_t.shape[1]
+                    boxes_t = target["boxes"]
+                    y1 = H - 1 - boxes_t[:, 3]
+                    y2 = H - 1 - boxes_t[:, 1]
+                    boxes_t[:, 1] = y1
+                    boxes_t[:, 3] = y2
+                    target["boxes"] = boxes_t
+                    target["masks"] = torch.flip(target["masks"], dims=[1])
+
+        return img_t, target
+
+    def __getitem__(self, idx: int):
+        for t in range(self.max_fallback_tries):
+            image_id = self.ids[idx] if t == 0 else random.choice(self.ids)
+            try:
+                img_t, target = self._try_load(image_id)
+                target["image_id"] = torch.tensor([idx], dtype=torch.int64)
+                return img_t, target, image_id
+            except Exception:
+                continue
+
+        # ultimate fallback
+        H = W = 768
+        img_t = torch.zeros((3, H, W), dtype=torch.float32)
+        target = {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "labels": torch.zeros((0,), dtype=torch.int64),
+            "masks": torch.zeros((0, H, W), dtype=torch.uint8),
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+        }
+        return img_t, target, self.ids[idx]
+
+def collate_fn(batch):
+    imgs = [b[0] for b in batch]
+    targets = [b[1] for b in batch]
+    ids = [b[2] for b in batch]
+    return imgs, targets, ids
+
+
+# ============================================================
+# Metrics (pixel-level union F2)
+# ============================================================
+
+def union_from_target(target: Dict[str, torch.Tensor], shape_hw: Tuple[int, int]) -> np.ndarray:
+    if "masks" not in target or target["masks"].numel() == 0:
+        H, W = shape_hw
+        return np.zeros((H, W), dtype=np.uint8)
+    m = target["masks"].cpu().numpy().astype(np.uint8)
+    u = (m.sum(axis=0) > 0).astype(np.uint8)
+    return u
+
+def accumulate_counts(gt: np.ndarray, pr: np.ndarray) -> Tuple[int, int, int]:
+    gt = (gt > 0).astype(np.uint8)
+    pr = (pr > 0).astype(np.uint8)
+    tp = int(((gt == 1) & (pr == 1)).sum())
+    fp = int(((gt == 0) & (pr == 1)).sum())
+    fn = int(((gt == 1) & (pr == 0)).sum())
+    return tp, fp, fn
+
+def compute_metrics(tp: int, fp: int, fn: int, beta: float = 2.0) -> Dict[str, float]:
+    eps = 1e-12
+    prec = tp / (tp + fp + eps)
+    rec  = tp / (tp + fn + eps)
+    f1   = (2 * prec * rec) / (prec + rec + eps)
+    b2 = beta * beta
+    fbeta = (1 + b2) * prec * rec / (b2 * prec + rec + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return {"precision": float(prec), "recall": float(rec), "f1": float(f1), "f2": float(fbeta), "iou": float(iou)}
+
+
+# ============================================================
+# Inference helper (single image -> instance masks)
+# NOTE: "no double sigmoid" invariant here.
+# ============================================================
+
+def safe_logit(p: float, eps: float = 1e-6) -> float:
+    p2 = min(1.0 - eps, max(eps, float(p)))
+    return float(math.log(p2 / (1.0 - p2)))
+
+def sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    else:
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+@torch.no_grad()
+def infer_raw_outputs(model: nn.Module, img_t: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
+    """
+    Return:
+      scores: [N] (0..1)
+      mask_probs: [N,1,H,W] in 0..1 (sigmoid applied at most once)
+    """
+    model.eval()
+    x = img_t.to(device)
+    out = model([x])[0]
+    scores = out.get("scores", torch.zeros((0,), device=device)).detach()
+    masks  = out.get("masks", torch.zeros((0, 1, x.shape[1], x.shape[2]), device=device)).detach()
+
+    if masks.numel() == 0:
+        mask_probs = masks
+    else:
+        mn = float(masks.min().item())
+        mx = float(masks.max().item())
+        if (mn >= -1e-6) and (mx <= 1.0 + 1e-6):
+            mask_probs = masks.float()
+        else:
+            mask_probs = masks.float().sigmoid()
+
+    return {"scores": scores, "mask_probs": mask_probs}
+
+def insts_union_from_cached(
+    scores: torch.Tensor,
+    mask_probs: torch.Tensor,
+    score_thr: float,
+    mask_thr: float,
+    shape_hw: Tuple[int, int]
+) -> np.ndarray:
+    H, W = shape_hw
+    if scores.numel() == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    keep = scores >= float(score_thr)
+    if keep.sum().item() == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    mp = mask_probs[keep]  # [K,1,H,W]
+    probs = mp[:, 0].float()  # [K,H,W]
+    u = np.zeros((H, W), dtype=np.uint8)
+    for k in range(probs.shape[0]):
+        mk = (probs[k].detach().cpu().numpy() >= float(mask_thr)).astype(np.uint8)
+        if mk.sum() > 0:
+            u = np.maximum(u, mk)
+    return u
+
+def seg_evidence_from_scores(scores: torch.Tensor) -> float:
+    if scores is None or scores.numel() == 0:
+        return 0.0
+    return float(scores.max().item())
+
+def fuse_det_seg_prob(det_p: float, seg_p: float, w_det: float, w_seg: float, bias: float) -> float:
+    ld = safe_logit(det_p)
+    ls = safe_logit(seg_p)
+    return sigmoid(float(w_det) * ld + float(w_seg) * ls + float(bias))
+
+
+# ============================================================
+# Detector ranking (rank0 only) + output files
+# ============================================================
+
+def compute_detector_probs_rank0(
+    det_model: nn.Module,
+    img_dir: str,
+    ids: List[str],
+    det_img_size: int,
+    device: torch.device,
+    score_all_limit: int,
+    logger: RunLogger
+) -> List[Tuple[str, float]]:
+    if not is_main_process():
+        return []
+
+    ids = list(ids)
+    if int(score_all_limit) > 0 and len(ids) > int(score_all_limit):
+        ids_scoring = random.sample(ids, int(score_all_limit))
+    else:
+        ids_scoring = ids
+
+    scored: List[Tuple[str, float]] = []
+    for k, img_id in enumerate(ids_scoring):
+        p = detector_prob_for_path(det_model, os.path.join(img_dir, img_id), det_img_size, device)
+        scored.append((img_id, float(p)))
+        if (k + 1) % 200 == 0:
+            logger.g(f"[det-prob] scored {k+1}/{len(ids_scoring)}")
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+def build_train_ids_from_rank(
+    candidates: List[str],
+    scored: List[Tuple[str, float]],
+    train_n: int,
+    top_frac: float,
+    bottom_frac: float
+) -> List[str]:
+    """
+    Sampling bias:
+    - take top_frac * train_n from top of ranking
+    - take bottom_frac * train_n from bottom
+    - fill remaining from the rest uniformly at random
+    """
+    candidates_set = set(candidates)
+    scored_ids = [i for i, _p in scored if i in candidates_set]
+
+    train_n = int(train_n)
+    top_n = int(round(train_n * float(top_frac)))
+    bot_n = int(round(train_n * float(bottom_frac)))
+    top_n = max(0, min(top_n, len(scored_ids), train_n))
+    bot_n = max(0, min(bot_n, len(scored_ids) - top_n, train_n - top_n))
+
+    top = scored_ids[:top_n]
+    bot = scored_ids[-bot_n:] if bot_n > 0 else []
+
+    chosen = list(top) + list(bot)
+    chosen_set = set(chosen)
+
+    remain_pool = [x for x in candidates if x not in chosen_set]
+    random.shuffle(remain_pool)
+    need = train_n - len(chosen)
+    if need > 0:
+        chosen += remain_pool[:need]
+    random.shuffle(chosen)
+    return chosen
+
+
+# ============================================================
+# Train (DDP)
+# ============================================================
+
+def to_device_targets(targets: List[Dict[str, Any]], device: torch.device) -> List[Dict[str, Any]]:
+    out = []
+    for t in targets:
+        t2 = {}
+        for k, v in t.items():
+            if isinstance(v, torch.Tensor):
+                t2[k] = v.to(device, non_blocking=True)
+            else:
+                t2[k] = v
+        out.append(t2)
+    return out
+
+def ddp_wrap(model: nn.Module, device: torch.device) -> nn.Module:
+    if is_dist_avail_and_initialized():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False
+        )
+    return model
+
+def get_model_to_save(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+def train_one_epoch_ddp(
+    model: nn.Module,
+    dl: DataLoader,
+    device: torch.device,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    logger: RunLogger,
+    log_every: int = 50
+) -> Dict[str, float]:
+    model.train()
+    running = []
+    steps = 0
+
+    for step, (imgs, targets, _ids) in enumerate(dl, start=1):
+        steps += 1
+        imgs = [x.to(device, non_blocking=True) for x in imgs]
+        targets2 = to_device_targets(targets, device)
+
+        loss_dict = model(imgs, targets2)
+        losses = sum(loss for loss in loss_dict.values())
+
+        if not torch.isfinite(losses):
+            if is_main_process():
+                logger.d(f"[TRAIN] non-finite loss epoch={epoch} step={step} -> skip")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
+        losses.backward()
+        optimizer.step()
+
+        running.append(float(losses.item()))
+
+        if is_main_process() and (step % int(max(1, log_every)) == 0):
+            d = {k: float(v.item()) for k, v in loss_dict.items()}
+            lr = float(optimizer.param_groups[0]["lr"])
+            logger.d(f"[TRAIN] epoch={epoch} step={step}/{len(dl)} lr={lr:.6g} loss={float(losses.item()):.6f} detail={d}")
+
+    avg = float(np.mean(running)) if len(running) else 0.0
+    return {"loss": avg, "steps": steps}
+
+
+# ============================================================
+# Joint tuning + evaluation (rank0 only)
+# - To reduce "val overfit", we split VAL into:
+#   val_tune (used for tune_joint_fusion_rank0)
+#   val_es   (used for early stopping decisions)
+# ============================================================
+
+def _collect_eval_cache_rank0(
+    model: nn.Module,
+    det_model: nn.Module,
+    dl: DataLoader,
+    img_dir: str,
+    device: torch.device,
+    det_img_size: int,
+    limit: int,
+    logger: RunLogger
+) -> Dict[str, Any]:
+    """
+    Collect per-image cache (rank0 only):
+      - gt union
+      - det_p
+      - seg_p (max score)
+      - raw outputs (scores, mask_probs) for union computation later
+    Returns dict of arrays and lists.
+    """
+    assert is_main_process(), "rank0 only"
+    model.eval()
+    det_model.eval()
+
+    gts = []
+    det_ps = []
+    seg_ps = []
+    raws = []  # list of (scores_cpu, mask_probs_cpu)
+    ids = []
+
+    n_seen = 0
+    for (imgs, targets, image_ids) in dl:
+        for j in range(len(imgs)):
+            img_t = imgs[j]
+            tgt = targets[j]
+            image_id = image_ids[j]
+            H, W = int(img_t.shape[1]), int(img_t.shape[2])
+
+            # GT union
+            gt_u = union_from_target(tgt, (H, W))
+
+            # Detector prob (file-based)
+            pth = os.path.join(img_dir, image_id)
+            if os.path.isfile(pth):
+                det_p = detector_prob_for_path(det_model, pth, det_img_size, device)
+            else:
+                det_p = 0.0
+
+            # Mask R-CNN raw
+            raw = infer_raw_outputs(model, img_t, device)
+            scores = raw["scores"].detach().cpu()
+            mask_probs = raw["mask_probs"].detach().cpu()
+            seg_p = seg_evidence_from_scores(raw["scores"])
+
+            gts.append(gt_u)
+            det_ps.append(float(det_p))
+            seg_ps.append(float(seg_p))
+            raws.append((scores, mask_probs))
+            ids.append(image_id)
+
+            n_seen += 1
+            if int(limit) > 0 and n_seen >= int(limit):
+                break
+        if int(limit) > 0 and n_seen >= int(limit):
+            break
+
+    logger.g(f"[cache] collected n={len(ids)} for tuning/eval")
+    gt_pos = np.asarray([int(x.sum()) for x in gts], dtype=np.int64)
+
+    return {
+        "ids": ids,
+        "gts": gts,
+        "gt_pos": gt_pos,
+        "det_ps": np.asarray(det_ps, dtype=np.float64),
+        "seg_ps": np.asarray(seg_ps, dtype=np.float64),
+        "raws": raws,
+    }
+
+def tune_joint_fusion_rank0(
+    model: nn.Module,
+    det_model: nn.Module,
+    dl: DataLoader,
+    img_dir: str,
+    device: torch.device,
+    det_img_size: int,
+    score_thrs: np.ndarray,
+    mask_thrs: np.ndarray,
+    w_det_grid: List[float],
+    w_seg_grid: List[float],
+    bias_grid: List[float],
+    tau_grid: List[float],
+    limit: int,
+    logger: RunLogger,
+    beta: float = 2.0
+) -> Dict[str, Any]:
+    """
+    Efficient joint tuning strategy:
+
+    1) Collect per-image cache: det_p, seg_p, gt union, raw outputs.
+    2) Precompute per-image confusion counts (tp,fp,fn) for EACH (score_thr, mask_thr) assuming "accepted".
+       Also store gt_pos per image for the "rejected => empty prediction" case.
+    3) For each fusion combo (w_det,w_seg,bias,tau), compute accept mask A_i (based only on det_p, seg_p),
+       then compute total counts for each (score_thr,mask_thr) fast using dot products, and pick best.
+
+    This prevents the combinatorial explosion that would happen if we recomputed unions for every hyperparam tuple.
+    """
+    assert is_main_process(), "rank0 only"
+
+    cache = _collect_eval_cache_rank0(
+        model=model,
+        det_model=det_model,
+        dl=dl,
+        img_dir=img_dir,
+        device=device,
+        det_img_size=int(det_img_size),
+        limit=int(limit),
+        logger=logger
+    )
+    N = len(cache["ids"])
+    if N == 0:
+        return {"score_thr": 0.5, "mask_thr": 0.5, "w_det": 1.0, "w_seg": 1.0, "bias": 0.0, "tau": 0.5, "best_f2": 0.0}
+
+    det_ps = cache["det_ps"]
+    seg_ps = cache["seg_ps"]
+    gt_pos = cache["gt_pos"]
+    gts = cache["gts"]
+    raws = cache["raws"]
+
+    # Precompute per-(score_thr, mask_thr) confusion counts per image
+    score_thrs = np.asarray(score_thrs, dtype=np.float64)
+    mask_thrs = np.asarray(mask_thrs, dtype=np.float64)
+    P = int(len(score_thrs) * len(mask_thrs))
+
+    tp_mat = np.zeros((P, N), dtype=np.int64)
+    fp_mat = np.zeros((P, N), dtype=np.int64)
+    fn_mat = np.zeros((P, N), dtype=np.int64)
+
+    # Build pair index mapping
+    pairs = []
+    for s in score_thrs:
+        for m in mask_thrs:
+            pairs.append((float(s), float(m)))
+
+    # Compute unions + counts (heavy part, but only P*N once)
+    t0 = time.time()
+    for i in range(N):
+        gt_u = gts[i]
+        H, W = gt_u.shape
+        scores_cpu, mask_probs_cpu = raws[i]
+        # For speed: convert to torch tensors on CPU once
+        scores_t = scores_cpu
+        mask_probs_t = mask_probs_cpu
+        for pidx, (s_thr, m_thr) in enumerate(pairs):
+            pr_u = insts_union_from_cached(scores_t, mask_probs_t, s_thr, m_thr, (H, W))
+            tp, fp, fn = accumulate_counts(gt_u, pr_u)
+            tp_mat[pidx, i] = tp
+            fp_mat[pidx, i] = fp
+            fn_mat[pidx, i] = fn
+
+        if (i + 1) % 50 == 0:
+            logger.d(f"[tune-pre] precomputed {i+1}/{N} images for {P} thr-pairs")
+
+    logger.g(f"[tune-pre] done precompute: N={N} P={P} elapsed={time.time()-t0:.1f}s")
+
+    # Now scan fusion params (fast-ish)
+    best = {
+        "score_thr": 0.5,
+        "mask_thr": 0.5,
+        "w_det": 1.0,
+        "w_seg": 1.0,
+        "bias": 0.0,
+        "tau": 0.5,
+        "best_f2": -1.0
+    }
+
+    # Vectorize fusion acceptance
+    # fused_p = sigmoid(w_det*logit(det_p) + w_seg*logit(seg_p) + bias)
+    # accept = fused_p >= tau
+    det_logits = np.asarray([safe_logit(x) for x in det_ps], dtype=np.float64)
+    seg_logits = np.asarray([safe_logit(x) for x in seg_ps], dtype=np.float64)
+
+    gt_pos_sum_all = int(gt_pos.sum())
+
+    for w_det in w_det_grid:
+        for w_seg in w_seg_grid:
+            for bias in bias_grid:
+                lin = float(w_det) * det_logits + float(w_seg) * seg_logits + float(bias)
+                # sigmoid in numpy
+                fused = 1.0 / (1.0 + np.exp(-lin))
+                for tau in tau_grid:
+                    A = (fused >= float(tau)).astype(np.int64)  # [N]
+                    A0 = 1 - A
+                    # totals for each pair:
+                    # tp = tp_mat @ A
+                    # fp = fp_mat @ A
+                    # fn = fn_mat @ A + gt_pos @ (1-A)
+                    tp = tp_mat.dot(A)
+                    fp = fp_mat.dot(A)
+                    fn = fn_mat.dot(A) + int(gt_pos.dot(A0))
+
+                    # compute f2 vectorized
+                    eps = 1e-12
+                    prec = tp / (tp + fp + eps)
+                    rec  = tp / (tp + fn + eps)
+                    b2 = beta * beta
+                    f2 = (1 + b2) * prec * rec / (b2 * prec + rec + eps)
+
+                    p_best = int(np.argmax(f2))
+                    f2_best = float(f2[p_best])
+
+                    if f2_best > float(best["best_f2"]):
+                        s_thr, m_thr = pairs[p_best]
+                        best = {
+                            "score_thr": float(s_thr),
+                            "mask_thr": float(m_thr),
+                            "w_det": float(w_det),
+                            "w_seg": float(w_seg),
+                            "bias": float(bias),
+                            "tau": float(tau),
+                            "best_f2": float(f2_best),
+                            "accepted_frac": float(A.mean()),
+                            "gt_pos_sum": int(gt_pos_sum_all),
+                        }
+
+    logger.g(
+        f"[tune] best_f2={best['best_f2']:.6f} "
+        f"score_thr={best['score_thr']:.3f} mask_thr={best['mask_thr']:.3f} "
+        f"w_det={best['w_det']:.2f} w_seg={best['w_seg']:.2f} bias={best['bias']:.2f} tau={best['tau']:.2f} "
+        f"accepted_frac={best.get('accepted_frac',0.0):.3f}"
+    )
+    return best
+
+def eval_joint_pixel_union_rank0(
+    model: nn.Module,
+    det_model: nn.Module,
+    dl: DataLoader,
+    img_dir: str,
+    device: torch.device,
+    det_img_size: int,
+    joint: Dict[str, Any],
+    limit: int,
+    logger: RunLogger,
+    beta: float = 2.0
+) -> Dict[str, float]:
+    """
+    Evaluate using the fixed joint params (rank0 only).
+    """
+    assert is_main_process(), "rank0 only"
+
+    model.eval()
+    det_model.eval()
+
+    tp = fp = fn = 0
+    n_seen = 0
+
+    score_thr = float(joint.get("score_thr", 0.5))
+    mask_thr  = float(joint.get("mask_thr", 0.5))
+    w_det     = float(joint.get("w_det", 1.0))
+    w_seg     = float(joint.get("w_seg", 1.0))
+    bias      = float(joint.get("bias", 0.0))
+    tau       = float(joint.get("tau", 0.5))
+
+    for (imgs, targets, image_ids) in dl:
+        for j in range(len(imgs)):
+            img_t = imgs[j]
+            tgt = targets[j]
+            image_id = image_ids[j]
+            H, W = int(img_t.shape[1]), int(img_t.shape[2])
+
+            gt_u = union_from_target(tgt, (H, W))
+
+            pth = os.path.join(img_dir, image_id)
+            det_p = detector_prob_for_path(det_model, pth, det_img_size, device) if os.path.isfile(pth) else 0.0
+
+            raw = infer_raw_outputs(model, img_t, device)
+            seg_p = seg_evidence_from_scores(raw["scores"])
+            fused_p = fuse_det_seg_prob(det_p, seg_p, w_det, w_seg, bias)
+
+            if fused_p < tau:
+                pr_u = np.zeros((H, W), dtype=np.uint8)
+            else:
+                scores = raw["scores"].detach().cpu()
+                mask_probs = raw["mask_probs"].detach().cpu()
+                pr_u = insts_union_from_cached(scores, mask_probs, score_thr, mask_thr, (H, W))
+
+            a, b, c = accumulate_counts(gt_u, pr_u)
+            tp += a; fp += b; fn += c
+
+            n_seen += 1
+            if int(limit) > 0 and n_seen >= int(limit):
+                break
+        if int(limit) > 0 and n_seen >= int(limit):
+            break
+
+    m = compute_metrics(tp, fp, fn, beta=beta)
+    m["n_eval"] = float(n_seen)
+    return m
+
+
+# ============================================================
+# Split sampling (rank0 decides, broadcast via json)
+# - VAL is split into val_tune and val_es to reduce "val overfit".
+# ============================================================
+
+def sample_split_stratified_4way(
+    pos_ids: List[str],
+    neg_ids: List[str],
+    train_n: int,
+    val_n: int,
+    ptest_n: int,
+    pos_frac: float,
+    val_tune_frac: float,
+    seed: int
+) -> Dict[str, List[str]]:
+    rnd = random.Random(int(seed))
+    pos_pool = pos_ids.copy()
+    neg_pool = neg_ids.copy()
+    rnd.shuffle(pos_pool)
+    rnd.shuffle(neg_pool)
+
+    def take(lst, n):
+        n = max(0, min(int(n), len(lst)))
+        out = lst[:n]
+        del lst[:n]
+        return out
+
+    pos_frac = float(pos_frac)
+
+    # split val into tune + es
+    val_tune_frac = float(val_tune_frac)
+    val_tune_n = int(round(val_n * val_tune_frac))
+    val_es_n = int(val_n) - int(val_tune_n)
+
+    pos_n_train = int(round(train_n * pos_frac))
+    neg_n_train = train_n - pos_n_train
+
+    pos_n_vt = int(round(val_tune_n * pos_frac))
+    neg_n_vt = val_tune_n - pos_n_vt
+
+    pos_n_ve = int(round(val_es_n * pos_frac))
+    neg_n_ve = val_es_n - pos_n_ve
+
+    pos_n_pt = int(round(ptest_n * pos_frac))
+    neg_n_pt = ptest_n - pos_n_pt
+
+    val_tune = take(pos_pool, pos_n_vt) + take(neg_pool, neg_n_vt)
+    val_es   = take(pos_pool, pos_n_ve) + take(neg_pool, neg_n_ve)
+    ptest    = take(pos_pool, pos_n_pt) + take(neg_pool, neg_n_pt)
+    train    = take(pos_pool, pos_n_train) + take(neg_pool, neg_n_train)
+
+    rnd.shuffle(train)
+    rnd.shuffle(val_tune)
+    rnd.shuffle(val_es)
+    rnd.shuffle(ptest)
+
+    return {"train": train, "val_tune": val_tune, "val_es": val_es, "ptest": ptest}
+
+
+# ============================================================
+# Detector probs for infer(test ids) (rank0 only)
+# ============================================================
+
+def write_detector_probs_infer_test_rank0(
+    det_model: nn.Module,
+    test_img_dir: str,
+    template_ids: List[str],
+    det_img_size: int,
+    device: torch.device,
+    out_csv: str,
+    logger: RunLogger
+) -> None:
+    if not is_main_process():
+        return
+    rows = []
+    n = len(template_ids)
+    for i, img_id in enumerate(template_ids, start=1):
+        pth = os.path.join(test_img_dir, img_id)
+        if not os.path.isfile(pth):
+            p = 0.0
+        else:
+            p = detector_prob_for_path(det_model, pth, det_img_size, device)
+        rows.append([img_id, f"{p:.10f}"])
+        if i % 500 == 0:
+            logger.g(f"[infer-det] {i}/{n}")
+    write_csv_rows(out_csv, ["ImageId", "det_prob"], rows)
+    logger.g(f"[infer-det] saved {out_csv} rows={len(rows)}")
+
+
+# ============================================================
+# Phase runner
+# ============================================================
+
+def run_phase(
+    phase_name: str,
+    model_ddp: nn.Module,
+    det_model: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    train_img_dir: str,
+    id2rles: Dict[str, List[str]],
+    train_ids: List[str],
+    val_tune_ids: List[str],
+    val_es_ids: List[str],
+    ptest_ids: List[str],
+    bad_ids_set: set,
+    train_size_mode: str,             # "fixed" or "multiscale"
+    train_size: int,
+    multiscale_min_sizes: List[int],
+    multiscale_max_size: int,
+    max_epochs: int,
+    patience: int,
+    joint_grids: Dict[str, Any],
+    eval_limits: Dict[str, int],
+    run_dir: str,
+    logger: RunLogger,
+) -> Dict[str, Any]:
+    """
+    Train one phase with early stopping on rank0 joint F2 evaluated on val_es.
+    Joint hyperparams are tuned on val_tune.
+    """
+    # dataset/dataloader
+    ds_train = AirbusMaskRcnnDataset(
+        train_img_dir, id2rles, train_ids,
+        bad_ids=bad_ids_set,
+        min_instance_area=joint_grids["min_instance_area"],
+        min_box_hw=joint_grids["min_box_hw"],
+        augment=1
+    )
+    ds_val_tune = AirbusMaskRcnnDataset(
+        train_img_dir, id2rles, val_tune_ids,
+        bad_ids=bad_ids_set,
+        min_instance_area=joint_grids["min_instance_area"],
+        min_box_hw=joint_grids["min_box_hw"],
+        augment=0
+    )
+    ds_val_es = AirbusMaskRcnnDataset(
+        train_img_dir, id2rles, val_es_ids,
+        bad_ids=bad_ids_set,
+        min_instance_area=joint_grids["min_instance_area"],
+        min_box_hw=joint_grids["min_box_hw"],
+        augment=0
+    )
+    ds_ptest = AirbusMaskRcnnDataset(
+        train_img_dir, id2rles, ptest_ids,
+        bad_ids=bad_ids_set,
+        min_instance_area=joint_grids["min_instance_area"],
+        min_box_hw=joint_grids["min_box_hw"],
+        augment=0
+    )
+
+    train_sampler = DistributedSampler(ds_train, shuffle=True) if is_dist_avail_and_initialized() else None
+
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=joint_grids["batch_train"],
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=joint_grids["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+    dl_val_tune = DataLoader(
+        ds_val_tune,
+        batch_size=joint_grids["batch_eval"],
+        shuffle=False,
+        num_workers=joint_grids["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+    dl_val_es = DataLoader(
+        ds_val_es,
+        batch_size=joint_grids["batch_eval"],
+        shuffle=False,
+        num_workers=joint_grids["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+    dl_ptest = DataLoader(
+        ds_ptest,
+        batch_size=joint_grids["batch_eval"],
+        shuffle=False,
+        num_workers=joint_grids["num_workers"],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+
+    # set transform size
+    model_plain = get_model_to_save(model_ddp)
+    if str(train_size_mode) == "multiscale":
+        set_maskrcnn_transform_multiscale(model_plain, multiscale_min_sizes, multiscale_max_size)
+        logger.g(f"[{phase_name}] train transform MULTISCALE: min_sizes={multiscale_min_sizes} max_size={multiscale_max_size}")
+    else:
+        set_maskrcnn_transform_size(model_plain, int(train_size), int(train_size))
+        logger.g(f"[{phase_name}] train transform FIXED: min=max={int(train_size)}")
+
+    # joint grid spec (score/mask thresholds)
+    grid_n = int(joint_grids["grid_n"])
+    score_thrs = np.linspace(float(joint_grids["score_thr_min"]), float(joint_grids["score_thr_max"]), grid_n)
+    mask_thrs  = np.linspace(float(joint_grids["mask_thr_min"]),  float(joint_grids["mask_thr_max"]),  grid_n)
+    w_det_grid = joint_grids["w_det_grid"]
+    w_seg_grid = joint_grids["w_seg_grid"]
+    bias_grid  = joint_grids["bias_grid"]
+    tau_grid   = joint_grids["tau_grid"]
+
+    best_f2 = -1.0
+    best_epoch = -1
+    best_joint = {"score_thr": 0.5, "mask_thr": 0.5, "w_det": 1.0, "w_seg": 1.0, "bias": 0.0, "tau": 0.5}
+    patience_left = int(patience)
+    history = []
+
+    ckpt_best = os.path.join(run_dir, f"{phase_name}_best_model.pt")
+    ckpt_last = os.path.join(run_dir, f"{phase_name}_last_model.pt")
+    meta_best = os.path.join(run_dir, f"{phase_name}_best_meta.json")
+
+    for epoch in range(int(max_epochs)):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        tr = train_one_epoch_ddp(model_ddp, dl_train, device, optimizer, epoch, logger, log_every=int(joint_grids["log_every"]))
+        ddp_barrier()
+
+        # rank0 tunes on val_tune
+        joint = tune_joint_fusion_rank0(
+            model=get_model_to_save(model_ddp),
+            det_model=det_model,
+            dl=dl_val_tune,
+            img_dir=train_img_dir,
+            device=device,
+            det_img_size=int(joint_grids["det_img_size"]),
+            score_thrs=score_thrs,
+            mask_thrs=mask_thrs,
+            w_det_grid=w_det_grid,
+            w_seg_grid=w_seg_grid,
+            bias_grid=bias_grid,
+            tau_grid=tau_grid,
+            limit=int(joint_grids["tune_limit"]),
+            logger=logger,
+            beta=2.0
+        ) if is_main_process() else {}
+
+        # broadcast joint to all ranks (keep deterministic consistency)
+        if is_dist_avail_and_initialized():
+            if is_main_process():
+                arr = torch.tensor([
+                    float(joint.get("score_thr", 0.5)),
+                    float(joint.get("mask_thr", 0.5)),
+                    float(joint.get("w_det", 1.0)),
+                    float(joint.get("w_seg", 1.0)),
+                    float(joint.get("bias", 0.0)),
+                    float(joint.get("tau", 0.5)),
+                ], device=device, dtype=torch.float32)
+            else:
+                arr = torch.zeros((6,), device=device, dtype=torch.float32)
+            dist.broadcast(arr, src=0)
+            joint = {
+                "score_thr": float(arr[0].item()),
+                "mask_thr": float(arr[1].item()),
+                "w_det": float(arr[2].item()),
+                "w_seg": float(arr[3].item()),
+                "bias": float(arr[4].item()),
+                "tau": float(arr[5].item()),
+            }
+
+        # Evaluate ES metric on val_es (rank0)
+        valm = eval_joint_pixel_union_rank0(
+            model=get_model_to_save(model_ddp),
+            det_model=det_model,
+            dl=dl_val_es,
+            img_dir=train_img_dir,
+            device=device,
+            det_img_size=int(joint_grids["det_img_size"]),
+            joint=joint,
+            limit=int(eval_limits["val_eval_limit"]),
+            logger=logger,
+            beta=2.0
+        ) if is_main_process() else {}
+
+        if is_main_process():
+            hist = {
+                "epoch": int(epoch),
+                "train_loss": float(tr["loss"]),
+                "val_es_f2": float(valm.get("f2", 0.0)),
+                "val_es_precision": float(valm.get("precision", 0.0)),
+                "val_es_recall": float(valm.get("recall", 0.0)),
+                "val_es_iou": float(valm.get("iou", 0.0)),
+                "joint": dict(joint),
+            }
+            history.append(hist)
+            save_json(os.path.join(run_dir, f"{phase_name}_history.json"), history)
+
+            logger.g(
+                f"[{phase_name}][VAL_ES] epoch={epoch} train_loss={tr['loss']:.6f} "
+                f"f2={valm.get('f2',0.0):.6f} prec={valm.get('precision',0.0):.4f} rec={valm.get('recall',0.0):.4f} "
+                f"iou={valm.get('iou',0.0):.4f} "
+                f"score_thr={joint['score_thr']:.3f} mask_thr={joint['mask_thr']:.3f} "
+                f"w_det={joint['w_det']:.2f} w_seg={joint['w_seg']:.2f} bias={joint['bias']:.2f} tau={joint['tau']:.2f}"
+            )
+
+            # save last
+            torch.save(get_model_to_save(model_ddp).state_dict(), ckpt_last)
+
+        # early stopping based on val_es f2
+        improved = False
+        if is_main_process():
+            cur_f2 = float(valm.get("f2", -1.0))
+            if cur_f2 > best_f2:
+                best_f2 = cur_f2
+                best_epoch = int(epoch)
+                best_joint = dict(joint)
+                torch.save(get_model_to_save(model_ddp).state_dict(), ckpt_best)
+                save_json(meta_best, {
+                    "phase": phase_name,
+                    "best_epoch": best_epoch,
+                    "best_val_es_f2": best_f2,
+                    "best_joint": best_joint,
+                })
+                logger.g(f"[{phase_name}][CKPT] saved BEST -> {ckpt_best} (epoch={best_epoch}, f2={best_f2:.6f})")
+                patience_left = int(patience)
+                improved = True
+            else:
+                patience_left -= 1
+                logger.g(f"[{phase_name}][ES] no improve. patience_left={patience_left}/{patience}")
+                if patience_left <= 0:
+                    logger.g(f"[{phase_name}][ES] early stop")
+
+        # synchronize decision + patience_left
+        if is_dist_avail_and_initialized():
+            flag = torch.tensor([1 if improved else 0], device=device, dtype=torch.int32) if is_main_process() else torch.tensor([0], device=device, dtype=torch.int32)
+            dist.broadcast(flag, src=0)
+            pten = torch.tensor([patience_left], device=device, dtype=torch.int32) if is_main_process() else torch.tensor([0], device=device, dtype=torch.int32)
+            dist.broadcast(pten, src=0)
+            patience_left = int(pten.item())
+
+        ddp_barrier()
+        if patience_left <= 0:
+            break
+
+    # load best for ptest summary (rank0 only)
+    if is_main_process() and os.path.isfile(ckpt_best):
+        get_model_to_save(model_ddp).load_state_dict(torch.load(ckpt_best, map_location=device))
+        logger.g(f"[{phase_name}] loaded BEST for ptest eval")
+
+    ptest_m = eval_joint_pixel_union_rank0(
+        model=get_model_to_save(model_ddp),
+        det_model=det_model,
+        dl=dl_ptest,
+        img_dir=train_img_dir,
+        device=device,
+        det_img_size=int(joint_grids["det_img_size"]),
+        joint=best_joint,
+        limit=int(eval_limits["ptest_eval_limit"]),
+        logger=logger,
+        beta=2.0
+    ) if is_main_process() else {}
+
+    out = {
+        "phase": phase_name,
+        "train_size_mode": str(train_size_mode),
+        "train_size": int(train_size),
+        "multiscale_min_sizes": list(multiscale_min_sizes),
+        "multiscale_max_size": int(multiscale_max_size),
+        "best_epoch": int(best_epoch),
+        "best_val_es_f2": float(best_f2),
+        "best_joint": dict(best_joint),
+        "ckpt_best": ckpt_best,
+        "ckpt_last": ckpt_last,
+        "ptest_metrics": dict(ptest_m) if is_main_process() else {},
+    }
+    return out
+
+
+# ============================================================
+# Args
+# ============================================================
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="cuda")  # DDP uses LOCAL_RANK
+
+    # dataset split (total sizes)
+    p.add_argument("--train_n", type=int, default=20000)
+    p.add_argument("--val_n", type=int, default=3000)     # total val = val_tune + val_es
+    p.add_argument("--ptest_n", type=int, default=3000)
+
+    # choose pos:neg ratio
+    p.add_argument("--pos_frac", type=float, default=0.40, help="pos fraction, e.g. 0.40")
+    p.add_argument("--pos_neg_ratio", type=str, default="", help='pos:neg ratio string, e.g. "40:60" (overrides pos_frac if set)')
+
+    # val split
+    p.add_argument("--val_tune_frac", type=float, default=0.50, help="fraction of val_n used for tuning; remainder used for early-stopping eval")
+
+    # dataloader
+    p.add_argument("--batch_train", type=int, default=2)
+    p.add_argument("--batch_eval", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
+
+    # maskrcnn init
+    p.add_argument("--maskrcnn_pretrained_coco", type=int, default=0, help="1 = COCO pretrained Mask R-CNN weights")
+    p.add_argument("--maskrcnn_pretrained_backbone", type=int, default=0, help="1 = ImageNet ResNet50 backbone only (if coco=0)")
+    p.add_argument("--trainable_backbone_layers", type=int, default=3)
+
+    # phase sizes
+    p.add_argument("--phase1_size", type=int, default=512)
+    p.add_argument("--phase2_size", type=int, default=768)
+
+    p.add_argument("--phase1_max_epochs", type=int, default=15)
+    p.add_argument("--phase1_patience", type=int, default=4)
+
+    p.add_argument("--phase2_max_epochs", type=int, default=30)
+    p.add_argument("--phase2_patience", type=int, default=6)
+
+    # optional phase3 multiscale
+    p.add_argument("--phase3_enable", type=int, default=0)
+    p.add_argument("--phase3_min_sizes", type=str, default="512,640,768,896", help="comma list for multiscale min_size candidates")
+    p.add_argument("--phase3_max_size", type=int, default=1024)
+    p.add_argument("--phase3_max_epochs", type=int, default=12)
+    p.add_argument("--phase3_patience", type=int, default=4)
+    p.add_argument("--lr_phase3_scale", type=float, default=0.2)
+
+    # optimizer
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lr_phase2_scale", type=float, default=0.3)
+
+    # detector
+    p.add_argument("--detector_ckpt", type=str, required=True)
+    p.add_argument("--det_variant", type=str, default="s", choices=["s", "m", "l"])
+    p.add_argument("--det_img_size", type=int, default=768)
+    p.add_argument("--det_pretrained_backbone", type=int, default=0)
+
+    # ranking
+    p.add_argument("--rank_score_all_limit", type=int, default=6000)
+    p.add_argument("--phase1_top_frac", type=float, default=0.90)
+    p.add_argument("--phase1_bottom_frac", type=float, default=0.10)
+    p.add_argument("--phase2_top_frac", type=float, default=0.60)
+    p.add_argument("--phase2_bottom_frac", type=float, default=0.20)
+    p.add_argument("--re_rank_phase2", type=int, default=0)
+
+    # integrity scan
+    p.add_argument("--integrity_scan_limit", type=int, default=0)  # 0=scan all (slow)
+
+    # dataset target filtering
+    p.add_argument("--min_instance_area", type=int, default=8)
+    p.add_argument("--min_box_hw", type=int, default=2)
+
+    # joint tuning
+    p.add_argument("--joint_tune_grid_n", type=int, default=13)
+    p.add_argument("--joint_tune_limit", type=int, default=600)
+    p.add_argument("--joint_tune_wdet", type=str, default="0.0,0.5,1.0,2.0")
+    p.add_argument("--joint_tune_wseg", type=str, default="0.0,0.5,1.0,2.0")
+    p.add_argument("--joint_tune_bias", type=str, default="-2,-1,0,1,2")
+    p.add_argument("--joint_tune_tau",  type=str, default="0.10,0.20,0.30,0.40,0.50,0.60")
+    p.add_argument("--score_thr_min", type=float, default=0.05)
+    p.add_argument("--score_thr_max", type=float, default=0.95)
+    p.add_argument("--mask_thr_min", type=float, default=0.20)
+    p.add_argument("--mask_thr_max", type=float, default=0.95)
+    p.add_argument("--val_eval_limit", type=int, default=600)
+    p.add_argument("--ptest_eval_limit", type=int, default=600)
+
+    # logging
+    p.add_argument("--log_every", type=int, default=50)
+
+    return p
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    ddp_setup(backend="nccl")
+    args = build_argparser().parse_args()
+
+    # pos:neg ratio override
+    pr = parse_ratio_to_pos_frac(args.pos_neg_ratio) if str(args.pos_neg_ratio).strip() != "" else None
+    if pr is not None:
+        args.pos_frac = float(pr)
+
+    # rank-aware seed
+    set_seed(seed_for_rank(args.seed))
+
+    # device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK','0'))}")
+    else:
+        device = torch.device("cpu")
+
+    # paths
+    data_dir = args.data_dir
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir  = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    if is_main_process():
+        assert os.path.isdir(train_img_dir), f"missing: {train_img_dir}"
+        assert os.path.isdir(test_img_dir),  f"missing: {test_img_dir}"
+        assert os.path.isfile(train_csv),    f"missing: {train_csv}"
+        assert os.path.isfile(sample_sub),   f"missing: {sample_sub}"
+    ddp_barrier()
+
+    # run dir (rank0 creates and broadcasts name)
+    if is_main_process():
+        run_name = (
+            f"run__maskrcnn_detfuse_ddp__seed{args.seed}"
+            f"__train{args.train_n}__val{args.val_n}__ptest{args.ptest_n}"
+            f"__pos{int(round(args.pos_frac*100))}"
+            f"__{int(time.time())}"
+        )
+        run_dir = os.path.join(args.out_dir, run_name)
+        ensure_dir(run_dir)
+    else:
+        run_dir = ""
+
+    if is_dist_avail_and_initialized():
+        if is_main_process():
+            b = run_dir.encode("utf-8")
+            n = torch.tensor([len(b)], device=device, dtype=torch.int32)
+        else:
+            n = torch.tensor([0], device=device, dtype=torch.int32)
+        dist.broadcast(n, src=0)
+        n_int = int(n.item())
+
+        if is_main_process():
+            buf = torch.from_numpy(np.frombuffer(run_dir.encode("utf-8"), dtype=np.uint8)).to(device)
+        else:
+            buf = torch.zeros((n_int,), device=device, dtype=torch.uint8)
+        dist.broadcast(buf, src=0)
+
+        if not is_main_process():
+            run_dir = bytes(buf.cpu().numpy().tolist()).decode("utf-8")
+
+    logger = RunLogger(run_dir)
+
+    # global meta logs (rank0)
+    if is_main_process():
+        logger.g(f"[run] run_dir={run_dir}")
+        logger.g(f"[run] data_dir={data_dir}")
+        logger.g(f"[run] world_size={get_world_size()} rank={get_rank()} device={device}")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                logger.g(f"[gpu] cuda:{i} name={torch.cuda.get_device_name(i)}")
+        logger.g(f"[args] {vars(args)}")
+    ddp_barrier()
+
+    # load mappings and ids
+    id2rles = load_id2rles(train_csv)
+    all_train_ids = list_image_ids(train_img_dir)
+    template_ids = read_template_ids(sample_sub)
+
+    pos_set = set(id2rles.keys())
+    pos_ids_all = [i for i in all_train_ids if i in pos_set]
+    neg_ids_all = [i for i in all_train_ids if i not in pos_set]
+
+    if is_main_process():
+        logger.g(f"[data] train_images={len(all_train_ids)} pos_ids(csv)={len(pos_ids_all)} neg_ids={len(neg_ids_all)} template_ids={len(template_ids)}")
+    ddp_barrier()
+
+    # integrity scan
+    integrity_train_json = os.path.join(run_dir, "integrity_train.json")
+    integrity_test_json  = os.path.join(run_dir, "integrity_test.json")
+    integ_train = integrity_scan_image_ids(train_img_dir, all_train_ids, logger, integrity_train_json, limit=int(args.integrity_scan_limit))
+    integ_test  = integrity_scan_image_ids(test_img_dir,  template_ids,  logger, integrity_test_json,  limit=int(args.integrity_scan_limit))
+    bad_train = set(integ_train.get("bad_ids", []))
+    bad_test  = set(integ_test.get("bad_ids", []))
+    _ = bad_test  # currently not used for training
+
+    # split (rank0 saves to splits.json)
+    splits_path = os.path.join(run_dir, "splits.json")
+    if is_main_process():
+        splits = sample_split_stratified_4way(
+            pos_ids_all, neg_ids_all,
+            args.train_n, args.val_n, args.ptest_n,
+            pos_frac=float(args.pos_frac),
+            val_tune_frac=float(args.val_tune_frac),
+            seed=int(args.seed)
+        )
+        save_json(splits_path, splits)
+        logger.g(
+            f"[split] train={len(splits['train'])} val_tune={len(splits['val_tune'])} "
+            f"val_es={len(splits['val_es'])} ptest={len(splits['ptest'])} (disjoint by construction)"
+        )
+    ddp_barrier()
+    splits = load_json(splits_path)
+
+    # build detector (each rank loads ckpt)
+    det_model = EffNetV2Binary(variant=args.det_variant, pretrained_backbone=int(args.det_pretrained_backbone)).to(device)
+    load_ckpt_flexible(det_model, args.detector_ckpt, device)
+    det_model.eval()
+    if is_main_process():
+        logger.g(f"[det] loaded ckpt={args.detector_ckpt} variant={args.det_variant} det_img_size={args.det_img_size}")
+    ddp_barrier()
+
+    # detector ranking & outputs (rank0 only)
+    det_rank_phase1_json = os.path.join(run_dir, "detector_probs_phase1_train_ranked.json")
+    det_rank_phase1_csv  = os.path.join(run_dir, "detector_probs_phase1_train_ranked.csv")
+    train_ids_phase1_json = os.path.join(run_dir, "train_ids_after_rank_phase1.json")
+    train_ids_phase1_csv  = os.path.join(run_dir, "detector_probs_train_used_phase1.csv")
+
+    if is_main_process():
+        scored1 = compute_detector_probs_rank0(
+            det_model, train_img_dir, splits["train"], int(args.det_img_size), device,
+            score_all_limit=int(args.rank_score_all_limit),
+            logger=logger
+        )
+        save_json(det_rank_phase1_json, [{"image_id": i, "det_prob": float(p)} for i, p in scored1])
+        write_csv_rows(det_rank_phase1_csv, ["ImageId", "det_prob"], [[i, f"{p:.10f}"] for i, p in scored1])
+
+        train_ids_phase1 = build_train_ids_from_rank(
+            splits["train"], scored1, args.train_n, args.phase1_top_frac, args.phase1_bottom_frac
+        )
+        save_json(train_ids_phase1_json, train_ids_phase1)
+
+        score_map1 = {i: p for i, p in scored1}
+        rows_used1 = [[i, f"{score_map1[i]:.10f}"] for i in train_ids_phase1 if i in score_map1]
+        write_csv_rows(train_ids_phase1_csv, ["ImageId", "det_prob"], rows_used1)
+
+        logger.g(f"[rank][phase1] scored_n={len(scored1)} train_ids={len(train_ids_phase1)} top_frac={args.phase1_top_frac} bottom_frac={args.phase1_bottom_frac}")
+        if len(scored1) > 0:
+            tops = ", ".join([f"{p:.3f}" for _i, p in scored1[:10]])
+            bots = ", ".join([f"{p:.3f}" for _i, p in scored1[-10:]])
+            logger.g(f"[rank][phase1] top10={tops}")
+            logger.g(f"[rank][phase1] bot10={bots}")
+    ddp_barrier()
+    train_ids_phase1 = load_json(train_ids_phase1_json)
+
+    det_rank_phase2_json = os.path.join(run_dir, "detector_probs_phase2_train_ranked.json")
+    det_rank_phase2_csv  = os.path.join(run_dir, "detector_probs_phase2_train_ranked.csv")
+    train_ids_phase2_json = os.path.join(run_dir, "train_ids_after_rank_phase2.json")
+    train_ids_phase2_csv  = os.path.join(run_dir, "detector_probs_train_used_phase2.csv")
+
+    if is_main_process():
+        if int(args.re_rank_phase2) == 1:
+            scored2 = compute_detector_probs_rank0(
+                det_model, train_img_dir, splits["train"], int(args.det_img_size), device,
+                score_all_limit=int(args.rank_score_all_limit),
+                logger=logger
+            )
+        else:
+            if os.path.isfile(det_rank_phase1_json):
+                tmp = load_json(det_rank_phase1_json)
+                scored2 = [(d["image_id"], float(d["det_prob"])) for d in tmp]
+                scored2.sort(key=lambda x: x[1], reverse=True)
+            else:
+                scored2 = compute_detector_probs_rank0(
+                    det_model, train_img_dir, splits["train"], int(args.det_img_size), device,
+                    score_all_limit=int(args.rank_score_all_limit),
+                    logger=logger
+                )
+
+        save_json(det_rank_phase2_json, [{"image_id": i, "det_prob": float(p)} for i, p in scored2])
+        write_csv_rows(det_rank_phase2_csv, ["ImageId", "det_prob"], [[i, f"{p:.10f}"] for i, p in scored2])
+
+        train_ids_phase2 = build_train_ids_from_rank(
+            splits["train"], scored2, args.train_n, args.phase2_top_frac, args.phase2_bottom_frac
+        )
+        save_json(train_ids_phase2_json, train_ids_phase2)
+
+        score_map2 = {i: p for i, p in scored2}
+        rows_used2 = [[i, f"{score_map2[i]:.10f}"] for i in train_ids_phase2 if i in score_map2]
+        write_csv_rows(train_ids_phase2_csv, ["ImageId", "det_prob"], rows_used2)
+
+        logger.g(f"[rank][phase2] re_rank={args.re_rank_phase2} scored_n={len(scored2)} train_ids={len(train_ids_phase2)} top_frac={args.phase2_top_frac} bottom_frac={args.phase2_bottom_frac}")
+    ddp_barrier()
+    train_ids_phase2 = load_json(train_ids_phase2_json)
+
+    # Build Mask R-CNN + DDP
+    model = build_maskrcnn(
+        num_classes=2,
+        pretrained_coco=int(args.maskrcnn_pretrained_coco),
+        pretrained_backbone=int(args.maskrcnn_pretrained_backbone),
+        trainable_backbone_layers=int(args.trainable_backbone_layers),
+        init_min_size=int(args.phase1_size),
+        init_max_size=int(args.phase1_size)
+    ).to(device)
+    model_ddp = ddp_wrap(model, device)
+
+    optimizer = optim.AdamW(
+        get_model_to_save(model_ddp).parameters(),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay)
+    )
+
+    # joint grids / config
+    joint_grids = {
+        "grid_n": int(args.joint_tune_grid_n),
+        "tune_limit": int(args.joint_tune_limit),
+        "w_det_grid": parse_csv_floats(args.joint_tune_wdet),
+        "w_seg_grid": parse_csv_floats(args.joint_tune_wseg),
+        "bias_grid":  parse_csv_floats(args.joint_tune_bias),
+        "tau_grid":   parse_csv_floats(args.joint_tune_tau),
+        "score_thr_min": float(args.score_thr_min),
+        "score_thr_max": float(args.score_thr_max),
+        "mask_thr_min":  float(args.mask_thr_min),
+        "mask_thr_max":  float(args.mask_thr_max),
+        "det_img_size": int(args.det_img_size),
+        "batch_train": int(args.batch_train),
+        "batch_eval": int(args.batch_eval),
+        "num_workers": int(args.num_workers),
+        "log_every": int(args.log_every),
+        "min_instance_area": int(args.min_instance_area),
+        "min_box_hw": int(args.min_box_hw),
+    }
+    eval_limits = {"val_eval_limit": int(args.val_eval_limit), "ptest_eval_limit": int(args.ptest_eval_limit)}
+
+    # Phase1 (fixed size)
+    if is_main_process():
+        logger.g("[phase1] start")
+    ddp_barrier()
+    phase1_info = run_phase(
+        phase_name="phase1",
+        model_ddp=model_ddp,
+        det_model=det_model,
+        optimizer=optimizer,
+        device=device,
+        train_img_dir=train_img_dir,
+        id2rles=id2rles,
+        train_ids=train_ids_phase1,
+        val_tune_ids=splits["val_tune"],
+        val_es_ids=splits["val_es"],
+        ptest_ids=splits["ptest"],
+        bad_ids_set=bad_train,
+        train_size_mode="fixed",
+        train_size=int(args.phase1_size),
+        multiscale_min_sizes=[],
+        multiscale_max_size=int(args.phase1_size),
+        max_epochs=int(args.phase1_max_epochs),
+        patience=int(args.phase1_patience),
+        joint_grids=joint_grids,
+        eval_limits=eval_limits,
+        run_dir=run_dir,
+        logger=logger,
+    )
+    ddp_barrier()
+
+    # load phase1 best for phase2 init (all ranks load same file)
+    ckpt_phase1_best = phase1_info.get("ckpt_best", os.path.join(run_dir, "phase1_best_model.pt"))
+    ddp_barrier()
+    if os.path.isfile(ckpt_phase1_best):
+        get_model_to_save(model_ddp).load_state_dict(torch.load(ckpt_phase1_best, map_location=device))
+    ddp_barrier()
+
+    # Adjust LR for phase2
+    for pg in optimizer.param_groups:
+        pg["lr"] = float(args.lr) * float(args.lr_phase2_scale)
+    if is_main_process():
+        logger.g(f"[phase2] set lr = lr * {args.lr_phase2_scale} -> {optimizer.param_groups[0]['lr']:.6g}")
+    ddp_barrier()
+
+    # Phase2 (fixed size)
+    if is_main_process():
+        logger.g("[phase2] start")
+    ddp_barrier()
+    phase2_info = run_phase(
+        phase_name="phase2",
+        model_ddp=model_ddp,
+        det_model=det_model,
+        optimizer=optimizer,
+        device=device,
+        train_img_dir=train_img_dir,
+        id2rles=id2rles,
+        train_ids=train_ids_phase2,
+        val_tune_ids=splits["val_tune"],
+        val_es_ids=splits["val_es"],
+        ptest_ids=splits["ptest"],
+        bad_ids_set=bad_train,
+        train_size_mode="fixed",
+        train_size=int(args.phase2_size),
+        multiscale_min_sizes=[],
+        multiscale_max_size=int(args.phase2_size),
+        max_epochs=int(args.phase2_max_epochs),
+        patience=int(args.phase2_patience),
+        joint_grids=joint_grids,
+        eval_limits=eval_limits,
+        run_dir=run_dir,
+        logger=logger,
+    )
+    ddp_barrier()
+
+    # Optional Phase3 (multi-scale train)
+    phase3_info = {}
+    if int(args.phase3_enable) == 1:
+        ckpt_phase2_best = phase2_info.get("ckpt_best", os.path.join(run_dir, "phase2_best_model.pt"))
+        ddp_barrier()
+        if os.path.isfile(ckpt_phase2_best):
+            get_model_to_save(model_ddp).load_state_dict(torch.load(ckpt_phase2_best, map_location=device))
+        ddp_barrier()
+
+        # LR for phase3
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(args.lr) * float(args.lr_phase3_scale)
+        if is_main_process():
+            logger.g(f"[phase3] set lr = lr * {args.lr_phase3_scale} -> {optimizer.param_groups[0]['lr']:.6g}")
+        ddp_barrier()
+
+        ms = [int(x) for x in parse_csv_floats(args.phase3_min_sizes)]
+        ms = [x for x in ms if x > 0]
+        if len(ms) == 0:
+            ms = [int(args.phase2_size)]
+
+        if is_main_process():
+            logger.g("[phase3] start (multiscale)")
+            logger.g(f"[phase3] min_sizes={ms} max_size={int(args.phase3_max_size)}")
+        ddp_barrier()
+
+        phase3_info = run_phase(
+            phase_name="phase3",
+            model_ddp=model_ddp,
+            det_model=det_model,
+            optimizer=optimizer,
+            device=device,
+            train_img_dir=train_img_dir,
+            id2rles=id2rles,
+            train_ids=train_ids_phase2,  # reuse phase2 selection by default
+            val_tune_ids=splits["val_tune"],
+            val_es_ids=splits["val_es"],
+            ptest_ids=splits["ptest"],
+            bad_ids_set=bad_train,
+            train_size_mode="multiscale",
+            train_size=int(args.phase2_size),
+            multiscale_min_sizes=ms,
+            multiscale_max_size=int(args.phase3_max_size),
+            max_epochs=int(args.phase3_max_epochs),
+            patience=int(args.phase3_patience),
+            joint_grids=joint_grids,
+            eval_limits=eval_limits,
+            run_dir=run_dir,
+            logger=logger,
+        )
+        ddp_barrier()
+
+    # detector probs for infer(test template all ids)
+    det_probs_infer_test_csv = os.path.join(run_dir, "detector_probs_infer_test.csv")
+    if is_main_process():
+        logger.g("[infer] compute detector probs for test template ids (submission order)")
+    ddp_barrier()
+    write_detector_probs_infer_test_rank0(
+        det_model=det_model,
+        test_img_dir=test_img_dir,
+        template_ids=template_ids,
+        det_img_size=int(args.det_img_size),
+        device=device,
+        out_csv=det_probs_infer_test_csv,
+        logger=logger
+    )
+    ddp_barrier()
+
+    # summary.json (rank0 only)
+    if is_main_process():
+        summary = {
+            "run_dir": run_dir,
+            "data_dir": data_dir,
+            "seed": int(args.seed),
+            "world_size": int(get_world_size()),
+            "ddp_backend": "nccl",
+            "splits": {
+                "train_n": int(len(splits.get("train", []))),
+                "val_tune_n": int(len(splits.get("val_tune", []))),
+                "val_es_n": int(len(splits.get("val_es", []))),
+                "ptest_n": int(len(splits.get("ptest", []))),
+                "pos_frac": float(args.pos_frac),
+                "pos_neg_ratio": str(args.pos_neg_ratio),
+                "val_tune_frac": float(args.val_tune_frac),
+            },
+            "phase1": phase1_info,
+            "phase2": phase2_info,
+            "phase3": phase3_info,
+            "best_joint": (
+                phase3_info.get("best_joint", {})
+                if int(args.phase3_enable) == 1
+                else phase2_info.get("best_joint", {})
+            ),
+            "logs": {
+                "global": os.path.join(run_dir, "log_global.txt"),
+                "detail": os.path.join(run_dir, "log_detail.txt"),
+            },
+            "detector_probs": {
+                "train_phase1_ranked_json": det_rank_phase1_json,
+                "train_phase1_ranked_csv": det_rank_phase1_csv,
+                "train_phase1_used_csv": train_ids_phase1_csv,
+                "train_phase2_ranked_json": det_rank_phase2_json,
+                "train_phase2_ranked_csv": det_rank_phase2_csv,
+                "train_phase2_used_csv": train_ids_phase2_csv,
+                "infer_test_csv": det_probs_infer_test_csv,
+            },
+            "artifacts": {
+                "splits_json": splits_path,
+                "integrity_train_json": integrity_train_json,
+                "integrity_test_json": integrity_test_json,
+                "phase1_best_model": phase1_info.get("ckpt_best", ""),
+                "phase1_last_model": phase1_info.get("ckpt_last", ""),
+                "phase2_best_model": phase2_info.get("ckpt_best", ""),
+                "phase2_last_model": phase2_info.get("ckpt_last", ""),
+                "phase3_best_model": phase3_info.get("ckpt_best", ""),
+                "phase3_last_model": phase3_info.get("ckpt_last", ""),
+            }
+        }
+        save_json(os.path.join(run_dir, "summary.json"), summary)
+        logger.g("[done] summary.json saved")
+        logger.g(f"[done] phase1_best={summary['artifacts']['phase1_best_model']}")
+        logger.g(f"[done] phase2_best={summary['artifacts']['phase2_best_model']}")
+        if int(args.phase3_enable) == 1:
+            logger.g(f"[done] phase3_best={summary['artifacts']['phase3_best_model']}")
+        logger.g(f"[done] detector_probs_infer_test={det_probs_infer_test_csv}")
+
+    ddp_barrier()
+    logger.close()
+    ddp_cleanup()
+
+
+if __name__ == "__main__":
+    main()
