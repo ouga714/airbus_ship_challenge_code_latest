@@ -1,0 +1,1266 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_airbus_detector_two_phase.py
+
+Airbus Ship Detection — image-level detector (ship-present vs ship-absent)
+Two-phase training that matches your requirements:
+
+[Phase-1]
+- Train at fixed 768 only (train/val both fixed)
+- Oversample POS exposure to target POS:NEG = 4:6 (target_pos_frac=0.40) via WeightedRandomSampler
+- Use F2-maximizing threshold selection on VAL (always at 768)
+- Save best_model.pt and last_model.pt (plus logs/config/splits/metrics)
+
+[Phase-2]
+- Strictly reuse EXACT SAME split (splits_json from Phase-1)
+- Initialize from Phase-1 checkpoint (init_ckpt)
+- Train-time only multi-scale training (scale jitter ms_min..ms_max), but VAL remains fixed 768
+- POS transform uses bbox-guided crop that GUARANTEES "ship is included" (explicit tuning)
+- Keep same POS exposure control (target_pos_frac=0.40) for fair comparison
+- Threshold selection on VAL remains F2-based, same as Phase-1
+
+Environment:
+- Recommended: export CUDA_VISIBLE_DEVICES=2 (then device is just "cuda")
+- Works on single GPU without DDP
+
+Expected dataset layout (data_dir):
+  data_dir/
+    train_v2/
+    train_ship_segmentations_v2.csv
+
+Outputs per run_dir:
+  - global.log / detail.log
+  - config.json
+  - splits.json (Phase-1) or copied metadata (Phase-2)
+  - metrics_val_best.json
+  - best_model.pt / last_model.pt
+  - val_probs_best.npz (y_prob/y_true at best epoch)
+  - bbox_cache.json (optional cache for bbox_map/pos_set)
+
+Notes:
+- We purposely avoid any "random crop that can cut ships out" for POS in Phase-2.
+- If bbox info missing (rare), POS falls back to non-crop pipeline to avoid breaking labels.
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import hashlib
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+import torchvision
+from torchvision import transforms
+
+try:
+    from PIL import Image
+except Exception:
+    print("PIL(Pillow) is required.", file=sys.stderr)
+    raise
+
+# optional sklearn metrics
+_HAS_SKLEARN = False
+try:
+    from sklearn.metrics import roc_auc_score
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
+
+
+# ============================================================
+# Logging
+# ============================================================
+class DualLogger:
+    """
+    global.log: epoch-level summary
+    detail.log: iteration-level details and warnings
+    """
+    def __init__(self, run_dir: str, also_stdout: bool = True):
+        os.makedirs(run_dir, exist_ok=True)
+        self.global_path = os.path.join(run_dir, "global.log")
+        self.detail_path = os.path.join(run_dir, "detail.log")
+        self.also_stdout = also_stdout
+        self.fg = open(self.global_path, "w", encoding="utf-8")
+        self.fd = open(self.detail_path, "w", encoding="utf-8")
+
+    def _ts(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def g(self, msg: str):
+        line = f"{self._ts()} {msg}"
+        self.fg.write(line + "\n")
+        self.fg.flush()
+        if self.also_stdout:
+            print(line, flush=True)
+
+    def d(self, msg: str):
+        line = f"{self._ts()} {msg}"
+        self.fd.write(line + "\n")
+        self.fd.flush()
+        if self.also_stdout:
+            print(line, flush=True)
+
+    def close(self):
+        try:
+            self.fg.close()
+        except Exception:
+            pass
+        try:
+            self.fd.close()
+        except Exception:
+            pass
+
+
+def safe_mkdir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # reproducibility > speed
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def sha1_of_file_head(path: str, nbytes: int = 1024 * 1024) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()
+
+
+def sha1_of_text_head(path: str, nbytes: int = 1024 * 1024) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()
+
+
+# ============================================================
+# Airbus RLE -> bbox (no full mask decoding)
+# Airbus RLE is column-major (Fortran order), 1-indexed
+# ============================================================
+def rle_to_bbox_768(rle: str, H: int = 768, W: int = 768) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Convert a single RLE string into bbox (xmin, ymin, xmax, ymax) in pixel indices [0..W-1],[0..H-1]
+    without full mask decoding.
+    """
+    if rle is None:
+        return None
+    s = str(rle).strip()
+    if s == "" or s.lower() == "nan":
+        return None
+    parts = s.split()
+    if len(parts) < 2 or (len(parts) % 2 != 0):
+        return None
+
+    xmin, ymin = W - 1, H - 1
+    xmax, ymax = 0, 0
+    any_pixel = False
+
+    for i in range(0, len(parts), 2):
+        try:
+            start = int(parts[i]) - 1
+            length = int(parts[i + 1])
+        except Exception:
+            continue
+        if length <= 0:
+            continue
+
+        row = start % H
+        col = start // H
+
+        remaining = length
+        while remaining > 0 and col < W:
+            take = min(remaining, H - row)
+            if take > 0:
+                any_pixel = True
+                y0 = row
+                y1 = row + take - 1
+                x0 = col
+                x1 = col
+                if x0 < xmin: xmin = x0
+                if x1 > xmax: xmax = x1
+                if y0 < ymin: ymin = y0
+                if y1 > ymax: ymax = y1
+            remaining -= take
+            col += 1
+            row = 0
+
+    if not any_pixel:
+        return None
+    return (xmin, ymin, xmax, ymax)
+
+
+def union_bbox(b1: Optional[Tuple[int, int, int, int]],
+               b2: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
+    if b1 is None:
+        return b2
+    if b2 is None:
+        return b1
+    x0 = min(b1[0], b2[0])
+    y0 = min(b1[1], b2[1])
+    x1 = max(b1[2], b2[2])
+    y1 = max(b1[3], b2[3])
+    return (x0, y0, x1, y1)
+
+
+def list_train_ids(train_img_dir: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png")
+    ids = [fn for fn in os.listdir(train_img_dir) if fn.lower().endswith(exts)]
+    ids.sort()
+    if not ids:
+        raise RuntimeError(f"No images in: {train_img_dir}")
+    return ids
+
+
+def stratified_split(ids: List[str], pos_set: set, val_ratio: float, seed: int) -> Dict[str, List[str]]:
+    rng = np.random.default_rng(seed)
+    pos_ids = [i for i in ids if i in pos_set]
+    neg_ids = [i for i in ids if i not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    n_pos = len(pos_ids)
+    n_neg = len(neg_ids)
+    n_pos_val = int(round(n_pos * val_ratio))
+    n_neg_val = int(round(n_neg * val_ratio))
+
+    val = pos_ids[:n_pos_val] + neg_ids[:n_neg_val]
+    train = pos_ids[n_pos_val:] + neg_ids[n_neg_val:]
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return {"train": train, "val": val}
+
+
+def load_pos_set_and_bbox_map_with_cache(
+    csv_path: str,
+    cache_path: str,
+    build_bbox: bool,
+    log: Optional[DualLogger] = None,
+    H: int = 768,
+    W: int = 768,
+) -> Tuple[set, Dict[str, Tuple[int, int, int, int]]]:
+    """
+    Read train_ship_segmentations_v2.csv and return:
+      - pos_set: images with at least one non-empty RLE row
+      - bbox_map: union bbox per image (only if build_bbox=True)
+
+    To avoid re-parsing overhead, uses cache if valid:
+      cache includes csv_sha1_head to detect mismatch.
+    """
+    csv_sha1 = sha1_of_text_head(csv_path)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if obj.get("csv_sha1_head") == csv_sha1 and obj.get("H") == H and obj.get("W") == W:
+                pos_list = obj.get("pos_list", [])
+                pos_set = set(pos_list)
+                bbox_map = obj.get("bbox_map", {}) if build_bbox else {}
+                # ensure tuples
+                bbox_map2: Dict[str, Tuple[int, int, int, int]] = {}
+                if build_bbox:
+                    for k, v in bbox_map.items():
+                        if isinstance(v, list) and len(v) == 4:
+                            bbox_map2[k] = (int(v[0]), int(v[1]), int(v[2]), int(v[3]))
+                if log:
+                    log.d(f"[CACHE] loaded pos/bbox cache: {cache_path} pos={len(pos_set)} bbox={len(bbox_map2)}")
+                return pos_set, bbox_map2
+        except Exception as e:
+            if log:
+                log.d(f"[CACHE] failed to load cache (ignore): {cache_path} err={repr(e)}")
+
+    pos = set()
+    bbox_map: Dict[str, Tuple[int, int, int, int]] = {}
+
+    with open(csv_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in r.fieldnames or "EncodedPixels" not in r.fieldnames:
+            raise RuntimeError(f"Unexpected CSV header: {r.fieldnames}")
+        for row in r:
+            img_id = row["ImageId"]
+            enc = row["EncodedPixels"]
+            if enc is None:
+                continue
+            enc = str(enc).strip()
+            if enc == "" or enc.lower() == "nan":
+                continue
+            pos.add(img_id)
+            if build_bbox:
+                b = rle_to_bbox_768(enc, H=H, W=W)
+                if b is not None:
+                    bbox_map[img_id] = union_bbox(bbox_map.get(img_id), b)
+
+    bbox_map = {k: v for k, v in bbox_map.items() if v is not None}
+    # write cache
+    try:
+        obj = {
+            "csv_sha1_head": csv_sha1,
+            "H": H,
+            "W": W,
+            "pos_list": sorted(list(pos)),
+            "bbox_map": {k: [int(v[0]), int(v[1]), int(v[2]), int(v[3])] for k, v in bbox_map.items()},
+        }
+        safe_mkdir(os.path.dirname(cache_path))
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        if log:
+            log.d(f"[CACHE] wrote pos/bbox cache: {cache_path} pos={len(pos)} bbox={len(bbox_map)}")
+    except Exception as e:
+        if log:
+            log.d(f"[CACHE] failed to write cache (ignore): {cache_path} err={repr(e)}")
+
+    return pos, bbox_map
+
+
+# ============================================================
+# Transforms
+# ============================================================
+_IMNET_MEAN = (0.485, 0.456, 0.406)
+_IMNET_STD  = (0.229, 0.224, 0.225)
+
+
+class AddGaussianNoise:
+    def __init__(self, sigma_min: float = 0.0, sigma_max: float = 0.02, p: float = 0.3):
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        self.p = float(p)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return x
+        sigma = random.uniform(self.sigma_min, self.sigma_max)
+        noise = torch.randn_like(x) * sigma
+        return torch.clamp(x + noise, 0.0, 1.0)
+
+
+def build_tfm_fixed768(train: bool, strong: bool, img_size: int = 768):
+    """
+    Fixed-size transform for Phase-1 (train/val both at 768).
+    strong=True: POS augmentation (still moderate; avoid destroying ship evidence).
+    """
+    if not train:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+
+    if strong:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.25),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.18, contrast=0.18, saturation=0.10, hue=0.02),
+            transforms.ToTensor(),
+            AddGaussianNoise(0.0, 0.025, p=0.30),
+            transforms.RandomErasing(p=0.08, scale=(0.01, 0.04), ratio=(0.5, 2.0), value="random"),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.35),
+            transforms.RandomVerticalFlip(p=0.10),
+            transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.05, hue=0.01),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+
+
+def clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(v)))
+
+
+def make_square_crop_containing_bbox(
+    bbox: Tuple[int, int, int, int],
+    H: int,
+    W: int,
+    side: int,
+    jitter: int = 0,
+) -> Tuple[int, int, int, int]:
+    """
+    Build a square crop (left, top, right, bottom) inclusive that MUST contain bbox.
+    side: crop side length in pixels.
+    jitter: allow random shift of crop window while still containing bbox (<= jitter pixels).
+    """
+    x0, y0, x1, y1 = bbox
+    bw = x1 - x0 + 1
+    bh = y1 - y0 + 1
+    side = max(int(side), max(bw, bh), 32)
+
+    # feasible range for left/top such that bbox is contained:
+    # left <= x0 and left + side - 1 >= x1  => left in [x1 - side + 1, x0]
+    left_min = x1 - side + 1
+    left_max = x0
+    top_min = y1 - side + 1
+    top_max = y0
+
+    # clamp to image
+    left_min = clamp_int(left_min, 0, W - side)
+    left_max = clamp_int(left_max, 0, W - side)
+    top_min  = clamp_int(top_min,  0, H - side)
+    top_max  = clamp_int(top_max,  0, H - side)
+
+    if left_min > left_max:
+        left_min, left_max = left_max, left_min
+    if top_min > top_max:
+        top_min, top_max = top_max, top_min
+
+    if jitter > 0:
+        # expand selection range a bit (still must be valid)
+        left_min2 = max(0, left_min - jitter)
+        left_max2 = min(W - side, left_max + jitter)
+        top_min2  = max(0, top_min - jitter)
+        top_max2  = min(H - side, top_max + jitter)
+        left_min, left_max = left_min2, left_max2
+        top_min, top_max   = top_min2, top_max2
+
+    left = random.randint(left_min, left_max) if left_min <= left_max else left_min
+    top  = random.randint(top_min, top_max) if top_min <= top_max else top_min
+    right = left + side - 1
+    bottom = top + side - 1
+    return (left, top, right, bottom)
+
+
+def pad_to_square(img: Image.Image, fill: Tuple[int, int, int] = (0, 0, 0)) -> Image.Image:
+    w, h = img.size
+    if w == h:
+        return img
+    side = max(w, h)
+    new_img = Image.new("RGB", (side, side), fill)
+    left = (side - w) // 2
+    top = (side - h) // 2
+    new_img.paste(img, (left, top))
+    return new_img
+
+
+@dataclass
+class MultiScaleParams:
+    ms_min: int
+    ms_max: int
+    bbox_margin_min: float
+    bbox_margin_max: float
+    pos_bbox_crop_prob: float
+
+
+class Phase2PosBBoxCropThenResize:
+    """
+    Phase-2 POS transform: explicit ship-preserving bbox-guided crop + multi-scale jitter.
+    Guarantees: crop contains union bbox (ship included).
+    """
+    def __init__(self, img_size: int, ms: MultiScaleParams):
+        self.img_size = int(img_size)
+        self.ms = ms
+
+    def __call__(self, img: Image.Image, bbox: Tuple[int, int, int, int]) -> torch.Tensor:
+        # original Airbus images are 768x768, but be robust:
+        img = pad_to_square(img)
+        W, H = img.size  # PIL: (W,H)
+        if H != W:
+            # after pad_to_square, should be square
+            side0 = max(H, W)
+            img = img.resize((side0, side0), resample=Image.BILINEAR)
+            W, H = img.size
+
+        # choose a "virtual" scale target for crop side computation
+        # ms_min..ms_max are interpreted as target side lengths in pixels (on original scale)
+        tgt = random.randint(int(self.ms.ms_min), int(self.ms.ms_max))
+        # bbox side
+        x0, y0, x1, y1 = bbox
+        bw = x1 - x0 + 1
+        bh = y1 - y0 + 1
+        bside = max(bw, bh)
+
+        # margin: enlarge crop relative to bbox
+        m = random.uniform(float(self.ms.bbox_margin_min), float(self.ms.bbox_margin_max))
+        # side is at least bbox*m but also allowed to follow tgt (bounded)
+        side = int(max(bside * m, 32))
+        # constrain by tgt to realize multi-scale behavior
+        # if tgt < side, keep side (must contain bbox), else allow increasing up to tgt
+        side = min(max(side, 32), max(tgt, side))
+        side = min(side, W)  # cannot exceed image
+
+        crop = make_square_crop_containing_bbox(bbox, H=H, W=W, side=side, jitter=16)
+        left, top, right, bottom = crop
+        img2 = img.crop((left, top, right + 1, bottom + 1))
+
+        # moderate appearance aug on cropped ship-centered view
+        tfm = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.25),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.18, contrast=0.18, saturation=0.10, hue=0.02),
+            transforms.ToTensor(),
+            AddGaussianNoise(0.0, 0.025, p=0.30),
+            transforms.RandomErasing(p=0.08, scale=(0.01, 0.04), ratio=(0.5, 2.0), value="random"),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+        return tfm(img2)
+
+
+class Phase2NegMultiScaleNoShipCut:
+    """
+    Phase-2 NEG transform: multi-scale jitter without random crop that could mimic ship-preserving constraints.
+    We jitter scale by resizing to [ms_min..ms_max], then pad/crop to square, then resize to final 768.
+    """
+    def __init__(self, img_size: int, ms_min: int, ms_max: int):
+        self.img_size = int(img_size)
+        self.ms_min = int(ms_min)
+        self.ms_max = int(ms_max)
+
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        img = pad_to_square(img)
+        side = random.randint(self.ms_min, self.ms_max)
+        img2 = img.resize((side, side), resample=Image.BILINEAR)
+        # optional mild aug (avoid too strong)
+        tfm = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.35),
+            transforms.RandomVerticalFlip(p=0.10),
+            transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.05, hue=0.01),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMNET_MEAN, std=_IMNET_STD),
+        ])
+        return tfm(img2)
+
+
+# ============================================================
+# Dataset
+# ============================================================
+class AirbusDetectorDataset(Dataset):
+    """
+    Phase-1: fixed transforms.
+    Phase-2: POS uses bbox-guided ship-preserving crop transform.
+    """
+    def __init__(
+        self,
+        img_dir: str,
+        image_ids: List[str],
+        pos_set: set,
+        train: bool,
+        tfm_pos_fixed,
+        tfm_neg_fixed,
+        tfm_val_fixed,
+        phase: int,
+        bbox_map: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
+        ms_params: Optional[MultiScaleParams] = None,
+        img_size: int = 768,
+    ):
+        self.img_dir = img_dir
+        self.ids = image_ids
+        self.pos_set = pos_set
+        self.train = bool(train)
+        self.tfm_pos_fixed = tfm_pos_fixed
+        self.tfm_neg_fixed = tfm_neg_fixed
+        self.tfm_val_fixed = tfm_val_fixed
+        self.phase = int(phase)
+        self.bbox_map = bbox_map or {}
+        self.ms_params = ms_params
+        self.img_size = int(img_size)
+
+        if self.phase == 2 and self.train:
+            assert self.ms_params is not None, "Phase-2 train requires ms_params"
+            self.tfm_pos_ms = Phase2PosBBoxCropThenResize(self.img_size, self.ms_params)
+            self.tfm_neg_ms = Phase2NegMultiScaleNoShipCut(self.img_size, self.ms_params.ms_min, self.ms_params.ms_max)
+        else:
+            self.tfm_pos_ms = None
+            self.tfm_neg_ms = None
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = Image.open(path).convert("RGB")
+
+        is_pos = (img_id in self.pos_set)
+        y = torch.tensor([1.0 if is_pos else 0.0], dtype=torch.float32)
+
+        if not self.train:
+            x = self.tfm_val_fixed(img)  # VAL always fixed 768
+            return x, y, img_id
+
+        # train
+        if self.phase == 1:
+            if is_pos:
+                x = self.tfm_pos_fixed(img)
+            else:
+                x = self.tfm_neg_fixed(img)
+            return x, y, img_id
+
+        # phase == 2
+        if is_pos:
+            use_bbox_crop = (random.random() < float(self.ms_params.pos_bbox_crop_prob))
+            if use_bbox_crop and (img_id in self.bbox_map):
+                bbox = self.bbox_map[img_id]
+                x = self.tfm_pos_ms(img, bbox=bbox)
+            else:
+                # fallback: fixed POS transform (still safe)
+                x = self.tfm_pos_fixed(img)
+        else:
+            x = self.tfm_neg_ms(img)
+
+        return x, y, img_id
+
+
+# ============================================================
+# Model
+# ============================================================
+def build_model(model_name: str, pretrained: bool, log: Optional[DualLogger]) -> nn.Module:
+    model_name = model_name.strip().lower()
+
+    def _log(msg: str):
+        if log:
+            log.d(msg)
+        else:
+            print(msg, flush=True)
+
+    weights = None
+    if pretrained:
+        try:
+            if model_name == "efficientnet_v2_s":
+                weights = torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
+            elif model_name == "efficientnet_v2_m":
+                weights = torchvision.models.EfficientNet_V2_M_Weights.IMAGENET1K_V1
+            elif model_name == "efficientnet_v2_l":
+                weights = torchvision.models.EfficientNet_V2_L_Weights.IMAGENET1K_V1
+            else:
+                raise ValueError(f"Unsupported model: {model_name}")
+        except Exception:
+            weights = None
+
+    try:
+        if model_name == "efficientnet_v2_s":
+            m = torchvision.models.efficientnet_v2_s(weights=weights)
+        elif model_name == "efficientnet_v2_m":
+            m = torchvision.models.efficientnet_v2_m(weights=weights)
+        elif model_name == "efficientnet_v2_l":
+            m = torchvision.models.efficientnet_v2_l(weights=weights)
+        else:
+            raise ValueError(f"Unsupported model: {model_name}")
+        _log(f"[MODEL] built {model_name} pretrained={pretrained} weights={'OK' if weights is not None else 'None'}")
+    except Exception as e:
+        _log(f"[WARN] failed to load pretrained weights: {repr(e)}")
+        _log("[WARN] fallback to random init (pretrained=False)")
+        if model_name == "efficientnet_v2_s":
+            m = torchvision.models.efficientnet_v2_s(weights=None)
+        elif model_name == "efficientnet_v2_m":
+            m = torchvision.models.efficientnet_v2_m(weights=None)
+        elif model_name == "efficientnet_v2_l":
+            m = torchvision.models.efficientnet_v2_l(weights=None)
+        else:
+            raise ValueError(f"Unsupported model: {model_name}")
+
+    # binary logit
+    in_features = m.classifier[-1].in_features
+    m.classifier[-1] = nn.Linear(in_features, 1)
+    return m
+
+
+# ============================================================
+# Metrics / Threshold selection (F2)
+# ============================================================
+@torch.no_grad()
+def predict_probs(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    probs = []
+    gts = []
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logit = model(x)
+        prob = torch.sigmoid(logit).detach().cpu().numpy().reshape(-1)
+        gt = y.detach().cpu().numpy().reshape(-1)
+        probs.append(prob)
+        gts.append(gt)
+    p = np.concatenate(probs, axis=0).astype(np.float32)
+    t = np.concatenate(gts, axis=0).astype(np.float32)
+    return p, t
+
+
+def compute_metrics_at_thr(y_prob: np.ndarray, y_true: np.ndarray, thr: float) -> Dict[str, float]:
+    eps = 1e-12
+    y_pred = (y_prob >= float(thr)).astype(np.int32)
+    y_true_i = y_true.astype(np.int32)
+
+    tp = float(((y_pred == 1) & (y_true_i == 1)).sum())
+    fp = float(((y_pred == 1) & (y_true_i == 0)).sum())
+    fn = float(((y_pred == 0) & (y_true_i == 1)).sum())
+    tn = float(((y_pred == 0) & (y_true_i == 0)).sum())
+
+    precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 1.0
+    recall = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+    f1 = (2.0 * precision * recall) / (precision + recall + eps) if (precision + recall) > 0 else 0.0
+
+    beta = 2.0
+    f2 = (1 + beta**2) * precision * recall / ((beta**2) * precision + recall + eps) if ((beta**2) * precision + recall) > 0 else 0.0
+
+    acc = (tp + tn) / max(1.0, len(y_true))
+
+    out = {
+        "thr": float(thr),
+        "acc": float(acc),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "f2": float(f2),
+        "tp": float(tp),
+        "fp": float(fp),
+        "fn": float(fn),
+        "tn": float(tn),
+        "n": float(len(y_true)),
+        "pos_rate": float(y_true.mean()) if len(y_true) > 0 else 0.0,
+    }
+    if _HAS_SKLEARN:
+        try:
+            if (y_true.max() > 0.0) and (y_true.min() < 1.0):
+                out["auroc"] = float(roc_auc_score(y_true, y_prob))
+            else:
+                out["auroc"] = float("nan")
+        except Exception:
+            out["auroc"] = float("nan")
+    else:
+        out["auroc"] = float("nan")
+    return out
+
+
+def select_threshold_by_f2_grid(y_prob: np.ndarray, y_true: np.ndarray, thr_grid_n: int) -> Tuple[float, Dict[str, float]]:
+    """
+    Choose threshold maximizing F2 on VAL.
+    Grid on [0,1]. (thr_grid_n=101 -> step 0.01)
+    """
+    thr_grid_n = int(thr_grid_n)
+    thr_grid_n = max(11, min(2001, thr_grid_n))
+    best = None
+    best_thr = 0.5
+    for i in range(thr_grid_n):
+        thr = float(i) / float(thr_grid_n - 1)
+        m = compute_metrics_at_thr(y_prob, y_true, thr)
+        if best is None or m["f2"] > best["f2"] + 1e-12:
+            best = m
+            best_thr = thr
+    assert best is not None
+    return float(best_thr), best
+
+
+# ============================================================
+# Training loop
+# ============================================================
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    criterion,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    epoch: int,
+    log: DualLogger,
+    log_every: int,
+    grad_clip: float,
+) -> Dict[str, float]:
+    model.train()
+    loss_sum = 0.0
+    n = 0
+    t0 = time.time()
+
+    for it, (x, y, _) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logit = model(x)
+        loss = criterion(logit, y)
+        loss.backward()
+
+        if grad_clip and float(grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        bs = int(y.shape[0])
+        loss_sum += float(loss.item()) * bs
+        n += bs
+
+        if log_every > 0 and (it % log_every) == 0:
+            lr_now = optimizer.param_groups[0]["lr"]
+            log.d(f"[TRAIN] epoch={epoch} iter={it}/{len(loader)} loss={loss.item():.6f} lr={lr_now:.6e}")
+
+    dt = time.time() - t0
+    return {"train_loss": float(loss_sum / max(1, n)), "train_n": float(n), "sec": float(dt)}
+
+
+def build_weighted_sampler(train_ids: List[str], pos_set: set, target_pos_frac: float, log: DualLogger) -> Tuple[Optional[WeightedRandomSampler], bool]:
+    labels = np.array([1 if i in pos_set else 0 for i in train_ids], dtype=np.int64)
+    n_pos = int(labels.sum())
+    n_neg = int(len(labels) - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        log.d("[WARN] sampler disabled due to single-class train split.")
+        return None, True
+
+    target_pos = float(target_pos_frac)
+    target_pos = max(1e-6, min(1.0 - 1e-6, target_pos))
+    target_neg = 1.0 - target_pos
+
+    w_pos = target_pos / max(1, n_pos)
+    w_neg = target_neg / max(1, n_neg)
+    weights = np.where(labels == 1, w_pos, w_neg).astype(np.float64)
+
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(weights),
+        num_samples=len(train_ids),
+        replacement=True
+    )
+    log.g(f"[SAMPLER] enabled: n_pos={n_pos} n_neg={n_neg} target_pos_frac={target_pos:.3f} w_pos={w_pos:.6e} w_neg={w_neg:.6e}")
+    return sampler, False
+
+
+# ============================================================
+# Main
+# ============================================================
+def build_argparser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", type=int, required=True, choices=[1, 2], help="1 or 2")
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+
+    # model
+    ap.add_argument("--model", type=str, default="efficientnet_v2_s")
+    ap.add_argument("--img_size", type=int, default=768)
+    ap.add_argument("--pretrained", type=int, default=1)
+
+    # split
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val_ratio", type=float, default=0.15)
+    ap.add_argument("--splits_json", type=str, default="", help="Phase-2 must point to Phase-1 splits.json")
+
+    # phase-2 init
+    ap.add_argument("--init_ckpt", type=str, default="", help="Phase-2 must point to Phase-1 best_model.pt")
+
+    # training
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--grad_clip", type=float, default=0.0)
+    ap.add_argument("--early_stop_patience", type=int, default=5)
+
+    # sampler for 4:6 exposure
+    ap.add_argument("--use_weighted_sampler", type=int, default=1)
+    ap.add_argument("--target_pos_frac", type=float, default=0.40)
+
+    # threshold tuning
+    ap.add_argument("--thr_grid_n", type=int, default=101)
+
+    # scheduler
+    ap.add_argument("--cosine_eta_min_ratio", type=float, default=0.05)
+    ap.add_argument("--warmup_steps", type=int, default=0)
+
+    # multi-scale (Phase-2 train only)
+    ap.add_argument("--ms_min", type=int, default=672)
+    ap.add_argument("--ms_max", type=int, default=832)
+    ap.add_argument("--pos_bbox_crop_prob", type=float, default=1.0, help="Phase-2 POS bbox-guided crop prob (1.0 recommended)")
+    ap.add_argument("--bbox_margin_min", type=float, default=1.8)
+    ap.add_argument("--bbox_margin_max", type=float, default=4.0)
+
+    # logs
+    ap.add_argument("--log_every", type=int, default=50)
+
+    return ap
+
+
+def main():
+    args = build_argparser().parse_args()
+
+    # Sanity checks for requirements
+    if args.img_size != 768:
+        raise ValueError("This script is specialized for img_size=768 as per your requirement.")
+    if not (0.0 <= args.val_ratio < 0.5):
+        raise ValueError("--val_ratio must be in [0,0.5)")
+    if not (0.0 < args.target_pos_frac < 1.0):
+        raise ValueError("--target_pos_frac must be in (0,1)")
+    if args.phase == 2:
+        if args.init_ckpt.strip() == "":
+            raise ValueError("Phase-2 requires --init_ckpt (Phase-1 best_model.pt)")
+        if args.splits_json.strip() == "":
+            raise ValueError("Phase-2 requires --splits_json (Phase-1 splits.json)")
+    if args.phase == 1 and args.splits_json.strip() != "":
+        # not forbidden, but irrelevant
+        pass
+
+    seed_everything(int(args.seed))
+
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    train_csv = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+    if not os.path.exists(train_img_dir):
+        raise RuntimeError(f"train_v2 not found: {train_img_dir}")
+    if not os.path.exists(train_csv):
+        raise RuntimeError(f"train_ship_segmentations_v2.csv not found: {train_csv}")
+
+    # Run dir naming (timestamp included to avoid collisions)
+    ts = int(time.time())
+    if args.phase == 1:
+        run_name = (
+            f"run__P1__detector__{args.model}__img{args.img_size}"
+            f"__seed{args.seed}__valr{args.val_ratio:.2f}__tpos{args.target_pos_frac:.2f}__ts{ts}"
+        )
+    else:
+        run_name = (
+            f"run__P2__detector__{args.model}__img{args.img_size}"
+            f"__seed{args.seed}__valr{args.val_ratio:.2f}__tpos{args.target_pos_frac:.2f}"
+            f"__ms{args.ms_min}-{args.ms_max}__bboxp{args.pos_bbox_crop_prob:.2f}__ts{ts}"
+        )
+
+    run_dir = os.path.join(args.out_dir, run_name)
+    safe_mkdir(run_dir)
+    log = DualLogger(run_dir, also_stdout=True)
+
+    log.g("==== START: Airbus Detector Two-Phase Training ====")
+    log.g(f"phase={args.phase}")
+    log.g(f"run_dir={run_dir}")
+    log.g(f"data_dir={args.data_dir}")
+    log.g(f"train_img_dir={train_img_dir}")
+    log.g(f"train_csv={train_csv}")
+    log.g(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','(not set)')}")
+    log.g(f"sklearn_available={_HAS_SKLEARN}")
+
+    # device (use CUDA_VISIBLE_DEVICES to force cuda2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.g(f"device={device}")
+
+    # bbox/pos cache path (in run_dir to keep it self-contained)
+    cache_path = os.path.join(run_dir, "bbox_cache.json")
+    build_bbox = (args.phase == 2)  # bbox needed only in phase-2 train for ship-preserving crop
+    pos_set, bbox_map = load_pos_set_and_bbox_map_with_cache(train_csv, cache_path, build_bbox=build_bbox, log=log)
+
+    all_ids = list_train_ids(train_img_dir)
+
+    log.g(f"ALL images={len(all_ids)} POS={len(pos_set)} POS_rate={len(pos_set)/len(all_ids):.6f}")
+    if args.phase == 2:
+        log.g(f"bbox_map size={len(bbox_map)} (POS with bbox parsed)")
+
+    # splits
+    if args.phase == 1:
+        splits = stratified_split(all_ids, pos_set, val_ratio=float(args.val_ratio), seed=int(args.seed))
+        train_ids = splits["train"]
+        val_ids = splits["val"]
+
+        splits_obj = {
+            "seed": int(args.seed),
+            "val_ratio": float(args.val_ratio),
+            "train_n": len(train_ids),
+            "val_n": len(val_ids),
+            "train_ids": train_ids,
+            "val_ids": val_ids,
+        }
+        with open(os.path.join(run_dir, "splits.json"), "w", encoding="utf-8") as f:
+            json.dump(splits_obj, f, indent=2, ensure_ascii=False)
+        log.g(f"[SPLIT] Phase-1 created split: train={len(train_ids)} val={len(val_ids)}")
+    else:
+        # Phase-2: MUST reuse Phase-1 split exactly
+        with open(args.splits_json, "r", encoding="utf-8") as f:
+            splits_obj = json.load(f)
+        train_ids = splits_obj["train_ids"]
+        val_ids = splits_obj["val_ids"]
+        # Save a copy for traceability
+        with open(os.path.join(run_dir, "splits.json"), "w", encoding="utf-8") as f:
+            json.dump(splits_obj, f, indent=2, ensure_ascii=False)
+        log.g(f"[SPLIT] Phase-2 reused split from: {args.splits_json}")
+        log.g(f"[SPLIT] train={len(train_ids)} val={len(val_ids)} (MUST match Phase-1)")
+
+    # config save
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+
+    # transforms (VAL always fixed 768)
+    tfm_pos_fixed = build_tfm_fixed768(train=True, strong=True, img_size=args.img_size)
+    tfm_neg_fixed = build_tfm_fixed768(train=True, strong=False, img_size=args.img_size)
+    tfm_val_fixed = build_tfm_fixed768(train=False, strong=False, img_size=args.img_size)
+
+    ms_params = None
+    if args.phase == 2:
+        if args.ms_min <= 0 or args.ms_max <= 0 or args.ms_max < args.ms_min:
+            raise ValueError("Invalid ms_min/ms_max")
+        if not (0.0 <= args.pos_bbox_crop_prob <= 1.0):
+            raise ValueError("pos_bbox_crop_prob must be in [0,1]")
+        if args.bbox_margin_min <= 1.0 or args.bbox_margin_max <= 1.0 or args.bbox_margin_max < args.bbox_margin_min:
+            raise ValueError("Invalid bbox_margin range")
+        ms_params = MultiScaleParams(
+            ms_min=int(args.ms_min),
+            ms_max=int(args.ms_max),
+            bbox_margin_min=float(args.bbox_margin_min),
+            bbox_margin_max=float(args.bbox_margin_max),
+            pos_bbox_crop_prob=float(args.pos_bbox_crop_prob),
+        )
+
+    ds_train = AirbusDetectorDataset(
+        img_dir=train_img_dir,
+        image_ids=train_ids,
+        pos_set=pos_set,
+        train=True,
+        tfm_pos_fixed=tfm_pos_fixed,
+        tfm_neg_fixed=tfm_neg_fixed,
+        tfm_val_fixed=tfm_val_fixed,
+        phase=int(args.phase),
+        bbox_map=bbox_map if args.phase == 2 else None,
+        ms_params=ms_params,
+        img_size=args.img_size,
+    )
+    ds_val = AirbusDetectorDataset(
+        img_dir=train_img_dir,
+        image_ids=val_ids,
+        pos_set=pos_set,
+        train=False,
+        tfm_pos_fixed=tfm_pos_fixed,
+        tfm_neg_fixed=tfm_neg_fixed,
+        tfm_val_fixed=tfm_val_fixed,
+        phase=int(args.phase),
+        bbox_map=None,
+        ms_params=None,
+        img_size=args.img_size,
+    )
+
+    # sampler to enforce exposure ratio 4:6 (target_pos_frac=0.40)
+    sampler = None
+    shuffle = True
+    if int(args.use_weighted_sampler) == 1:
+        sampler, shuffle = build_weighted_sampler(train_ids, pos_set, float(args.target_pos_frac), log)
+    else:
+        labels = np.array([1 if i in pos_set else 0 for i in train_ids], dtype=np.int64)
+        log.g(f"[SAMPLER] disabled: train_pos_rate={labels.mean():.6f}")
+
+    num_workers = int(args.num_workers)
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=int(args.batch),
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=(num_workers > 0),
+    )
+    dl_val = DataLoader(
+        ds_val,
+        batch_size=max(1, int(args.batch)),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+    )
+
+    # model
+    model = build_model(args.model, pretrained=(int(args.pretrained) == 1), log=log).to(device)
+
+    # Phase-2: load init checkpoint strictly
+    if args.phase == 2:
+        if not os.path.exists(args.init_ckpt):
+            raise RuntimeError(f"init_ckpt not found: {args.init_ckpt}")
+        ckpt = torch.load(args.init_ckpt, map_location="cpu")
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        log.g(f"[INIT] loaded init_ckpt={args.init_ckpt}")
+        log.d(f"[INIT] missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+        # you can enforce strict=True if you prefer:
+        # model.load_state_dict(state, strict=True)
+
+    # loss (plain BCEWithLogitsLoss; class exposure is controlled by sampler)
+    bce = nn.BCEWithLogitsLoss()
+
+    def criterion(logit, y):
+        return bce(logit, y)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    # scheduler: cosine per-iteration
+    total_steps = max(1, int(args.epochs) * max(1, len(dl_train)))
+    eta_min = float(args.lr) * float(args.cosine_eta_min_ratio)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
+    warmup_steps = int(args.warmup_steps)
+    global_step = 0
+
+    def warmup_adjust_lr(step: int):
+        if warmup_steps <= 0:
+            return
+        if step <= warmup_steps:
+            scale = float(step) / float(max(1, warmup_steps))
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(args.lr) * scale
+
+    log.g(f"[SCHED] cosine T_max={total_steps} eta_min={eta_min:.6e} warmup_steps={warmup_steps}")
+    log.g(f"[THR] select by F2 on VAL grid_n={int(args.thr_grid_n)} (VAL always fixed 768)")
+
+    # early stopping on best F2
+    best_score = -1.0
+    best_epoch = -1
+    best_thr = 0.5
+    best_val_metrics = {}
+    no_improve = 0
+
+    for epoch in range(1, int(args.epochs) + 1):
+        # train
+        if warmup_steps > 0:
+            model.train()
+            loss_sum = 0.0
+            n = 0
+            t0 = time.time()
+            for it, (x, y, _) in enumerate(dl_train, start=1):
+                global_step += 1
+                warmup_adjust_lr(global_step)
+
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                logit = model(x)
+                loss = criterion(logit, y)
+                loss.backward()
+
+                if args.grad_clip and float(args.grad_clip) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+
+                optimizer.step()
+                cosine.step()
+
+                bs = int(y.shape[0])
+                loss_sum += float(loss.item()) * bs
+                n += bs
+
+                if int(args.log_every) > 0 and (it % int(args.log_every) == 0):
+                    lr_now = optimizer.param_groups[0]["lr"]
+                    log.d(f"[TRAIN] epoch={epoch} iter={it}/{len(dl_train)} loss={loss.item():.6f} lr={lr_now:.6e}")
+
+            tr = {"train_loss": float(loss_sum / max(1, n)), "train_n": float(n), "sec": float(time.time() - t0)}
+        else:
+            tr = train_one_epoch(
+                model=model,
+                loader=dl_train,
+                device=device,
+                optimizer=optimizer,
+                criterion=criterion,
+                scheduler=cosine,
+                epoch=epoch,
+                log=log,
+                log_every=int(args.log_every),
+                grad_clip=float(args.grad_clip),
+            )
+            global_step += len(dl_train)
+
+        # val
+        y_prob, y_true = predict_probs(model, dl_val, device=device)
+        thr, pack = select_threshold_by_f2_grid(y_prob, y_true, thr_grid_n=int(args.thr_grid_n))
+        val_metrics = dict(pack)
+
+        score = float(val_metrics["f2"])  # early-stop target
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        log.g(
+            f"[EPOCH] {epoch}/{int(args.epochs)} "
+            f"train_loss={tr['train_loss']:.6f} sec={tr['sec']:.1f} lr={lr_now:.6e} "
+            f"VAL: thr={thr:.3f} "
+            f"acc={val_metrics['acc']:.5f} "
+            f"p={val_metrics['precision']:.5f} r={val_metrics['recall']:.5f} "
+            f"f1={val_metrics['f1']:.5f} f2={val_metrics['f2']:.5f} "
+            f"auroc={val_metrics['auroc']:.5f}"
+        )
+
+        # save last
+        last_path = os.path.join(run_dir, "last_model.pt")
+        torch.save({
+            "epoch": epoch,
+            "global_step": global_step,
+            "model": model.state_dict(),
+            "config": vars(args),
+            "val_thr": float(thr),
+            "val_metrics": val_metrics,
+        }, last_path)
+
+        # update best
+        if score > best_score + 1e-12:
+            best_score = float(score)
+            best_epoch = int(epoch)
+            best_thr = float(thr)
+            best_val_metrics = dict(val_metrics)
+            no_improve = 0
+
+            best_path = os.path.join(run_dir, "best_model.pt")
+            torch.save({
+                "epoch": epoch,
+                "global_step": global_step,
+                "model": model.state_dict(),
+                "config": vars(args),
+                "best_thr": float(best_thr),
+                "val_metrics": best_val_metrics,
+            }, best_path)
+
+            # keep best val probs for auditing
+            np.savez_compressed(os.path.join(run_dir, "val_probs_best.npz"), y_prob=y_prob, y_true=y_true)
+
+            log.g(f"[BEST] epoch={best_epoch} best_f2={best_score:.6f} best_thr={best_thr:.3f} saved={best_path}")
+        else:
+            no_improve += 1
+            log.g(f"[EARLYSTOP] no_improve={no_improve}/{int(args.early_stop_patience)}")
+
+        if int(args.early_stop_patience) > 0 and no_improve >= int(args.early_stop_patience):
+            log.g("[EARLYSTOP] triggered. stop training.")
+            break
+
+    # write summary
+    best_model_path = os.path.join(run_dir, "best_model.pt")
+    head_sha1 = sha1_of_file_head(best_model_path) if os.path.exists(best_model_path) else "NA"
+    out_json = os.path.join(run_dir, "metrics_val_best.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({
+            "phase": int(args.phase),
+            "run_dir": run_dir,
+            "best_epoch": best_epoch,
+            "best_f2": best_score,
+            "best_thr": best_thr,
+            "best_val_metrics": best_val_metrics,
+            "best_model_path": best_model_path,
+            "best_model_sha1_head_1mb": head_sha1,
+            "splits_json": os.path.join(run_dir, "splits.json"),
+            "init_ckpt": args.init_ckpt if args.phase == 2 else "",
+            "notes": {
+                "val_is_fixed_768": True,
+                "phase2_train_is_multiscale": (args.phase == 2),
+                "phase2_pos_crop_guarantees_ship_included": (args.phase == 2),
+                "pos_exposure_control_target_pos_frac": float(args.target_pos_frac),
+            }
+        }, f, indent=2, ensure_ascii=False)
+
+    log.g("==== DONE ====")
+    log.g(f"run_dir={run_dir}")
+    log.g(f"best_epoch={best_epoch} best_f2={best_score:.6f} best_thr={best_thr:.3f}")
+    log.g(f"best_model.pt sha1(first1MB)={head_sha1}")
+    log.g(f"metrics_val_best.json={out_json}")
+    log.close()
+
+
+if __name__ == "__main__":
+    main()
