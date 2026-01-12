@@ -1,0 +1,1415 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+infer_fusion_tree_3way_strictcache_nopandas.py
+
+Airbus Ship Detection — 3-way fusion + tree stacking (HGBDT)
+Improvements over infer_fusion_tree_3way_nopandas.py:
+
+(1) STRICT compatibility filter for checkpoints (auto_select_models chooses only compatible ckpts)
+    - Prevents "loaded but actually random layers" due to strict=False with many missing/unexpected keys.
+    - compat_strict=1 (default): only accept ckpts with missing=0 and unexpected=0 after module-prefix stripping.
+
+(2) Calibration acceleration: cache candidate masks + tree-proba once for calib images,
+    then threshold scan uses cache (NO re-inference 41x).
+    - Fixes "no logs for days" and makes experiments faster.
+
+(3) Progress logs added for calibration / ptest / test inference.
+
+Constraints:
+- FP32 only (no AMP)
+- NO pandas (csv module)
+Requires: scikit-learn, torch, torchvision, PIL, numpy
+Optional: opencv-python and/or scipy for connected components
+
+Outputs (run_dir):
+- log_global.txt
+- splits.json
+- tree_model.pkl
+- meta.json
+- submission_tree.csv (variable rows; duplicates ImageId allowed; shipless => exactly one empty row)
+
+Example:
+CUDA_VISIBLE_DEVICES=1 python3 infer_fusion_tree_3way_strictcache_nopandas.py \
+  --data_dir /home/ougaishibashi/kaggle_competition/dataset/airbus_ship_detection \
+  --zoo_dir  /home/ougaishibashi/kaggle_competition/model_zoo_airbus/best_model_pt \
+  --run_dir  /home/ougaishibashi/kaggle_competition/runs_fusion/tree_run_002 \
+  --n_images 10000 --pos_frac 0.40 --seed 42 --infer_size 768 --tta_hflip 1
+"""
+
+import os
+import re
+import csv
+import json
+import time
+import math
+import glob
+import pickle
+import random
+import hashlib
+import argparse
+from typing import List, Dict, Tuple, Optional, Any
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms.functional as TF
+
+try:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+except Exception:
+    HistGradientBoostingClassifier = None  # type: ignore
+
+_HAS_CV2 = False
+_HAS_SCIPY = False
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+try:
+    from scipy import ndimage  # type: ignore
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
+# -------------------------
+# Utilities
+# -------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+
+def log(msg: str, fp) -> None:
+    t = time.strftime("%H:%M:%S", time.localtime())
+    fp.write(f"[{t}] {msg}\n")
+    fp.flush()
+
+
+def sha1_first1mb(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        data = f.read(1024 * 1024)
+    h.update(data)
+    return h.hexdigest()
+
+
+def list_images_in_dir(img_dir: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in glob.glob(os.path.join(img_dir, "*.jpg")):
+        out[os.path.basename(p)] = p
+    return out
+
+
+def pil_open_rgb(path: str) -> Image.Image:
+    img = Image.open(path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
+
+
+def to_tensor_imagenet_norm(pil_img: Image.Image) -> torch.Tensor:
+    x = TF.to_tensor(pil_img)
+    x = TF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+    return x
+
+
+def to_tensor_01(pil_img: Image.Image) -> torch.Tensor:
+    return TF.to_tensor(pil_img)
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -50, 50)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if not any(k.startswith("module.") for k in state_dict.keys()):
+        return state_dict
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            out[k[len("module."):]] = v
+        else:
+            out[k] = v
+    return out
+
+
+def extract_state_dict(obj: Any) -> Tuple[Optional[Dict[str, torch.Tensor]], str]:
+    """
+    Accept:
+      - raw state_dict (dict[str, Tensor])
+      - dict with "state_dict"
+    Return (state_dict or None, message)
+    """
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        sd = obj["state_dict"]
+        return sd, "wrapped[state_dict]"
+    if isinstance(obj, dict):
+        # Heuristic: if values look like tensors
+        any_tensor = any(isinstance(v, torch.Tensor) for v in obj.values())
+        if any_tensor:
+            return obj, "raw[dict]"
+        return None, "dict_without_tensors"
+    return None, f"unsupported_obj:{type(obj)}"
+
+
+def load_state_dict_with_report(model: nn.Module, ckpt_path: str, strict: bool = False) -> Tuple[bool, str, int, int]:
+    """
+    Load checkpoint into model. Returns:
+      ok, msg, missing_count, unexpected_count
+    """
+    try:
+        obj = torch.load(ckpt_path, map_location="cpu")
+        sd, kind = extract_state_dict(obj)
+        if sd is None:
+            return False, f"load failed: {os.path.basename(ckpt_path)} | {kind}", 999999, 999999
+        sd = strip_module_prefix(sd)
+        missing, unexpected = model.load_state_dict(sd, strict=strict)
+        mc = len(missing)
+        uc = len(unexpected)
+        msg = f"loaded({kind}): {os.path.basename(ckpt_path)} | missing={mc} unexpected={uc}"
+        return True, msg, mc, uc
+    except Exception as e:
+        return False, f"load failed: {os.path.basename(ckpt_path)} | {repr(e)}", 999999, 999999
+
+
+# -------------------------
+# Airbus RLE
+# -------------------------
+def rle_decode_airbus(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Decode Airbus RLE (column-major) into mask HxW uint8
+    shape: (H, W)
+    """
+    h, w = shape
+    mask = np.zeros(h * w, dtype=np.uint8)
+    if rle is None:
+        return mask.reshape((w, h)).T
+    if isinstance(rle, str):
+        rle = rle.strip()
+    else:
+        rle = str(rle).strip()
+    if rle == "" or rle.lower() == "nan":
+        return mask.reshape((w, h)).T
+
+    s = rle.split()
+    if len(s) < 2:
+        return mask.reshape((w, h)).T
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    for st, en in zip(starts, ends):
+        if st < 0:
+            st = 0
+        if en > mask.size:
+            en = mask.size
+        mask[st:en] = 1
+
+    return mask.reshape((w, h)).T
+
+
+def rle_encode_airbus(mask: np.ndarray) -> str:
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    pixels = mask.T.flatten()  # column-major
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    if len(runs) == 0:
+        return ""
+    return " ".join(str(x) for x in runs)
+
+
+# -------------------------
+# Connected components
+# -------------------------
+def connected_components(mask_bin: np.ndarray) -> Tuple[int, np.ndarray]:
+    if mask_bin.dtype != np.uint8:
+        mask_u8 = mask_bin.astype(np.uint8)
+    else:
+        mask_u8 = mask_bin
+
+    if _HAS_CV2:
+        num, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+        return int(num), labels.astype(np.int32)
+    if _HAS_SCIPY:
+        labels, num = ndimage.label(mask_u8)
+        return int(num + 1), labels.astype(np.int32)
+
+    # naive fallback (slow)
+    h, w = mask_u8.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    cur = 0
+    for y in range(h):
+        for x in range(w):
+            if mask_u8[y, x] == 1 and labels[y, x] == 0:
+                cur += 1
+                stack = [(y, x)]
+                labels[y, x] = cur
+                while stack:
+                    cy, cx = stack.pop()
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            if dy == 0 and dx == 0:
+                                continue
+                            ny, nx = cy + dy, cx + dx
+                            if 0 <= ny < h and 0 <= nx < w:
+                                if mask_u8[ny, nx] == 1 and labels[ny, nx] == 0:
+                                    labels[ny, nx] = cur
+                                    stack.append((ny, nx))
+    return int(cur + 1), labels
+
+
+def mean_over_mask(arr: np.ndarray, mask: np.ndarray) -> float:
+    s = int(mask.sum())
+    if s <= 0:
+        return 0.0
+    return float(arr[mask].mean())
+
+
+def p90_over_mask(arr: np.ndarray, mask: np.ndarray) -> float:
+    s = int(mask.sum())
+    if s <= 0:
+        return 0.0
+    return float(np.percentile(arr[mask], 90))
+
+
+def bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return 0, 0, 0, 0
+    x0 = int(xs.min()); x1 = int(xs.max()) + 1
+    y0 = int(ys.min()); y1 = int(ys.max()) + 1
+    return x0, y0, x1, y1
+
+
+def iou_mask(a: np.ndarray, b: np.ndarray) -> float:
+    inter = np.logical_and(a, b).sum()
+    if inter <= 0:
+        return 0.0
+    uni = np.logical_or(a, b).sum()
+    if uni <= 0:
+        return 0.0
+    return float(inter / uni)
+
+
+def gate_level(p_det: float, t_low: float, t_high: float) -> int:
+    if p_det < t_low:
+        return 0
+    if p_det < t_high:
+        return 1
+    return 2
+
+
+def choose_by_gate(level: int, low: float, mid: float, high: float) -> float:
+    return low if level == 0 else (mid if level == 1 else high)
+
+
+def choose_int_by_gate(level: int, low: int, mid: int, high: int) -> int:
+    return low if level == 0 else (mid if level == 1 else high)
+
+
+# -------------------------
+# Mask packing for cache
+# -------------------------
+def pack_bool_mask(mask: np.ndarray) -> bytes:
+    """
+    mask: bool HxW
+    returns: packed bytes of flattened mask
+    """
+    flat = mask.reshape(-1).astype(np.uint8)
+    packed = np.packbits(flat, bitorder="little")
+    return packed.tobytes()
+
+
+def unpack_bool_mask(packed: bytes, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    packed: bytes from pack_bool_mask
+    returns: bool HxW
+    """
+    h, w = shape
+    n = h * w
+    arr = np.frombuffer(packed, dtype=np.uint8)
+    bits = np.unpackbits(arr, bitorder="little")[:n]
+    return bits.reshape((h, w)).astype(bool)
+
+
+# -------------------------
+# Models (torchvision)
+# -------------------------
+def build_detector(arch: str) -> nn.Module:
+    arch = arch.lower().strip()
+    if arch == "efficientnet_v2_s":
+        m = torchvision.models.efficientnet_v2_s(weights=None)
+        in_f = m.classifier[-1].in_features
+        m.classifier[-1] = nn.Linear(in_f, 1)
+        return m
+    if arch == "efficientnet_v2_m":
+        m = torchvision.models.efficientnet_v2_m(weights=None)
+        in_f = m.classifier[-1].in_features
+        m.classifier[-1] = nn.Linear(in_f, 1)
+        return m
+    raise ValueError(f"Unsupported detector_arch: {arch}")
+
+
+def build_semseg(arch: str) -> nn.Module:
+    arch = arch.lower().strip()
+    if arch == "deeplabv3_resnet50":
+        return torchvision.models.segmentation.deeplabv3_resnet50(
+            weights=None, weights_backbone=None, num_classes=1, aux_loss=False
+        )
+    if arch == "deeplabv3_resnet101":
+        return torchvision.models.segmentation.deeplabv3_resnet101(
+            weights=None, weights_backbone=None, num_classes=1, aux_loss=False
+        )
+    raise ValueError(f"Unsupported sem_arch: {arch}")
+
+
+def build_instseg(arch: str) -> nn.Module:
+    arch = arch.lower().strip()
+    if arch == "maskrcnn_resnet50_fpn":
+        return torchvision.models.detection.maskrcnn_resnet50_fpn(
+            weights=None, weights_backbone=None, num_classes=2
+        )
+    raise ValueError(f"Unsupported inst_arch: {arch}")
+
+
+def auto_select_models(zoo_dir: str, kind: str) -> List[str]:
+    all_pt = sorted(glob.glob(os.path.join(zoo_dir, "*.pt")))
+    if kind == "det":
+        keys = ["detector", "detfuse", "cls"]
+    elif kind == "sem":
+        keys = ["deeplab", "seg", "semantic", "tversky", "iou"]
+    elif kind == "inst":
+        keys = ["maskrcnn", "mask_r_cnn", "inst"]
+    else:
+        raise ValueError(kind)
+    out: List[str] = []
+    for p in all_pt:
+        n = os.path.basename(p).lower()
+        if any(k in n for k in keys):
+            out.append(p)
+    return out
+
+
+def filter_compatible_checkpoints(
+    ckpt_paths: List[str],
+    builder_fn,
+    device: torch.device,
+    strict_compat: bool,
+    fp,
+    max_models: int,
+    tag: str,
+) -> Tuple[List[str], List[Tuple[str, int, int]]]:
+    """
+    Try loading each checkpoint into a freshly built model.
+    Keep only compatible ones:
+      - if strict_compat=True: keep only missing=0 and unexpected=0
+      - else: keep all that load succeeds, but log missing/unexpected
+    Returns:
+      kept_paths, reports (path, missing, unexpected) for all attempted
+    """
+    kept: List[str] = []
+    reports: List[Tuple[str, int, int]] = []
+
+    for p in ckpt_paths:
+        m = builder_fn()
+        ok, msg, mc, uc = load_state_dict_with_report(m, p, strict=False)
+        reports.append((p, mc, uc))
+        if not ok:
+            log(f"[{tag}] REJECT(load_fail) {msg}", fp)
+            continue
+
+        if strict_compat:
+            if mc == 0 and uc == 0:
+                kept.append(p)
+                log(f"[{tag}] ACCEPT(strict) {msg} sha1_1mb={sha1_first1mb(p)}", fp)
+            else:
+                log(f"[{tag}] REJECT(strict) {msg} sha1_1mb={sha1_first1mb(p)}", fp)
+        else:
+            kept.append(p)
+            log(f"[{tag}] ACCEPT(loose) {msg} sha1_1mb={sha1_first1mb(p)}", fp)
+
+        if len(kept) >= max_models:
+            break
+
+    return kept, reports
+
+
+@torch.no_grad()
+def infer_detector_ensemble(models: List[nn.Module], x: torch.Tensor, tta_hflip: bool, tta_vflip: bool) -> float:
+    probs: List[float] = []
+    for m in models:
+        m.eval()
+        z = m(x).view(-1)
+        probs.append(float(torch.sigmoid(z).item()))
+        if tta_hflip:
+            x2 = torch.flip(x, dims=[3])
+            z2 = m(x2).view(-1)
+            probs.append(float(torch.sigmoid(z2).item()))
+        if tta_vflip:
+            x3 = torch.flip(x, dims=[2])
+            z3 = m(x3).view(-1)
+            probs.append(float(torch.sigmoid(z3).item()))
+    return float(np.mean(probs)) if probs else 0.0
+
+
+@torch.no_grad()
+def infer_semseg_ensemble(models: List[nn.Module], x: torch.Tensor, tta_hflip: bool, tta_vflip: bool) -> np.ndarray:
+    logits: List[np.ndarray] = []
+    for m in models:
+        m.eval()
+        out = m(x)["out"][0, 0].detach().cpu().numpy()
+        logits.append(out)
+
+        if tta_hflip:
+            x2 = torch.flip(x, dims=[3])
+            out2 = m(x2)["out"][0, 0].detach().cpu().numpy()
+            logits.append(np.flip(out2, axis=1))
+
+        if tta_vflip:
+            x3 = torch.flip(x, dims=[2])
+            out3 = m(x3)["out"][0, 0].detach().cpu().numpy()
+            logits.append(np.flip(out3, axis=0))
+
+    if not logits:
+        h, w = int(x.shape[2]), int(x.shape[3])
+        return np.zeros((h, w), dtype=np.float32)
+
+    z = np.mean(np.stack(logits, 0), 0)
+    return sigmoid_np(z).astype(np.float32)
+
+
+@torch.no_grad()
+def infer_instseg_ensemble(
+    models: List[nn.Module],
+    img01: torch.Tensor,   # (3,H,W) [0,1]
+    score_thr: float,
+    mask_thr: float,
+    min_area: int,
+    tta_hflip: bool,
+    tta_vflip: bool,
+) -> List[Dict]:
+    cands: List[Dict] = []
+
+    def run_one(m: nn.Module, img: torch.Tensor, tag: str) -> None:
+        m.eval()
+        out = m([img])[0]
+        scores = out.get("scores", torch.zeros((0,), device=img.device)).detach().cpu().numpy()
+        masks  = out.get("masks", torch.zeros((0, 1, img.shape[1], img.shape[2]), device=img.device)).detach().cpu().numpy()
+
+        for i in range(int(scores.shape[0])):
+            sc = float(scores[i])
+            if sc < score_thr:
+                continue
+            pm = masks[i, 0]
+            mb = (pm >= mask_thr)
+            if int(mb.sum()) < min_area:
+                continue
+            cands.append({"mask": mb.astype(bool), "score": sc, "src": tag})
+
+    for mi, m in enumerate(models):
+        run_one(m, img01, f"inst_m{mi}_base")
+
+        if tta_hflip:
+            img2 = torch.flip(img01, dims=[2])  # flip W
+            before = len(cands)
+            run_one(m, img2, f"inst_m{mi}_hflip")
+            for j in range(before, len(cands)):
+                cands[j]["mask"] = np.flip(cands[j]["mask"], axis=1)
+
+        if tta_vflip:
+            img3 = torch.flip(img01, dims=[1])  # flip H
+            before = len(cands)
+            run_one(m, img3, f"inst_m{mi}_vflip")
+            for j in range(before, len(cands)):
+                cands[j]["mask"] = np.flip(cands[j]["mask"], axis=0)
+
+    return cands
+
+
+def build_sem_cc_candidates(P_sem: np.ndarray, sem_thr: float, cc_min_area: int, topk: int, score_scale: float) -> List[Dict]:
+    sem_bin = (P_sem >= sem_thr).astype(np.uint8)
+    _, labels = connected_components(sem_bin)
+
+    comp: List[Tuple[float, np.ndarray]] = []
+    max_lab = int(labels.max())
+    for lab in range(1, max_lab + 1):
+        m = (labels == lab)
+        a = int(m.sum())
+        if a < cc_min_area:
+            continue
+        sc = mean_over_mask(P_sem, m)
+        comp.append((sc, m.astype(bool)))
+
+    comp.sort(key=lambda x: x[0], reverse=True)
+    comp = comp[:topk]
+
+    out: List[Dict] = []
+    for sc, m in comp:
+        out.append({"mask": m, "score": float(sc) * score_scale, "src": f"semcc_thr{sem_thr:.3f}"})
+    return out
+
+
+def extract_features_for_candidate(
+    mask: np.ndarray,
+    inst_score: float,
+    p_det: float,
+    lvl: int,
+    P_sem: np.ndarray,
+) -> np.ndarray:
+    area = int(mask.sum())
+    x0, y0, x1, y1 = bbox_from_mask(mask)
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+    aspect = float(bw / bh)
+    solidity = float(area / (bw * bh))
+
+    sup_mean = mean_over_mask(P_sem, mask)
+    sup_p90 = p90_over_mask(P_sem, mask)
+
+    sem_area_ratio = float((P_sem >= 0.5).mean())
+
+    feats = np.array([
+        float(p_det),
+        float(lvl),
+        float(inst_score),
+        float(area),
+        float(bw),
+        float(bh),
+        float(aspect),
+        float(solidity),
+        float(sup_mean),
+        float(sup_p90),
+        float(sem_area_ratio),
+    ], dtype=np.float32)
+    return feats
+
+
+def greedy_match_f2(
+    pred_masks: List[np.ndarray],
+    pred_scores: List[float],
+    gt_masks: List[np.ndarray],
+    score_thr: float,
+    iou_thr: float,
+    beta: float,
+) -> Tuple[float, Dict]:
+    idxs = [i for i, s in enumerate(pred_scores) if s >= score_thr]
+    idxs.sort(key=lambda i: pred_scores[i], reverse=True)
+
+    used_gt = set()
+    tp = 0
+    fp = 0
+
+    for i in idxs:
+        pm = pred_masks[i]
+        best_j = -1
+        best_iou = 0.0
+        for j, gm in enumerate(gt_masks):
+            if j in used_gt:
+                continue
+            v = iou_mask(pm, gm)
+            if v > best_iou:
+                best_iou = v
+                best_j = j
+        if best_j >= 0 and best_iou >= iou_thr:
+            tp += 1
+            used_gt.add(best_j)
+        else:
+            fp += 1
+
+    fn = len(gt_masks) - len(used_gt)
+
+    prec = tp / (tp + fp + 1e-9)
+    rec  = tp / (tp + fn + 1e-9)
+    b2 = beta * beta
+    f2 = (1 + b2) * prec * rec / (b2 * prec + rec + 1e-9)
+
+    info = {"tp": tp, "fp": fp, "fn": fn, "precision": prec, "recall": rec}
+    return float(f2), info
+
+
+def enforce_non_overlap(cands: List[Tuple[float, np.ndarray]], min_area: int, max_inst: int) -> List[np.ndarray]:
+    final: List[np.ndarray] = []
+    if not cands:
+        return final
+
+    H, W = cands[0][1].shape
+    occ = np.zeros((H, W), dtype=bool)
+
+    for sc, m in cands:
+        if len(final) >= max_inst:
+            break
+        mm = m & (~occ)
+        if int(mm.sum()) < min_area:
+            continue
+        occ |= mm
+        final.append(mm)
+    return final
+
+
+# -------------------------
+# CSV reading (NO pandas)
+# -------------------------
+def read_sample_submission_order(sample_csv_path: str) -> List[str]:
+    order: List[str] = []
+    with open(sample_csv_path, "r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in (r.fieldnames or []):
+            raise ValueError(f"sample_submission missing ImageId header: {sample_csv_path}")
+        for row in r:
+            img_id = (row.get("ImageId") or "").strip()
+            if img_id:
+                order.append(img_id)
+    return order
+
+
+def build_id2rles(train_csv_path: str) -> Dict[str, List[str]]:
+    id2r: Dict[str, List[str]] = {}
+    with open(train_csv_path, "r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        if "ImageId" not in (r.fieldnames or []) or "EncodedPixels" not in (r.fieldnames or []):
+            raise ValueError(f"train_csv headers invalid (need ImageId,EncodedPixels): {train_csv_path}")
+        for row in r:
+            img_id = (row.get("ImageId") or "").strip()
+            enc = row.get("EncodedPixels")
+            enc = (enc or "").strip()
+            if img_id not in id2r:
+                id2r[img_id] = []
+            if enc != "":
+                id2r[img_id].append(enc)
+    return id2r
+
+
+# -------------------------
+# Sampling / splitting
+# -------------------------
+def stratified_sample_ids(all_ids: List[str], pos_ids: List[str], n: int, pos_frac: float, seed: int) -> List[str]:
+    rnd = random.Random(seed)
+    pos_set = set(pos_ids)
+    neg_ids = [i for i in all_ids if i not in pos_set]
+
+    n_pos = int(round(n * pos_frac))
+    n_neg = n - n_pos
+    n_pos = min(n_pos, len(pos_ids))
+    n_neg = min(n_neg, len(neg_ids))
+
+    samp_pos = rnd.sample(pos_ids, n_pos) if n_pos > 0 else []
+    samp_neg = rnd.sample(neg_ids, n_neg) if n_neg > 0 else []
+    out = samp_pos + samp_neg
+    rnd.shuffle(out)
+    return out
+
+
+def split_ids(ids: List[str], r_train: float, r_calib: float, r_ptest: float, seed: int) -> Dict[str, List[str]]:
+    assert abs((r_train + r_calib + r_ptest) - 1.0) < 1e-6
+    rnd = random.Random(seed)
+    ids2 = ids[:]
+    rnd.shuffle(ids2)
+    n = len(ids2)
+    n_train = int(round(n * r_train))
+    n_calib = int(round(n * r_calib))
+    n_train = min(n_train, n)
+    n_calib = min(n_calib, n - n_train)
+    n_ptest = n - n_train - n_calib
+    return {
+        "train": ids2[:n_train],
+        "calib": ids2[n_train:n_train + n_calib],
+        "ptest": ids2[n_train + n_calib:],
+    }
+
+
+# -------------------------
+# Argparse
+# -------------------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--zoo_dir", type=str, required=True)
+    ap.add_argument("--run_dir", type=str, required=True)
+
+    ap.add_argument("--train_csv", type=str, default="")
+    ap.add_argument("--sample_csv", type=str, default="")
+    ap.add_argument("--train_dir", type=str, default="")
+    ap.add_argument("--test_dir", type=str, default="")
+
+    ap.add_argument("--detector_arch", type=str, default="efficientnet_v2_s")
+    ap.add_argument("--sem_arch", type=str, default="deeplabv3_resnet50")
+    ap.add_argument("--inst_arch", type=str, default="maskrcnn_resnet50_fpn")
+
+    ap.add_argument("--det_models", type=str, default="")
+    ap.add_argument("--sem_models", type=str, default="")
+    ap.add_argument("--inst_models", type=str, default="")
+
+    # Compatibility filter
+    ap.add_argument("--compat_strict", type=int, default=1, help="1: keep only ckpts with missing=0 & unexpected=0")
+    ap.add_argument("--max_det_models", type=int, default=3)
+    ap.add_argument("--max_sem_models", type=int, default=8)
+    ap.add_argument("--max_inst_models", type=int, default=3)
+
+    # Sampling for tree training
+    ap.add_argument("--n_images", type=int, default=10000)
+    ap.add_argument("--pos_frac", type=float, default=0.40)
+    ap.add_argument("--split_train", type=float, default=0.70)
+    ap.add_argument("--split_calib", type=float, default=0.15)
+    ap.add_argument("--split_ptest", type=float, default=0.15)
+    ap.add_argument("--seed", type=int, default=42)
+
+    # Inference
+    ap.add_argument("--infer_size", type=int, default=768)
+    ap.add_argument("--tta_hflip", type=int, default=1)
+    ap.add_argument("--tta_vflip", type=int, default=0)
+
+    # Detector gate thresholds
+    ap.add_argument("--det_t_low", type=float, default=0.002)
+    ap.add_argument("--det_t_high", type=float, default=0.01)
+
+    # Sem/Inst thresholds by gate
+    ap.add_argument("--sem_thr_low", type=float, default=0.07)
+    ap.add_argument("--sem_thr_mid", type=float, default=0.10)
+    ap.add_argument("--sem_thr_high", type=float, default=0.13)
+
+    ap.add_argument("--inst_score_thr_low", type=float, default=0.10)
+    ap.add_argument("--inst_score_thr_mid", type=float, default=0.20)
+    ap.add_argument("--inst_score_thr_high", type=float, default=0.30)
+
+    ap.add_argument("--inst_mask_thr", type=float, default=0.50)
+    ap.add_argument("--inst_min_area", type=int, default=40)
+
+    # Sem CC candidates
+    ap.add_argument("--sem_cc_min_area", type=int, default=60)
+    ap.add_argument("--sem_cc_topk", type=int, default=20)
+    ap.add_argument("--sem_cc_score_scale", type=float, default=1.0)
+
+    # Final constraints
+    ap.add_argument("--final_min_area", type=int, default=50)
+    ap.add_argument("--max_inst_low", type=int, default=30)
+    ap.add_argument("--max_inst_mid", type=int, default=20)
+    ap.add_argument("--max_inst_high", type=int, default=12)
+
+    # Candidate labeling / evaluation
+    ap.add_argument("--match_iou_thr", type=float, default=0.30)
+    ap.add_argument("--eval_iou", type=float, default=0.50)
+    ap.add_argument("--beta", type=float, default=2.0)
+
+    # Negative subsampling
+    ap.add_argument("--max_neg_per_image", type=int, default=50)
+
+    # Threshold search for tree proba
+    ap.add_argument("--thr_grid_n", type=int, default=41)
+
+    # Logging intervals
+    ap.add_argument("--log_every_train_imgs", type=int, default=200)
+    ap.add_argument("--log_every_calib_imgs", type=int, default=100)
+    ap.add_argument("--log_every_test_imgs", type=int, default=200)
+
+    # Output
+    ap.add_argument("--submit_name", type=str, default="submission_tree.csv")
+
+    return ap.parse_args()
+
+
+def resolve_dataset_paths(args) -> Tuple[str, str, str, str]:
+    train_csv = args.train_csv.strip() if args.train_csv.strip() else ""
+    sample_csv = args.sample_csv.strip() if args.sample_csv.strip() else ""
+    train_dir = args.train_dir.strip() if args.train_dir.strip() else ""
+    test_dir = args.test_dir.strip() if args.test_dir.strip() else ""
+
+    cur = os.path.abspath(args.data_dir)
+    roots = [cur, os.path.dirname(cur), os.path.dirname(os.path.dirname(cur))]
+
+    def pick_file(name: str) -> str:
+        for r in roots:
+            cand = os.path.join(r, name)
+            if os.path.isfile(cand):
+                return cand
+        return ""
+
+    def pick_dir(name: str) -> str:
+        for r in roots:
+            cand = os.path.join(r, name)
+            if os.path.isdir(cand):
+                return cand
+        return ""
+
+    if not train_csv:
+        train_csv = pick_file("train_ship_segmentations_v2.csv")
+    if not sample_csv:
+        sample_csv = pick_file("sample_submission_v2.csv")
+    if not train_dir:
+        train_dir = pick_dir("train_v2")
+    if not test_dir:
+        test_dir = pick_dir("test_v2")
+
+    missing = []
+    if not (train_csv and os.path.isfile(train_csv)):
+        missing.append("train_ship_segmentations_v2.csv")
+    if not (sample_csv and os.path.isfile(sample_csv)):
+        missing.append("sample_submission_v2.csv")
+    if not (train_dir and os.path.isdir(train_dir)):
+        missing.append("train_v2/")
+    if not (test_dir and os.path.isdir(test_dir)):
+        missing.append("test_v2/")
+
+    if missing:
+        msg = (
+            "Dataset path resolution failed. Missing: " + ", ".join(missing) + "\n"
+            f"  data_dir={args.data_dir}\n"
+            f"  tried_roots={roots}\n"
+            f"  resolved train_csv={train_csv}\n"
+            f"  resolved sample_csv={sample_csv}\n"
+            f"  resolved train_dir={train_dir}\n"
+            f"  resolved test_dir={test_dir}\n"
+            "Fix: pass explicit --train_csv/--sample_csv/--train_dir/--test_dir or set correct --data_dir."
+        )
+        raise AssertionError(msg)
+
+    return train_csv, sample_csv, train_dir, test_dir
+
+
+def main():
+    args = parse_args()
+
+    if HistGradientBoostingClassifier is None:
+        raise RuntimeError(
+            "scikit-learn is missing or broken. Install/repair it first.\n"
+            "Example: python3 -m pip install -U scikit-learn"
+        )
+
+    set_seed(args.seed)
+    ensure_dir(args.run_dir)
+
+    log_path = os.path.join(args.run_dir, "log_global.txt")
+    with open(log_path, "w", encoding="utf-8") as fp:
+        log("=== infer_fusion_tree_3way_strictcache_nopandas START ===", fp)
+        log(f"data_dir={args.data_dir}", fp)
+        log(f"zoo_dir={args.zoo_dir}", fp)
+        log(f"run_dir={args.run_dir}", fp)
+        log(f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES','')}", fp)
+        log(f"torch={torch.__version__} torchvision={torchvision.__version__}", fp)
+        log(f"cv2={_HAS_CV2} scipy={_HAS_SCIPY}", fp)
+        log(f"compat_strict={args.compat_strict}", fp)
+
+        train_csv, sample_csv, train_dir, test_dir = resolve_dataset_paths(args)
+        log(f"resolved train_csv={train_csv}", fp)
+        log(f"resolved sample_csv={sample_csv}", fp)
+        log(f"resolved train_dir={train_dir}", fp)
+        log(f"resolved test_dir={test_dir}", fp)
+
+        train_map = list_images_in_dir(train_dir)
+        test_map = list_images_in_dir(test_dir)
+        test_order = read_sample_submission_order(sample_csv)
+        log(f"train_images={len(train_map)} test_images={len(test_map)} template_rows={len(test_order)}", fp)
+
+        id2rles = build_id2rles(train_csv)
+        pos_ids = sorted([k for k, v in id2rles.items() if len(v) > 0])
+        all_train_ids = sorted(list(train_map.keys()))
+        log(f"pos_ids_from_csv={len(pos_ids)} all_train_ids_from_dir={len(all_train_ids)}", fp)
+
+        sampled = stratified_sample_ids(all_train_ids, pos_ids, args.n_images, args.pos_frac, args.seed)
+        splits = split_ids(sampled, args.split_train, args.split_calib, args.split_ptest, args.seed)
+
+        with open(os.path.join(args.run_dir, "splits.json"), "w", encoding="utf-8") as f:
+            json.dump(splits, f, ensure_ascii=False, indent=2)
+        log(f"sampled={len(sampled)} | train={len(splits['train'])} calib={len(splits['calib'])} ptest={len(splits['ptest'])}", fp)
+
+        # Candidate model paths (explicit > auto)
+        det_paths_all = [p.strip() for p in args.det_models.split(",") if p.strip()] if args.det_models else auto_select_models(args.zoo_dir, "det")
+        sem_paths_all = [p.strip() for p in args.sem_models.split(",") if p.strip()] if args.sem_models else auto_select_models(args.zoo_dir, "sem")
+        inst_paths_all = [p.strip() for p in args.inst_models.split(",") if p.strip()] if args.inst_models else auto_select_models(args.zoo_dir, "inst")
+
+        log(f"det_paths_all={len(det_paths_all)} sem_paths_all={len(sem_paths_all)} inst_paths_all={len(inst_paths_all)}", fp)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        log(f"device={device}", fp)
+
+        strict_compat = bool(args.compat_strict)
+
+        # Filter compatible checkpoints BEFORE building final models
+        det_paths, det_reports = filter_compatible_checkpoints(
+            det_paths_all,
+            builder_fn=lambda: build_detector(args.detector_arch),
+            device=device,
+            strict_compat=strict_compat,
+            fp=fp,
+            max_models=args.max_det_models,
+            tag="DET_CKPT",
+        )
+        sem_paths, sem_reports = filter_compatible_checkpoints(
+            sem_paths_all,
+            builder_fn=lambda: build_semseg(args.sem_arch),
+            device=device,
+            strict_compat=strict_compat,
+            fp=fp,
+            max_models=args.max_sem_models,
+            tag="SEM_CKPT",
+        )
+        inst_paths, inst_reports = filter_compatible_checkpoints(
+            inst_paths_all,
+            builder_fn=lambda: build_instseg(args.inst_arch),
+            device=device,
+            strict_compat=strict_compat,
+            fp=fp,
+            max_models=args.max_inst_models,
+            tag="INS_CKPT",
+        )
+
+        log(f"kept det_paths={len(det_paths)} sem_paths={len(sem_paths)} inst_paths={len(inst_paths)}", fp)
+
+        # Build and load final models (now safe: compatible)
+        det_models: List[nn.Module] = []
+        for p in det_paths:
+            m = build_detector(args.detector_arch)
+            ok, msg, mc, uc = load_state_dict_with_report(m, p, strict=False)
+            if ok:
+                det_models.append(m.to(device))
+            log(f"[DET] {msg}", fp)
+
+        sem_models: List[nn.Module] = []
+        for p in sem_paths:
+            m = build_semseg(args.sem_arch)
+            ok, msg, mc, uc = load_state_dict_with_report(m, p, strict=False)
+            if ok:
+                sem_models.append(m.to(device))
+            log(f"[SEM] {msg}", fp)
+
+        inst_models: List[nn.Module] = []
+        for p in inst_paths:
+            m = build_instseg(args.inst_arch)
+            ok, msg, mc, uc = load_state_dict_with_report(m, p, strict=False)
+            if ok:
+                inst_models.append(m.to(device))
+            log(f"[INS] {msg}", fp)
+
+        if len(sem_models) == 0:
+            raise RuntimeError(
+                "sem_models is empty after compatibility filtering.\n"
+                "Fix: provide a correct --sem_models path matching torchvision deeplabv3_* with num_classes=1."
+            )
+        if len(det_models) == 0:
+            log("WARNING: det_models empty: p_det=0.0 will be used (gate fixed to lvl=0).", fp)
+        if len(inst_models) == 0:
+            log("WARNING: inst_models empty: only semCC candidates will be used.", fp)
+
+        # -----------------------------------------
+        # Helper: process one image (inference + GT)
+        # -----------------------------------------
+        def process_one_image(img_path: str, img_id: str, is_train: bool) -> Tuple[List[np.ndarray], List[float], List[np.ndarray], float, int, np.ndarray]:
+            pil0 = pil_open_rgb(img_path)
+            orig_w, orig_h = pil0.size  # (W,H)
+            pil = pil0.resize((args.infer_size, args.infer_size), resample=Image.BILINEAR)
+
+            x_norm = to_tensor_imagenet_norm(pil).unsqueeze(0).to(device)
+            x_det  = to_tensor_01(pil).to(device)
+
+            p_det = infer_detector_ensemble(det_models, x_norm, bool(args.tta_hflip), bool(args.tta_vflip)) if det_models else 0.0
+            lvl = gate_level(p_det, args.det_t_low, args.det_t_high)
+
+            P_sem = infer_semseg_ensemble(sem_models, x_norm, bool(args.tta_hflip), bool(args.tta_vflip))
+
+            sem_thr = choose_by_gate(lvl, args.sem_thr_low, args.sem_thr_mid, args.sem_thr_high)
+            inst_score_thr = choose_by_gate(lvl, args.inst_score_thr_low, args.inst_score_thr_mid, args.inst_score_thr_high)
+
+            inst_cand = infer_instseg_ensemble(
+                inst_models, x_det,
+                score_thr=inst_score_thr,
+                mask_thr=args.inst_mask_thr,
+                min_area=args.inst_min_area,
+                tta_hflip=bool(args.tta_hflip),
+                tta_vflip=bool(args.tta_vflip),
+            ) if inst_models else []
+
+            sem_cc = build_sem_cc_candidates(P_sem, sem_thr, args.sem_cc_min_area, args.sem_cc_topk, args.sem_cc_score_scale)
+
+            pred_masks: List[np.ndarray] = []
+            pred_scores: List[float] = []
+            for c in inst_cand:
+                pred_masks.append(c["mask"].astype(bool))
+                pred_scores.append(float(c["score"]))
+            for c in sem_cc:
+                pred_masks.append(c["mask"].astype(bool))
+                pred_scores.append(float(c["score"]))
+
+            gt_masks: List[np.ndarray] = []
+            if is_train:
+                gt_rles = id2rles.get(img_id, [])
+                for rle in gt_rles:
+                    gm = rle_decode_airbus(rle, (orig_h, orig_w))  # (H,W)
+                    if gm.shape[0] != args.infer_size or gm.shape[1] != args.infer_size:
+                        gm_pil = Image.fromarray((gm * 255).astype(np.uint8)).resize((args.infer_size, args.infer_size), resample=Image.NEAREST)
+                        gm = (np.array(gm_pil) > 127).astype(np.uint8)
+                    gt_masks.append(gm.astype(bool))
+
+            return pred_masks, pred_scores, gt_masks, float(p_det), int(lvl), P_sem
+
+        def label_candidates(pred_masks: List[np.ndarray], gt_masks: List[np.ndarray], thr: float) -> List[int]:
+            if len(gt_masks) == 0:
+                return [0] * len(pred_masks)
+            y: List[int] = []
+            for pm in pred_masks:
+                best = 0.0
+                for gm in gt_masks:
+                    v = iou_mask(pm, gm)
+                    if v > best:
+                        best = v
+                y.append(1 if best >= thr else 0)
+            return y
+
+        # -----------------------------------------
+        # Build training samples for tree
+        # -----------------------------------------
+        X_train: List[np.ndarray] = []
+        y_train: List[int] = []
+
+        log("Building tree training samples...", fp)
+        for i, img_id in enumerate(splits["train"]):
+            img_path = train_map[img_id]
+            pred_masks, pred_scores, gt_masks, p_det, lvl, P_sem = process_one_image(img_path, img_id, is_train=True)
+            y = label_candidates(pred_masks, gt_masks, args.match_iou_thr)
+
+            pos_idx = [k for k, yy in enumerate(y) if yy == 1]
+            neg_idx = [k for k, yy in enumerate(y) if yy == 0]
+            if len(neg_idx) > args.max_neg_per_image:
+                neg_idx = random.sample(neg_idx, args.max_neg_per_image)
+            use_idx = pos_idx + neg_idx
+
+            for k in use_idx:
+                feats = extract_features_for_candidate(pred_masks[k], pred_scores[k], p_det, lvl, P_sem)
+                X_train.append(feats)
+                y_train.append(int(y[k]))
+
+            if (i + 1) % args.log_every_train_imgs == 0:
+                log(f"tree_train progress {i+1}/{len(splits['train'])} | X={len(X_train)}", fp)
+
+        if len(X_train) == 0:
+            raise RuntimeError("No training samples collected. Check candidate generation thresholds and model loading.")
+
+        X_train_np = np.stack(X_train, 0)
+        y_train_np = np.asarray(y_train, dtype=np.int32)
+        log(f"Tree train samples: X={X_train_np.shape} y_pos={int(y_train_np.sum())} y_neg={int((y_train_np==0).sum())}", fp)
+
+        # Train tree
+        log("Training HistGradientBoostingClassifier...", fp)
+        tree = HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.08,
+            max_iter=300,
+            random_state=args.seed,
+        )
+        tree.fit(X_train_np, y_train_np)
+        log("Tree trained.", fp)
+
+        tree_path = os.path.join(args.run_dir, "tree_model.pkl")
+        with open(tree_path, "wb") as f:
+            pickle.dump(tree, f)
+        log(f"Saved tree: {tree_path}", fp)
+
+        # -----------------------------------------
+        # Calibration cache (NO re-inference per threshold)
+        # -----------------------------------------
+        log("Building calibration cache (single-pass inference + proba)...", fp)
+        calib_cache_path = os.path.join(args.run_dir, "calib_cache_preview.json")
+
+        calib_items: List[Dict[str, Any]] = []
+        t0_cache = time.time()
+        for ii, img_id in enumerate(splits["calib"]):
+            img_path = train_map[img_id]
+            pred_masks, pred_scores, gt_masks, p_det, lvl, P_sem = process_one_image(img_path, img_id, is_train=True)
+
+            # build feats for all candidates, get proba once
+            feats_list: List[np.ndarray] = []
+            for pm, sc in zip(pred_masks, pred_scores):
+                feats_list.append(extract_features_for_candidate(pm, sc, p_det, lvl, P_sem))
+
+            if len(feats_list) > 0:
+                Xc = np.stack(feats_list, 0)
+                proba = tree.predict_proba(Xc)[:, 1].astype(np.float32)
+            else:
+                proba = np.zeros((0,), dtype=np.float32)
+
+            # pack masks to bytes for memory efficiency
+            H = W = args.infer_size
+            cand_packed: List[bytes] = [pack_bool_mask(pm) for pm in pred_masks]
+            gt_packed: List[bytes] = [pack_bool_mask(gm) for gm in gt_masks]
+
+            calib_items.append({
+                "img_id": img_id,
+                "shape": (H, W),
+                "cand_proba": proba,                 # np.float32
+                "cand_masks_packed": cand_packed,    # list[bytes]
+                "gt_masks_packed": gt_packed,        # list[bytes]
+            })
+
+            if (ii + 1) % args.log_every_calib_imgs == 0:
+                log(f"calib_cache {ii+1}/{len(splits['calib'])} elapsed={(time.time()-t0_cache)/60:.1f}m", fp)
+
+        # tiny preview file (not storing bytes) to confirm cache size
+        try:
+            preview = {
+                "n_items": len(calib_items),
+                "avg_cands": float(np.mean([len(it["cand_proba"]) for it in calib_items])) if calib_items else 0.0,
+                "avg_gt": float(np.mean([len(it["gt_masks_packed"]) for it in calib_items])) if calib_items else 0.0,
+            }
+            with open(calib_cache_path, "w", encoding="utf-8") as f:
+                json.dump(preview, f, ensure_ascii=False, indent=2)
+            log(f"Wrote calib cache preview: {calib_cache_path} {preview}", fp)
+        except Exception as e:
+            log(f"WARNING: failed to write cache preview: {repr(e)}", fp)
+
+        # -----------------------------------------
+        # Calibrate threshold on calib split (instance-level F2), using cache
+        # -----------------------------------------
+        log("Calibrating threshold on calib cache...", fp)
+        thr_grid = np.linspace(0.01, 0.99, args.thr_grid_n).tolist()
+        best_thr = 0.50
+        best_f2 = -1.0
+        best_info = None
+
+        t0_cal = time.time()
+        for ti, thr in enumerate(thr_grid):
+            all_tp = all_fp = all_fn = 0
+            for ii, it in enumerate(calib_items):
+                H, W = it["shape"]
+                proba: np.ndarray = it["cand_proba"]
+                cand_packed: List[bytes] = it["cand_masks_packed"]
+                gt_packed: List[bytes] = it["gt_masks_packed"]
+
+                gt_masks = [unpack_bool_mask(b, (H, W)) for b in gt_packed]
+                if proba.shape[0] == 0:
+                    all_fn += len(gt_masks)
+                    continue
+
+                keep_idx = [k for k, p in enumerate(proba.tolist()) if float(p) >= float(thr)]
+                if len(keep_idx) == 0:
+                    all_fn += len(gt_masks)
+                    continue
+
+                keep_masks = [unpack_bool_mask(cand_packed[k], (H, W)) for k in keep_idx]
+                keep_scores = [float(proba[k]) for k in keep_idx]
+
+                _, info = greedy_match_f2(keep_masks, keep_scores, gt_masks, score_thr=0.0, iou_thr=args.eval_iou, beta=args.beta)
+                all_tp += int(info["tp"])
+                all_fp += int(info["fp"])
+                all_fn += int(info["fn"])
+
+                if (ii + 1) % args.log_every_calib_imgs == 0 and ti in (0, len(thr_grid)//2, len(thr_grid)-1):
+                    log(f"calib_scan thr[{ti+1}/{len(thr_grid)}]={thr:.3f} img[{ii+1}/{len(calib_items)}] tp={all_tp} fp={all_fp} fn={all_fn}", fp)
+
+            prec = all_tp / (all_tp + all_fp + 1e-9)
+            rec  = all_tp / (all_tp + all_fn + 1e-9)
+            b2 = args.beta * args.beta
+            f2_all = (1 + b2) * prec * rec / (b2 * prec + rec + 1e-9)
+
+            if float(f2_all) > float(best_f2):
+                best_f2 = float(f2_all)
+                best_thr = float(thr)
+                best_info = {"tp": all_tp, "fp": all_fp, "fn": all_fn, "precision": prec, "recall": rec}
+
+            if (ti + 1) % max(1, len(thr_grid)//8) == 0:
+                log(f"calib_thr_progress {ti+1}/{len(thr_grid)} best_thr={best_thr:.3f} best_f2={best_f2:.6f} elapsed={(time.time()-t0_cal)/60:.1f}m", fp)
+
+        log(f"Best tree_thr={best_thr:.4f} best_f2={best_f2:.6f} info={best_info}", fp)
+
+        # -----------------------------------------
+        # Pseudo-test evaluation (single pass; with logs)
+        # -----------------------------------------
+        log("Pseudo-test evaluation...", fp)
+        t0_pt = time.time()
+        all_tp = all_fp = all_fn = 0
+        for ii, img_id in enumerate(splits["ptest"]):
+            img_path = train_map[img_id]
+            pred_masks, pred_scores, gt_masks, p_det, lvl, P_sem = process_one_image(img_path, img_id, is_train=True)
+
+            feats_list: List[np.ndarray] = []
+            for pm, sc in zip(pred_masks, pred_scores):
+                feats_list.append(extract_features_for_candidate(pm, sc, p_det, lvl, P_sem))
+
+            if len(feats_list) == 0:
+                all_fn += len(gt_masks)
+            else:
+                Xc = np.stack(feats_list, 0)
+                proba = tree.predict_proba(Xc)[:, 1]
+                keep_idx = [k for k, p in enumerate(proba) if float(p) >= float(best_thr)]
+                keep_masks = [pred_masks[k] for k in keep_idx]
+                keep_scores = [float(proba[k]) for k in keep_idx]
+                _, info = greedy_match_f2(keep_masks, keep_scores, gt_masks, score_thr=0.0, iou_thr=args.eval_iou, beta=args.beta)
+                all_tp += int(info["tp"]); all_fp += int(info["fp"]); all_fn += int(info["fn"])
+
+            if (ii + 1) % args.log_every_calib_imgs == 0:
+                log(f"ptest {ii+1}/{len(splits['ptest'])} tp={all_tp} fp={all_fp} fn={all_fn} elapsed={(time.time()-t0_pt)/60:.1f}m", fp)
+
+        prec = all_tp / (all_tp + all_fp + 1e-9)
+        rec  = all_tp / (all_tp + all_fn + 1e-9)
+        b2 = args.beta * args.beta
+        f2_ptest = (1 + b2) * prec * rec / (b2 * prec + rec + 1e-9)
+        log(f"Pseudo-test: f2={f2_ptest:.6f} precision={prec:.6f} recall={rec:.6f} tp={all_tp} fp={all_fp} fn={all_fn}", fp)
+
+        # -----------------------------------------
+        # Test inference -> submission
+        # -----------------------------------------
+        log("Running test inference and building submission...", fp)
+        out_rows: List[Tuple[str, str]] = []
+        shipless = 0
+        inst_rows = 0
+        t0_test = time.time()
+
+        for idx, img_id in enumerate(test_order):
+            if img_id not in test_map:
+                out_rows.append((img_id, ""))
+                shipless += 1
+                continue
+
+            pil0 = pil_open_rgb(test_map[img_id])
+            pil = pil0.resize((args.infer_size, args.infer_size), resample=Image.BILINEAR)
+
+            x_norm = to_tensor_imagenet_norm(pil).unsqueeze(0).to(device)
+            x_det  = to_tensor_01(pil).to(device)
+
+            p_det = infer_detector_ensemble(det_models, x_norm, bool(args.tta_hflip), bool(args.tta_vflip)) if det_models else 0.0
+            lvl = gate_level(p_det, args.det_t_low, args.det_t_high)
+
+            P_sem = infer_semseg_ensemble(sem_models, x_norm, bool(args.tta_hflip), bool(args.tta_vflip))
+
+            sem_thr = choose_by_gate(lvl, args.sem_thr_low, args.sem_thr_mid, args.sem_thr_high)
+            inst_score_thr = choose_by_gate(lvl, args.inst_score_thr_low, args.inst_score_thr_mid, args.inst_score_thr_high)
+            max_inst = choose_int_by_gate(lvl, args.max_inst_low, args.max_inst_mid, args.max_inst_high)
+
+            inst_cand = infer_instseg_ensemble(
+                inst_models, x_det,
+                score_thr=inst_score_thr,
+                mask_thr=args.inst_mask_thr,
+                min_area=args.inst_min_area,
+                tta_hflip=bool(args.tta_hflip),
+                tta_vflip=bool(args.tta_vflip),
+            ) if inst_models else []
+
+            sem_cc = build_sem_cc_candidates(P_sem, sem_thr, args.sem_cc_min_area, args.sem_cc_topk, args.sem_cc_score_scale)
+
+            pred_masks = [c["mask"].astype(bool) for c in inst_cand] + [c["mask"].astype(bool) for c in sem_cc]
+            pred_scores = [float(c["score"]) for c in inst_cand] + [float(c["score"]) for c in sem_cc]
+
+            if len(pred_masks) == 0:
+                out_rows.append((img_id, ""))
+                shipless += 1
+                continue
+
+            feats: List[np.ndarray] = []
+            for pm, sc in zip(pred_masks, pred_scores):
+                feats.append(extract_features_for_candidate(pm, sc, p_det, lvl, P_sem))
+            X = np.stack(feats, 0)
+            proba = tree.predict_proba(X)[:, 1]
+
+            keep: List[Tuple[float, np.ndarray]] = []
+            for pm, pb in zip(pred_masks, proba):
+                if float(pb) >= float(best_thr):
+                    keep.append((float(pb), pm))
+            keep.sort(key=lambda x: x[0], reverse=True)
+
+            final_masks = enforce_non_overlap(keep, min_area=args.final_min_area, max_inst=max_inst)
+
+            if len(final_masks) == 0:
+                out_rows.append((img_id, ""))
+                shipless += 1
+            else:
+                for m in final_masks:
+                    out_rows.append((img_id, rle_encode_airbus(m)))
+                inst_rows += len(final_masks)
+
+            if (idx + 1) % args.log_every_test_imgs == 0:
+                log(f"test {idx+1}/{len(test_order)} shipless={shipless} inst_rows={inst_rows} elapsed={(time.time()-t0_test)/60:.1f}m", fp)
+
+        submit_path = os.path.join(args.run_dir, args.submit_name)
+        with open(submit_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["ImageId", "EncodedPixels"])
+            for img_id, enc in out_rows:
+                w.writerow([img_id, enc])
+
+        meta = {
+            "time": now_ts(),
+            "data_dir": args.data_dir,
+            "zoo_dir": args.zoo_dir,
+            "resolved_paths": {
+                "train_csv": train_csv,
+                "sample_csv": sample_csv,
+                "train_dir": train_dir,
+                "test_dir": test_dir,
+            },
+            "infer_size": args.infer_size,
+            "tta_hflip": int(args.tta_hflip),
+            "tta_vflip": int(args.tta_vflip),
+            "n_images": args.n_images,
+            "pos_frac": args.pos_frac,
+            "splits": {k: len(v) for k, v in splits.items()},
+            "compat_strict": int(args.compat_strict),
+            "tree": {
+                "model": "HistGradientBoostingClassifier",
+                "tree_path": tree_path,
+                "best_thr": best_thr,
+                "best_f2_calib": best_f2,
+                "ptest_f2": f2_ptest,
+            },
+            "thresholds": {
+                "det_t_low": args.det_t_low,
+                "det_t_high": args.det_t_high,
+                "sem_thr": {"low": args.sem_thr_low, "mid": args.sem_thr_mid, "high": args.sem_thr_high},
+                "inst_score_thr": {"low": args.inst_score_thr_low, "mid": args.inst_score_thr_mid, "high": args.inst_score_thr_high},
+                "inst_mask_thr": args.inst_mask_thr,
+                "inst_min_area": args.inst_min_area,
+                "sem_cc": {"min_area": args.sem_cc_min_area, "topk": args.sem_cc_topk, "score_scale": args.sem_cc_score_scale},
+                "final": {"min_area": args.final_min_area, "max_inst": {"low": args.max_inst_low, "mid": args.max_inst_mid, "high": args.max_inst_high}},
+            },
+            "models": {
+                "detector_arch": args.detector_arch,
+                "sem_arch": args.sem_arch,
+                "inst_arch": args.inst_arch,
+                "det_paths_kept": det_paths,
+                "sem_paths_kept": sem_paths,
+                "inst_paths_kept": inst_paths,
+                "det_loaded": len(det_models),
+                "sem_loaded": len(sem_models),
+                "inst_loaded": len(inst_models),
+            },
+            "result": {
+                "submission_path": submit_path,
+                "rows": len(out_rows),
+                "shipless_rows": shipless,
+                "instance_rows": inst_rows,
+            }
+        }
+        with open(os.path.join(args.run_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        log("=== DONE ===", fp)
+        log(f"submission_path={submit_path}", fp)
+        log(f"rows={len(out_rows)} shipless_rows={shipless} instance_rows={inst_rows}", fp)
+
+    print(f"[OK] submission written: {os.path.join(args.run_dir, args.submit_name)}")
+
+
+if __name__ == "__main__":
+    main()
