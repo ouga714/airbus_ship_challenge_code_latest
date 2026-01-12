@@ -1,0 +1,1748 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_infer_unet_emb_detgate_hades.py
+
+Airbus Ship Detection (Kaggle) — U-Net + Embedding for instance split, Detector-gated inference,
+Two-phase training (fixed 768 + multi-scale), TTA, variable-row submission,
+and visualization (original + pred mask + Grad-CAM concatenated JPEG).
+
+Hard constraints:
+- HADES environment (paths under /workspace)
+- NO DDP
+- FP32 only (NO AMP)
+- One-file end-to-end: split -> train -> eval -> infer -> submission -> visualization
+- Strict detector identity check by sha1(first1MB)
+
+Key design choices:
+- Train segmentation (union mask) + embedding head for instance separation.
+- Avoid watershed (over-splitting) by using embedding + DBSCAN clustering within connected components.
+- Recall-oriented loss: BCEWithLogits + Tversky(alpha,beta) (beta>alpha to penalize FN).
+- Two-phase training:
+  Phase1: fixed 768
+  Phase2: multi-scale sizes list (e.g. 640/704/768/832/896)
+
+Dependencies:
+- Python >= 3.9
+- torch, torchvision
+- numpy, pillow
+- opencv-python (cv2) OR scipy (fallback) for connected components/morphology
+- scikit-learn for DBSCAN
+
+Usage example (hades container):
+python3 train_infer_unet_emb_detgate_hades.py \
+  --mode all \
+  --data_dir /workspace/kaggle_competition/dataset/airbus_ship_detection \
+  --run_dir  /workspace/kaggle_competition/runs_unet_emb_detgate/run_001 \
+  --seed 42 \
+  --detector_ckpt /workspace/kaggle_competition/outputs_airbus_detector_f1/run__detector_fbeta_1.00_efficientnet_v2_s__img768__seed42__all192556__valr0.15__tpos0.35__pw1.00__ic1__cache1/best_model.pt \
+  --detector_expected_sha1_first1mb 036cefbb874e2c623fdd46f69fc8ddb3790aed70 \
+  --train_pos 50000 \
+  --val_total 30000 --val_pos_rate 0.221 \
+  --ptest_total 3000 --ptest_pos_rate 0.221 \
+  --phase1_epochs 6 --phase2_epochs 4 \
+  --phase1_bs 4 --phase2_bs 1 \
+  --lr 2e-4 --weight_decay 1e-4 \
+  --tversky_alpha 0.3 --tversky_beta 0.7 \
+  --emb_dim 16 \
+  --near_mode soft --near_sigma_px 140 --near_min_weight 0.05 \
+  --infer_size 768 --tta_hflip 1 --tta_vflip 0 \
+  --det_gate 1 --det_thr 0.004130961839109659 \
+  --fg_thr 0.05 --min_area 50 --big_cc_area 600 \
+  --dbscan_eps 0.6 --dbscan_min_samples 30 --spatial_weight 0.02 \
+  --nms_iou_thr 0.50 --max_instances_per_image 15 \
+  --save_vis 1 --vis_max_images 200
+
+Notes:
+- Detector thr default uses your known best_thr (~0.00413) as a starting point.
+- You can relax/tighten det_thr depending on gating aggressiveness.
+"""
+
+import os
+import sys
+import time
+import math
+import json
+import csv
+import random
+import hashlib
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision import transforms as T
+
+# -----------------------------
+# Optional deps (cv2 / scipy / sklearn)
+# -----------------------------
+_HAS_CV2 = False
+_HAS_SCIPY = False
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+try:
+    import scipy.ndimage as ndi  # type: ignore
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+_HAS_SKLEARN = False
+try:
+    from sklearn.cluster import DBSCAN  # type: ignore
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
+
+
+# -----------------------------
+# Logging
+# -----------------------------
+_GLOBAL_LOG_F = None
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def log(msg: str) -> None:
+    s = f"[{now_str()}] {msg}"
+    print(s, flush=True)
+    if _GLOBAL_LOG_F is not None:
+        _GLOBAL_LOG_F.write(s + "\n")
+        _GLOBAL_LOG_F.flush()
+
+
+# -----------------------------
+# Repro
+# -----------------------------
+def seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+# -----------------------------
+# SHA1(first1MB) strict detector identity
+# -----------------------------
+def sha1_first1mb(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        chunk = f.read(1024 * 1024)
+    h.update(chunk)
+    return h.hexdigest()
+
+
+# -----------------------------
+# RLE utils (Airbus)
+# Kaggle Airbus uses column-major order (Fortran order)
+# -----------------------------
+def rle_decode(mask_rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Decode RLE string into binary mask.
+    shape: (H, W)
+    RLE is in "start length start length ..." 1-indexed,
+    applied on flattened array in column-major order.
+    """
+    if mask_rle is None or mask_rle == "" or (isinstance(mask_rle, float) and np.isnan(mask_rle)):
+        return np.zeros(shape, dtype=np.uint8)
+
+    s = mask_rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    # reshape using column-major (Fortran order)
+    return img.reshape((shape[1], shape[0]), order="F").T  # back to (H,W)
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    Encode binary mask into RLE string (Airbus format).
+    mask: (H,W), values 0/1
+    """
+    if mask is None:
+        return ""
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    # flatten in Fortran order (column-major)
+    pixels = m.T.flatten(order="F")
+    # add sentinel
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+# -----------------------------
+# CSV -> id2rles mapping
+# -----------------------------
+def load_id2rles(train_csv_path: Path) -> Dict[str, List[str]]:
+    """
+    Build mapping: ImageId -> list of instance RLEs (pos only).
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(train_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None or rle == "":
+                continue
+            id2rles.setdefault(img_id, []).append(rle)
+    return id2rles
+
+
+# -----------------------------
+# Connected components / Morphology
+# -----------------------------
+def _cc_label_cv2(bin_mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    # returns labels (int32), num
+    num, labels = cv2.connectedComponents(bin_mask.astype(np.uint8), connectivity=8)
+    # labels: 0=background, 1..num-1
+    return labels.astype(np.int32), int(num - 1)
+
+def _cc_label_scipy(bin_mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    structure = np.ones((3, 3), dtype=np.int32)
+    labels, num = ndi.label(bin_mask.astype(np.uint8), structure=structure)
+    return labels.astype(np.int32), int(num)
+
+def connected_components(bin_mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    if _HAS_CV2:
+        return _cc_label_cv2(bin_mask)
+    if _HAS_SCIPY:
+        return _cc_label_scipy(bin_mask)
+    raise RuntimeError("Connected components requires either cv2 or scipy. Please install opencv-python-headless or scipy.")
+
+def morph_open_close(bin_mask: np.ndarray, k_open: int = 0, k_close: int = 0) -> np.ndarray:
+    if not _HAS_CV2:
+        # If no cv2, skip morph to keep runtime safe (but you should install cv2)
+        return bin_mask
+    x = bin_mask.astype(np.uint8) * 255
+    if k_open > 0:
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
+        x = cv2.morphologyEx(x, cv2.MORPH_OPEN, ker)
+    if k_close > 0:
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+        x = cv2.morphologyEx(x, cv2.MORPH_CLOSE, ker)
+    return (x > 127).astype(np.uint8)
+
+
+# -----------------------------
+# IoU for masks (instance NMS)
+# -----------------------------
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
+
+def nms_masks(masks: List[np.ndarray], scores: List[float], iou_thr: float) -> List[int]:
+    order = np.argsort(np.asarray(scores))[::-1].tolist()
+    keep: List[int] = []
+    for idx in order:
+        ok = True
+        for j in keep:
+            if mask_iou(masks[idx], masks[j]) >= iou_thr:
+                ok = False
+                break
+        if ok:
+            keep.append(idx)
+    return keep
+
+
+# -----------------------------
+# Simple pixel metrics (union)
+# -----------------------------
+def compute_pixel_metrics(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-9) -> Dict[str, float]:
+    pred = (pred > 0).astype(np.uint8)
+    gt = (gt > 0).astype(np.uint8)
+    tp = float(np.logical_and(pred == 1, gt == 1).sum())
+    fp = float(np.logical_and(pred == 1, gt == 0).sum())
+    fn = float(np.logical_and(pred == 0, gt == 1).sum())
+    tn = float(np.logical_and(pred == 0, gt == 0).sum())
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    beta2 = 4.0
+    f2 = (1 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+    iou = tp / (tp + fp + fn + eps)
+    acc = (tp + tn) / (tp + tn + fp + fn + eps)
+    return {
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "precision": precision, "recall": recall,
+        "f1": f1, "f2": f2, "iou": iou, "acc": acc
+    }
+
+
+# -----------------------------
+# Dataset
+# - returns: image tensor [3,H,W], union mask [1,H,W], instance masks [N,H,W] (uint8)
+# -----------------------------
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+def normalize_img(x: torch.Tensor) -> torch.Tensor:
+    # x in [0,1], shape [3,H,W]
+    mean = IMAGENET_MEAN.to(dtype=x.dtype, device=x.device)
+    std = IMAGENET_STD.to(dtype=x.dtype, device=x.device)
+    return (x - mean) / std
+
+def pil_load_rgb(path: Path) -> Image.Image:
+    img = Image.open(str(path)).convert("RGB")
+    return img
+
+def resize_to_square_np(img: np.ndarray, size: int, is_mask: bool = False) -> np.ndarray:
+    # img: HxWxC or HxW
+    if _HAS_CV2:
+        interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
+        return cv2.resize(img, (size, size), interpolation=interp)
+    # PIL fallback
+    pil = Image.fromarray(img)
+    pil = pil.resize((size, size), resample=Image.NEAREST if is_mask else Image.BILINEAR)
+    return np.asarray(pil)
+
+class AirbusDataset(Dataset):
+    def __init__(self,
+                 img_dir: Path,
+                 ids: List[str],
+                 id2rles: Dict[str, List[str]],
+                 out_size: int,
+                 multi_scale: bool = False,
+                 ms_sizes: Optional[List[int]] = None,
+                 augment: bool = True):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.out_size = out_size
+        self.multi_scale = multi_scale
+        self.ms_sizes = ms_sizes if ms_sizes is not None else [640, 704, 768, 832, 896]
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _rand_flip(self, img: np.ndarray, union: np.ndarray, insts: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        # H,W,3 ; H,W ; list H,W
+        if random.random() < 0.5:
+            img = img[:, ::-1, :].copy()
+            union = union[:, ::-1].copy()
+            insts = [m[:, ::-1].copy() for m in insts]
+        if random.random() < 0.1:
+            img = img[::-1, :, :].copy()
+            union = union[::-1, :].copy()
+            insts = [m[::-1, :].copy() for m in insts]
+        return img, union, insts
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        img_id = self.ids[idx]
+        img_path = self.img_dir / img_id
+        img_pil = pil_load_rgb(img_path)
+        img = np.asarray(img_pil)  # H,W,3 uint8
+
+        H, W = img.shape[0], img.shape[1]
+        rles = self.id2rles.get(img_id, [])
+        insts: List[np.ndarray] = []
+        if len(rles) > 0:
+            for rle in rles:
+                m = rle_decode(rle, (H, W))  # 0/1
+                insts.append(m.astype(np.uint8))
+        if len(insts) > 0:
+            union = np.clip(np.sum(np.stack(insts, axis=0), axis=0), 0, 1).astype(np.uint8)
+        else:
+            union = np.zeros((H, W), dtype=np.uint8)
+
+        # choose size
+        if self.multi_scale:
+            size = random.choice(self.ms_sizes)
+        else:
+            size = self.out_size
+
+        # resize to size x size
+        img_rs = resize_to_square_np(img, size, is_mask=False)
+        union_rs = resize_to_square_np(union, size, is_mask=True)
+        insts_rs = [resize_to_square_np(m, size, is_mask=True) for m in insts]
+
+        if self.augment:
+            img_rs, union_rs, insts_rs = self._rand_flip(img_rs, union_rs, insts_rs)
+
+        # to tensors
+        x = torch.from_numpy(img_rs).permute(2, 0, 1).float() / 255.0  # [3,S,S]
+        x = normalize_img(x)
+        y_union = torch.from_numpy(union_rs).unsqueeze(0).float()  # [1,S,S]
+
+        # instance masks tensor list
+        y_insts: List[torch.Tensor] = []
+        for m in insts_rs:
+            y_insts.append(torch.from_numpy((m > 0).astype(np.uint8)))  # [S,S] uint8
+
+        return {
+            "image_id": img_id,
+            "image": x,
+            "union": y_union,
+            "insts": y_insts,
+        }
+
+def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # images: [B,3,H,W], union: [B,1,H,W], insts: list length B of list-of-masks
+    image_ids = [b["image_id"] for b in batch]
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    unions = torch.stack([b["union"] for b in batch], dim=0)
+    insts = [b["insts"] for b in batch]
+    return {"image_id": image_ids, "image": images, "union": unions, "insts": insts}
+
+
+# -----------------------------
+# Model: U-Net + Embedding head
+# -----------------------------
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.conv(x)))
+
+class UNetResNet34(nn.Module):
+    """
+    U-Net with ResNet34 encoder (torchvision) and decoder blocks.
+    Outputs:
+      - mask logits: [B,1,H,W]
+      - embedding: [B,emb_dim,H,W] (L2-normalized by default in forward)
+    """
+    def __init__(self, emb_dim: int = 16, pretrained: bool = True):
+        super().__init__()
+        base = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
+
+        self.enc0 = nn.Sequential(base.conv1, base.bn1, base.relu)     # /2
+        self.pool = base.maxpool                                       # /4
+        self.enc1 = base.layer1                                        # /4
+        self.enc2 = base.layer2                                        # /8
+        self.enc3 = base.layer3                                        # /16
+        self.enc4 = base.layer4                                        # /32
+
+        # decoder
+        self.up4 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)  # /16
+        self.dec4 = nn.Sequential(ConvBNReLU(256 + 256, 256), ConvBNReLU(256, 256))
+
+        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)  # /8
+        self.dec3 = nn.Sequential(ConvBNReLU(128 + 128, 128), ConvBNReLU(128, 128))
+
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)   # /4
+        self.dec2 = nn.Sequential(ConvBNReLU(64 + 64, 64), ConvBNReLU(64, 64))
+
+        self.up1 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)    # /2
+        self.dec1 = nn.Sequential(ConvBNReLU(64 + 64, 64), ConvBNReLU(64, 64))
+
+        self.up0 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)    # /1
+        self.dec0 = nn.Sequential(ConvBNReLU(32, 32), ConvBNReLU(32, 32))
+
+        self.head_mask = nn.Conv2d(32, 1, kernel_size=1)
+        self.head_emb = nn.Conv2d(32, emb_dim, kernel_size=1)
+
+        # For Grad-CAM target: use enc4 as last conv stage (we will hook enc4 output)
+        self._cam_last_feat: Optional[torch.Tensor] = None
+        self._cam_last_grad: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        e0 = self.enc0(x)              # /2, 64
+        e1 = self.enc1(self.pool(e0))  # /4, 64
+        e2 = self.enc2(e1)             # /8, 128
+        e3 = self.enc3(e2)             # /16, 256
+        e4 = self.enc4(e3)             # /32, 512
+
+        # store for gradcam
+        if e4.requires_grad:
+            self._cam_last_feat = e4
+            self._cam_last_feat.retain_grad()
+
+        d4 = self.up4(e4)
+        d4 = torch.cat([d4, e3], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e2], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e1], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e0], dim=1)
+        d1 = self.dec1(d1)
+
+        d0 = self.up0(d1)
+        d0 = self.dec0(d0)
+
+        logits = self.head_mask(d0)
+        emb = self.head_emb(d0)
+        emb = F.normalize(emb, p=2, dim=1)  # stable for clustering
+        return logits, emb
+
+    def get_cam_feat_grad(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        feat = self._cam_last_feat
+        grad = None
+        if feat is not None and feat.grad is not None:
+            grad = feat.grad
+        return feat, grad
+
+
+# -----------------------------
+# Losses
+# -----------------------------
+def tversky_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, alpha: float, beta: float, eps: float = 1e-7) -> torch.Tensor:
+    """
+    logits: [B,1,H,W]
+    target: [B,1,H,W] in {0,1}
+    """
+    probs = torch.sigmoid(logits)
+    tp = torch.sum(probs * target, dim=(1,2,3))
+    fp = torch.sum(probs * (1 - target), dim=(1,2,3))
+    fn = torch.sum((1 - probs) * target, dim=(1,2,3))
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return 1.0 - tversky.mean()
+
+def bce_loss_from_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return F.binary_cross_entropy_with_logits(logits, target)
+
+def embedding_instance_loss(emb: torch.Tensor,
+                            inst_masks: List[torch.Tensor],
+                            near_mode: str,
+                            near_sigma_px: float,
+                            near_min_weight: float,
+                            delta_push: float = 1.0,
+                            eps: float = 1e-6) -> torch.Tensor:
+    """
+    Discriminative-style embedding loss with centroid pull + centroid push.
+
+    emb: [C,H,W] L2-normalized
+    inst_masks: list of [H,W] uint8 (0/1) for each instance
+    near_mode:
+      - "soft": weight per pixel by exp(-dist_to_centroid/sigma) clipped by near_min_weight
+      - "hard": uniform weights (no distance weighting)
+    """
+    if len(inst_masks) <= 1:
+        # 0 or 1 instance -> no push; pull is still meaningful if 1 instance
+        pass
+
+    C, H, W = emb.shape
+    device = emb.device
+    total_loss = torch.zeros([], device=device)
+
+    # collect instance means
+    mus: List[torch.Tensor] = []
+    areas: List[int] = []
+    pull_losses: List[torch.Tensor] = []
+
+    # precompute coordinate grid
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
+    yy = yy.float()
+    xx = xx.float()
+
+    for m in inst_masks:
+        m = m.to(device=device)
+        idx = (m > 0)
+        area = int(idx.sum().item())
+        if area <= 0:
+            continue
+        areas.append(area)
+        feats = emb[:, idx]  # [C,N]
+        mu = feats.mean(dim=1)  # [C]
+        mu = F.normalize(mu, p=2, dim=0)
+        mus.append(mu)
+
+        # pull: weighted distance to mu
+        if near_mode == "soft":
+            # centroid in pixel coords
+            y_c = yy[idx].mean()
+            x_c = xx[idx].mean()
+            dist = torch.sqrt((yy[idx] - y_c) ** 2 + (xx[idx] - x_c) ** 2 + eps)  # [N]
+            w = torch.exp(-dist / max(near_sigma_px, 1.0))
+            w = torch.clamp(w, min=near_min_weight)
+            w = w / (w.sum() + eps)
+        else:
+            w = torch.full((area,), 1.0 / max(area, 1), device=device)
+
+        # distance in embedding space
+        dif = feats - mu.view(C, 1)
+        d2 = (dif * dif).sum(dim=0)  # [N]
+        pull = (w * d2).sum()
+        pull_losses.append(pull)
+
+    if len(mus) == 0:
+        return total_loss
+
+    pull_term = torch.stack(pull_losses).mean()
+    total_loss = total_loss + pull_term
+
+    # push: enforce instance means apart
+    if len(mus) >= 2:
+        mu_stack = torch.stack(mus, dim=0)  # [K,C]
+        # pairwise distances
+        K = mu_stack.shape[0]
+        push_accum = []
+        for i in range(K):
+            for j in range(i+1, K):
+                d = torch.norm(mu_stack[i] - mu_stack[j], p=2)
+                # hinge: want d >= delta_push
+                push_accum.append(F.relu(delta_push - d) ** 2)
+        if len(push_accum) > 0:
+            push_term = torch.stack(push_accum).mean()
+            total_loss = total_loss + push_term
+
+    return total_loss
+
+
+# -----------------------------
+# Detector loading (strict sha1 + robust state_dict naming)
+# -----------------------------
+def extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
+    """
+    Accept common ckpt formats:
+    - raw state_dict dict
+    - dict with 'model', 'state_dict', 'net', etc.
+    """
+    if isinstance(ckpt, dict):
+        for k in ["model", "state_dict", "net", "weights"]:
+            if k in ckpt and isinstance(ckpt[k], dict):
+                # sometimes nested with tensors
+                sd = ckpt[k]
+                if all(isinstance(v, torch.Tensor) for v in sd.values()):
+                    return sd
+        # maybe it is already a state_dict
+        if all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            return ckpt
+    raise RuntimeError("Unsupported checkpoint format: cannot find state_dict.")
+
+def strip_prefix(sd: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    if len(sd) == 0:
+        return sd
+    keys = list(sd.keys())
+    if all(k.startswith(prefix) for k in keys):
+        return {k[len(prefix):]: v for k, v in sd.items()}
+    return sd
+
+def has_key_prefix(sd: Dict[str, torch.Tensor], prefix: str) -> bool:
+    return any(k.startswith(prefix) for k in sd.keys())
+
+class EffNetV2SBinary(torch.nn.Module):
+    """
+    Torchvision EfficientNetV2-S binary classifier (logit output).
+    state_dict keys are typically 'features.*' and 'classifier.*'
+    """
+    def __init__(self, pretrained: bool = False):
+        super().__init__()
+        m = torchvision.models.efficientnet_v2_s(
+            weights=torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        # replace classifier to 1 logit
+        in_features = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_features, 1)
+        self.net = m
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # returns [B]
+        logits = self.net(x)
+        return logits.view(-1)
+
+def load_detector_checked(detector_ckpt_path: str,
+                          device: torch.device,
+                          expected_sha1_first1mb: Optional[str]) -> nn.Module:
+    p = Path(detector_ckpt_path)
+    if not p.exists():
+        raise FileNotFoundError(f"detector_ckpt not found: {detector_ckpt_path}")
+
+    actual = sha1_first1mb(p)
+    log(f"[Detector Check] sha1(first1MB) actual   = {actual}")
+    if expected_sha1_first1mb is not None and expected_sha1_first1mb != "":
+        log(f"[Detector Check] sha1(first1MB) expected = {expected_sha1_first1mb}")
+        if actual != expected_sha1_first1mb:
+            raise RuntimeError(
+                "Detector sha1(first1MB) mismatch. Refusing to continue.\n"
+                f"  actual   = {actual}\n"
+                f"  expected = {expected_sha1_first1mb}"
+            )
+
+    ckpt = torch.load(str(p), map_location="cpu")
+    sd = extract_state_dict(ckpt)
+
+    # Common prefix cleanup
+    sd = strip_prefix(sd, "module.")
+    # Sometimes a wrapper saved net.*; sometimes saved raw torchvision features.* / classifier.*
+    # We will decide model shape based on keys.
+    keys0 = list(sd.keys())[:20]
+    log(f"[Detector Check] first keys sample: {keys0}")
+
+    # Case-1: keys look like raw torchvision efficientnet ('features.', 'classifier.')
+    if has_key_prefix(sd, "features.") or has_key_prefix(sd, "classifier."):
+        det = EffNetV2SBinary(pretrained=False)
+        # det.net state_dict expects 'features.*' 'classifier.*' etc
+        missing, unexpected = det.net.load_state_dict(sd, strict=False)
+        # sanity check: must have loaded a good chunk
+        if len(missing) > 200:
+            raise RuntimeError(
+                f"Detector load seems broken (too many missing keys: {len(missing)}). "
+                f"Example missing: {missing[:10]} / unexpected: {unexpected[:10]}"
+            )
+        log(f"[Detector] loaded into torchvision EfficientNetV2-S (raw). missing={len(missing)} unexpected={len(unexpected)}")
+        det = det.to(device).eval()
+        return det
+
+    # Case-2: keys look like wrapper net.features.*
+    if has_key_prefix(sd, "net.features.") or has_key_prefix(sd, "net.classifier."):
+        # we can load into EffNetV2SBinary but need to add/remove 'net.' appropriately.
+        det = EffNetV2SBinary(pretrained=False)
+        sd2 = strip_prefix(sd, "net.")
+        missing, unexpected = det.net.load_state_dict(sd2, strict=False)
+        if len(missing) > 200:
+            raise RuntimeError(
+                f"Detector load seems broken (too many missing keys: {len(missing)}). "
+                f"Example missing: {missing[:10]} / unexpected: {unexpected[:10]}"
+            )
+        log(f"[Detector] loaded into torchvision EfficientNetV2-S (from net.*). missing={len(missing)} unexpected={len(unexpected)}")
+        det = det.to(device).eval()
+        return det
+
+    # Unknown naming => refuse (strict)
+    raise RuntimeError(
+        "Detector state_dict key naming not recognized. "
+        "Expected prefixes: features.* / classifier.* OR net.features.*.\n"
+        f"First keys: {keys0}"
+    )
+
+
+@torch.no_grad()
+def detector_predict_prob(detector: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B,3,H,W] normalized
+    return prob: [B]
+    """
+    logits = detector(x)  # [B]
+    prob = torch.sigmoid(logits)
+    return prob
+
+
+# -----------------------------
+# Inference with TTA
+# -----------------------------
+@torch.no_grad()
+def forward_tta(model: nn.Module,
+                x: torch.Tensor,
+                tta_hflip: bool,
+                tta_vflip: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    x: [1,3,H,W]
+    returns:
+      prob: [H,W] float
+      emb: [C,H,W] float (L2 norm)
+    """
+    assert x.shape[0] == 1
+
+    def _run(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits, emb = model(inp)
+        prob = torch.sigmoid(logits)[0, 0]  # [H,W]
+        emb0 = emb[0]  # [C,H,W]
+        return prob, emb0
+
+    probs_acc = None
+    emb_acc = None
+    cnt = 0
+
+    # base
+    p0, e0 = _run(x)
+    probs_acc = p0.clone()
+    emb_acc = e0.clone()
+    cnt += 1
+
+    # hflip
+    if tta_hflip:
+        xh = torch.flip(x, dims=[3])
+        ph, eh = _run(xh)
+        ph = torch.flip(ph, dims=[1])
+        eh = torch.flip(eh, dims=[2])
+        probs_acc += ph
+        emb_acc += eh
+        cnt += 1
+
+    # vflip
+    if tta_vflip:
+        xv = torch.flip(x, dims=[2])
+        pv, ev = _run(xv)
+        pv = torch.flip(pv, dims=[0])
+        ev = torch.flip(ev, dims=[1])
+        probs_acc += pv
+        emb_acc += ev
+        cnt += 1
+
+    # hv
+    if tta_hflip and tta_vflip:
+        xhv = torch.flip(x, dims=[2,3])
+        phv, ehv = _run(xhv)
+        phv = torch.flip(phv, dims=[0,1])
+        ehv = torch.flip(ehv, dims=[1,2])
+        probs_acc += phv
+        emb_acc += ehv
+        cnt += 1
+
+    probs_acc = probs_acc / float(cnt)
+    emb_acc = emb_acc / float(cnt)
+    emb_acc = F.normalize(emb_acc, p=2, dim=0)
+    return probs_acc, emb_acc
+
+
+# -----------------------------
+# Embedding-based instance splitting with DBSCAN within CC
+# -----------------------------
+def split_instances_with_embedding(prob: np.ndarray,
+                                  emb: np.ndarray,
+                                  fg_thr: float,
+                                  min_area: int,
+                                  big_cc_area: int,
+                                  dbscan_eps: float,
+                                  dbscan_min_samples: int,
+                                  spatial_weight: float,
+                                  nms_iou_thr: float,
+                                  max_instances_per_image: int) -> List[Tuple[np.ndarray, float]]:
+    """
+    prob: [H,W] float in [0,1]
+    emb: [C,H,W] float L2-normalized
+    returns list of (mask[H,W] bool, score float)
+    """
+    if not _HAS_SKLEARN:
+        raise RuntimeError("DBSCAN requires scikit-learn. Please install scikit-learn in the environment.")
+    H, W = prob.shape
+    fg = (prob >= fg_thr).astype(np.uint8)
+    if fg.sum() < min_area:
+        return []
+
+    # CC on foreground
+    labels, n_cc = connected_components(fg)
+    instances: List[np.ndarray] = []
+    scores: List[float] = []
+
+    for cc_id in range(1, n_cc + 1):
+        m = (labels == cc_id).astype(np.uint8)
+        area = int(m.sum())
+        if area < min_area:
+            continue
+
+        # small CC: keep as one instance (avoid over-split)
+        if area < big_cc_area:
+            inst = (m > 0)
+            s = float(prob[inst].mean()) if inst.sum() > 0 else 0.0
+            instances.append(inst)
+            scores.append(s)
+            continue
+
+        # big CC: use DBSCAN on pixels within CC
+        ys, xs = np.where(m > 0)
+        N = ys.shape[0]
+        if N < max(dbscan_min_samples, min_area):
+            inst = (m > 0)
+            s = float(prob[inst].mean()) if inst.sum() > 0 else 0.0
+            instances.append(inst)
+            scores.append(s)
+            continue
+
+        # feature: [emb_dim + 2]
+        # spatial normalized by H,W then weighted
+        emb_vec = emb[:, ys, xs].T  # [N,C]
+        fy = (ys.astype(np.float32) / max(H-1, 1)) * spatial_weight
+        fx = (xs.astype(np.float32) / max(W-1, 1)) * spatial_weight
+        feat = np.concatenate([emb_vec.astype(np.float32), fy[:, None], fx[:, None]], axis=1)
+
+        # DBSCAN
+        clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, n_jobs=1)
+        lab = clustering.fit_predict(feat)  # -1 noise
+        # if everything noise, fallback to one
+        uniq = [u for u in np.unique(lab).tolist() if u >= 0]
+        if len(uniq) == 0:
+            inst = (m > 0)
+            s = float(prob[inst].mean()) if inst.sum() > 0 else 0.0
+            instances.append(inst)
+            scores.append(s)
+            continue
+
+        # build instance masks per cluster
+        for u in uniq:
+            sel = (lab == u)
+            if int(sel.sum()) < min_area:
+                continue
+            inst_mask = np.zeros((H, W), dtype=bool)
+            inst_mask[ys[sel], xs[sel]] = True
+            # score = mean prob within inst
+            s = float(prob[inst_mask].mean()) if inst_mask.sum() > 0 else 0.0
+            instances.append(inst_mask)
+            scores.append(s)
+
+    if len(instances) == 0:
+        return []
+
+    # NMS + max instances
+    keep = nms_masks(instances, scores, iou_thr=nms_iou_thr)
+    keep = keep[:max_instances_per_image]
+    out = [(instances[i], scores[i]) for i in keep]
+
+    # pixel ownership enforcement: no overlap
+    out_sorted = sorted(out, key=lambda x: x[1], reverse=True)
+    owned = np.zeros((H, W), dtype=bool)
+    final: List[Tuple[np.ndarray, float]] = []
+    for m, s in out_sorted:
+        m2 = np.logical_and(m, np.logical_not(owned))
+        if int(m2.sum()) < min_area:
+            continue
+        owned = np.logical_or(owned, m2)
+        final.append((m2, s))
+        if len(final) >= max_instances_per_image:
+            break
+
+    return final
+
+
+# -----------------------------
+# Grad-CAM (for ship-present images only)
+# - We compute CAM from last encoder feature (enc4 output)
+# - Use enable_grad locally to avoid no_grad conflict
+# -----------------------------
+def compute_gradcam(model: UNetResNet34,
+                    x: torch.Tensor,
+                    target_mask_logits: torch.Tensor) -> np.ndarray:
+    """
+    x: [1,3,H,W] normalized
+    target_mask_logits: [1,1,H,W] (from a forward pass) OR recompute inside
+    returns cam: [H,W] float in [0,1]
+    """
+    # We recompute inside with gradients to be safe.
+    model.zero_grad(set_to_none=True)
+
+    with torch.enable_grad():
+        x2 = x.detach().clone()
+        x2.requires_grad_(True)
+
+        logits, _emb = model(x2)  # logits requires grad
+        # target score: sum of logits over predicted foreground region (or overall)
+        # safer: take mean over top-k logits to focus on ship regions
+        l = logits[0, 0]  # [H,W]
+        # pick top-k
+        k = min(5000, l.numel())
+        topk = torch.topk(l.reshape(-1), k=k, largest=True).values
+        score = topk.mean()
+        score.backward()
+
+        feat, grad = model.get_cam_feat_grad()
+        if feat is None or grad is None:
+            return np.zeros((x.shape[2], x.shape[3]), dtype=np.float32)
+
+        # Grad-CAM weights: global average pool over spatial dims
+        w = grad.mean(dim=(2, 3), keepdim=True)  # [1,C,1,1] but feat is [1,C,h,w]
+        cam = (w * feat).sum(dim=1, keepdim=True)  # [1,1,h,w]
+        cam = F.relu(cam)
+
+        # upsample to input size
+        cam = F.interpolate(cam, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
+        cam = cam[0, 0]
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-7)
+
+    return cam.detach().cpu().numpy().astype(np.float32)
+
+
+def overlay_heatmap_on_image(img_rgb: np.ndarray, heat: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    """
+    img_rgb: [H,W,3] uint8
+    heat: [H,W] float 0..1
+    returns overlay [H,W,3] uint8
+    """
+    if not _HAS_CV2:
+        # simple grayscale overlay if no cv2
+        h = (heat * 255).astype(np.uint8)
+        h3 = np.stack([h, h, h], axis=-1)
+        out = (img_rgb.astype(np.float32) * (1 - alpha) + h3.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+        return out
+
+    heat_u8 = (heat * 255).astype(np.uint8)
+    hm = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)  # BGR
+    hm = cv2.cvtColor(hm, cv2.COLOR_BGR2RGB)
+    out = (img_rgb.astype(np.float32) * (1 - alpha) + hm.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+    return out
+
+
+def draw_mask_overlay(img_rgb: np.ndarray, mask: np.ndarray, alpha: float = 0.35) -> np.ndarray:
+    """
+    mask: [H,W] bool or 0/1
+    """
+    m = (mask > 0).astype(np.uint8)
+    out = img_rgb.copy()
+    # color: green-ish
+    color = np.array([40, 220, 40], dtype=np.float32)
+    out_f = out.astype(np.float32)
+    out_f[m == 1] = (1 - alpha) * out_f[m == 1] + alpha * color
+    return out_f.clip(0, 255).astype(np.uint8)
+
+
+def concat3_horiz(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    # all [H,W,3]
+    H = min(a.shape[0], b.shape[0], c.shape[0])
+    a2 = a[:H]
+    b2 = b[:H]
+    c2 = c[:H]
+    return np.concatenate([a2, b2, c2], axis=1)
+
+
+# -----------------------------
+# Split creation (strict: disjoint train/val/ptest)
+# - train size determined by train_pos and pos:neg=8:2 => neg = train_pos*0.25
+# - val_total and val_pos_rate
+# - ptest_total and ptest_pos_rate
+# -----------------------------
+def make_splits(all_train_ids: List[str],
+                id2rles: Dict[str, List[str]],
+                seed: int,
+                train_pos: int,
+                val_total: int,
+                val_pos_rate: float,
+                ptest_total: int,
+                ptest_pos_rate: Optional[float]) -> Dict[str, Any]:
+    rng = np.random.RandomState(seed)
+
+    # define pos/neg pools based on id2rles presence
+    pos_ids = [i for i in all_train_ids if i in id2rles and len(id2rles[i]) > 0]
+    neg_ids = [i for i in all_train_ids if i not in id2rles or len(id2rles[i]) == 0]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    total_pos = len(pos_ids)
+    total_neg = len(neg_ids)
+
+    # compute counts
+    train_neg = int(round(train_pos * 0.25))  # 8:2 => neg = pos*(2/8)=pos/4
+    val_pos = int(round(val_total * val_pos_rate))
+    val_neg = val_total - val_pos
+
+    if ptest_pos_rate is None:
+        ptest_pos_rate = val_pos_rate
+    ptest_pos = int(round(ptest_total * ptest_pos_rate))
+    ptest_neg = ptest_total - ptest_pos
+
+    # reserve val+ptest from pools WITHOUT overlap
+    # We first allocate val and ptest from the pools; remaining is train pool.
+    need_pos_for_holdout = val_pos + ptest_pos
+    need_neg_for_holdout = val_neg + ptest_neg
+
+    if need_pos_for_holdout > total_pos:
+        log(f"[WARN] not enough pos for val+ptest (need {need_pos_for_holdout}, have {total_pos}). Will reduce holdout pos.")
+        need_pos_for_holdout = total_pos
+    if need_neg_for_holdout > total_neg:
+        log(f"[WARN] not enough neg for val+ptest (need {need_neg_for_holdout}, have {total_neg}). Will reduce holdout neg.")
+        need_neg_for_holdout = total_neg
+
+    holdout_pos = pos_ids[:need_pos_for_holdout]
+    holdout_neg = neg_ids[:need_neg_for_holdout]
+    rem_pos = pos_ids[need_pos_for_holdout:]
+    rem_neg = neg_ids[need_neg_for_holdout:]
+
+    # now split holdout into val and ptest
+    val_pos_ids = holdout_pos[:min(val_pos, len(holdout_pos))]
+    ptest_pos_ids = holdout_pos[min(val_pos, len(holdout_pos)) : min(val_pos + ptest_pos, len(holdout_pos))]
+
+    val_neg_ids = holdout_neg[:min(val_neg, len(holdout_neg))]
+    ptest_neg_ids = holdout_neg[min(val_neg, len(holdout_neg)) : min(val_neg + ptest_neg, len(holdout_neg))]
+
+    # train pools are rem_pos/rem_neg
+    # sample train pos (oversample allowed, but only from rem_pos)
+    if len(rem_pos) == 0:
+        raise RuntimeError("No remaining positive IDs for training after holdout allocation. Reduce val/ptest or check pools.")
+
+    if train_pos <= len(rem_pos):
+        train_pos_ids = rem_pos[:train_pos]
+        pos_oversampled = 0
+    else:
+        # oversample with replacement
+        extra = train_pos - len(rem_pos)
+        extra_ids = rng.choice(rem_pos, size=extra, replace=True).tolist()
+        train_pos_ids = rem_pos + extra_ids
+        pos_oversampled = extra
+
+    # sample train neg (prefer no replacement)
+    if train_neg <= len(rem_neg):
+        train_neg_ids = rem_neg[:train_neg]
+        neg_oversampled = 0
+    else:
+        extra = train_neg - len(rem_neg)
+        extra_ids = rng.choice(rem_neg, size=extra, replace=True).tolist()
+        train_neg_ids = rem_neg + extra_ids
+        neg_oversampled = extra
+
+    # final sets (note: train may contain duplicates due to oversample, but IDs must not overlap with val/ptest IDs)
+    val_ids = val_pos_ids + val_neg_ids
+    ptest_ids = ptest_pos_ids + ptest_neg_ids
+
+    holdout_set = set(val_ids) | set(ptest_ids)
+    # ensure train unique base pool doesn't contain holdout
+    # train_pos_ids and train_neg_ids are from rem pools already, so should be disjoint.
+    if any(i in holdout_set for i in train_pos_ids):
+        raise RuntimeError("Leak detected: some train_pos ids are in holdout.")
+    if any(i in holdout_set for i in train_neg_ids):
+        raise RuntimeError("Leak detected: some train_neg ids are in holdout.")
+
+    # build train list with shuffle
+    train_ids = train_pos_ids + train_neg_ids
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+    rng.shuffle(ptest_ids)
+
+    out = {
+        "seed": seed,
+        "counts": {
+            "all_train_total": len(all_train_ids),
+            "all_pos": total_pos,
+            "all_neg": total_neg,
+            "train_pos": len(train_pos_ids),
+            "train_neg": len(train_neg_ids),
+            "val_pos": len(val_pos_ids),
+            "val_neg": len(val_neg_ids),
+            "ptest_pos": len(ptest_pos_ids),
+            "ptest_neg": len(ptest_neg_ids),
+            "pos_oversampled_in_train": pos_oversampled,
+            "neg_oversampled_in_train": neg_oversampled,
+        },
+        "ids": {
+            "train": train_ids,
+            "val": val_ids,
+            "ptest": ptest_ids
+        }
+    }
+    return out
+
+
+# -----------------------------
+# Train / Eval loops
+# -----------------------------
+def train_one_epoch(model: nn.Module,
+                    loader: DataLoader,
+                    optimizer: optim.Optimizer,
+                    device: torch.device,
+                    tversky_alpha: float,
+                    tversky_beta: float,
+                    emb_dim: int,
+                    near_mode: str,
+                    near_sigma_px: float,
+                    near_min_weight: float,
+                    emb_weight: float = 1.0,
+                    max_grad_norm: float = 0.0) -> Dict[str, float]:
+    model.train()
+    loss_sum = 0.0
+    bce_sum = 0.0
+    tv_sum = 0.0
+    emb_sum = 0.0
+    n = 0
+
+    for it, batch in enumerate(loader):
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["union"].to(device, non_blocking=True)
+        insts_list = batch["insts"]  # list length B
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits, emb = model(x)  # logits [B,1,H,W], emb [B,C,H,W]
+        bce = bce_loss_from_logits(logits, y)
+        tv = tversky_loss_from_logits(logits, y, alpha=tversky_alpha, beta=tversky_beta)
+
+        # embedding loss (per-sample)
+        emb_losses = []
+        B = x.shape[0]
+        for bi in range(B):
+            insts = insts_list[bi]
+            # insts: list of [H,W] uint8 tensors
+            emb_b = emb[bi]  # [C,H,W]
+            emb_l = embedding_instance_loss(
+                emb=emb_b,
+                inst_masks=insts,
+                near_mode=near_mode,
+                near_sigma_px=near_sigma_px,
+                near_min_weight=near_min_weight,
+                delta_push=1.0
+            )
+            emb_losses.append(emb_l)
+        emb_l = torch.stack(emb_losses).mean() if len(emb_losses) > 0 else torch.zeros([], device=device)
+
+        loss = bce + tv + emb_weight * emb_l
+        loss.backward()
+
+        if max_grad_norm and max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+        optimizer.step()
+
+        loss_sum += float(loss.detach().cpu().item())
+        bce_sum += float(bce.detach().cpu().item())
+        tv_sum += float(tv.detach().cpu().item())
+        emb_sum += float(emb_l.detach().cpu().item())
+        n += 1
+
+        if (it + 1) % 50 == 0:
+            log(f"  iter {it+1}/{len(loader)} loss={loss_sum/n:.4f} bce={bce_sum/n:.4f} tv={tv_sum/n:.4f} emb={emb_sum/n:.4f}")
+
+    return {"loss": loss_sum/max(n,1), "bce": bce_sum/max(n,1), "tversky": tv_sum/max(n,1), "emb": emb_sum/max(n,1)}
+
+
+@torch.no_grad()
+def eval_union_metrics(model: nn.Module,
+                       loader: DataLoader,
+                       device: torch.device,
+                       fg_thr: float = 0.5) -> Dict[str, float]:
+    model.eval()
+    agg = {"tp":0.0,"fp":0.0,"fn":0.0,"tn":0.0}
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["union"].cpu().numpy()[:,0]  # [B,H,W]
+        logits, _emb = model(x)
+        prob = torch.sigmoid(logits).detach().cpu().numpy()[:,0]  # [B,H,W]
+        for i in range(prob.shape[0]):
+            pred = (prob[i] >= fg_thr).astype(np.uint8)
+            gt = (y[i] >= 0.5).astype(np.uint8)
+            m = compute_pixel_metrics(pred, gt)
+            agg["tp"] += m["tp"]; agg["fp"] += m["fp"]; agg["fn"] += m["fn"]; agg["tn"] += m["tn"]
+
+    eps = 1e-9
+    tp, fp, fn, tn = agg["tp"], agg["fp"], agg["fn"], agg["tn"]
+    precision = tp/(tp+fp+eps)
+    recall = tp/(tp+fn+eps)
+    f1 = 2*precision*recall/(precision+recall+eps)
+    beta2 = 4.0
+    f2 = (1+beta2)*precision*recall/(beta2*precision+recall+eps)
+    iou = tp/(tp+fp+fn+eps)
+    acc = (tp+tn)/(tp+tn+fp+fn+eps)
+    return {"precision":precision,"recall":recall,"f1":f1,"f2":f2,"iou":iou,"acc":acc}
+
+
+# -----------------------------
+# Inference runner: produce variable-row submission and visualization
+# -----------------------------
+@torch.no_grad()
+def run_inference_on_ids(model: UNetResNet34,
+                         detector: Optional[nn.Module],
+                         img_dir: Path,
+                         ids: List[str],
+                         out_dir: Path,
+                         device: torch.device,
+                         infer_size: int,
+                         tta_hflip: bool,
+                         tta_vflip: bool,
+                         det_gate: bool,
+                         det_thr: float,
+                         fg_thr: float,
+                         min_area: int,
+                         big_cc_area: int,
+                         dbscan_eps: float,
+                         dbscan_min_samples: int,
+                         spatial_weight: float,
+                         nms_iou_thr: float,
+                         max_instances_per_image: int,
+                         save_vis: bool,
+                         vis_max_images: int,
+                         tag: str,
+                         use_template_order: Optional[List[str]] = None) -> Path:
+    """
+    If use_template_order is provided, we output in that order for submission compatibility.
+    Otherwise, we output rows for given ids order.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir = out_dir / f"vis_{tag}"
+    if save_vis:
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+    # output CSV path
+    out_csv = out_dir / f"submission_{tag}.csv"
+    rows: List[Tuple[str, str]] = []
+
+    model.eval()
+    if detector is not None:
+        detector.eval()
+
+    # helper to load + preprocess image
+    def load_preprocess(img_path: Path) -> Tuple[torch.Tensor, np.ndarray]:
+        img_pil = pil_load_rgb(img_path)
+        img = np.asarray(img_pil)  # H,W,3
+        img_rs = resize_to_square_np(img, infer_size, is_mask=False)  # H,W,3
+        x = torch.from_numpy(img_rs).permute(2,0,1).float()/255.0
+        x = normalize_img(x)
+        return x.unsqueeze(0), img_rs
+
+    # decide iteration list
+    if use_template_order is not None:
+        iter_ids = use_template_order
+    else:
+        iter_ids = ids
+
+    vis_count = 0
+
+    for k, img_id in enumerate(iter_ids):
+        img_path = img_dir / img_id
+        if not img_path.exists():
+            # If template includes ids not in dir, keep empty
+            rows.append((img_id, ""))
+            continue
+
+        x, img_rs = load_preprocess(img_path)
+        x = x.to(device)
+
+        # detector gating
+        det_prob = None
+        if detector is not None:
+            det_prob_t = detector_predict_prob(detector, x)
+            det_prob = float(det_prob_t[0].detach().cpu().item())
+
+        if det_gate and detector is not None:
+            if det_prob is None or det_prob < det_thr:
+                # shipless -> exactly one empty row
+                rows.append((img_id, ""))
+                continue
+
+        # model forward (TTA)
+        prob_t, emb_t = forward_tta(model, x, tta_hflip=tta_hflip, tta_vflip=tta_vflip)
+        prob = prob_t.detach().cpu().numpy().astype(np.float32)
+        emb = emb_t.detach().cpu().numpy().astype(np.float32)  # [C,H,W]
+
+        # instance split
+        insts = split_instances_with_embedding(
+            prob=prob,
+            emb=emb,
+            fg_thr=fg_thr,
+            min_area=min_area,
+            big_cc_area=big_cc_area,
+            dbscan_eps=dbscan_eps,
+            dbscan_min_samples=dbscan_min_samples,
+            spatial_weight=spatial_weight,
+            nms_iou_thr=nms_iou_thr,
+            max_instances_per_image=max_instances_per_image
+        )
+
+        if len(insts) == 0:
+            rows.append((img_id, ""))
+        else:
+            # multiple rows
+            for m, s in insts:
+                rle = rle_encode(m.astype(np.uint8))
+                if rle == "":
+                    continue
+                rows.append((img_id, rle))
+            # ensure at least one row exists
+            if len([r for r in rows if r[0] == img_id]) == 0:
+                rows.append((img_id, ""))
+
+        # visualization: ship-present only (after det_gate)
+        if save_vis and vis_count < vis_max_images:
+            # union mask for overlay
+            union = (prob >= fg_thr).astype(np.uint8)
+            img_overlay = draw_mask_overlay(img_rs, union, alpha=0.35)
+
+            # Grad-CAM (only for model positive-ish)
+            cam = compute_gradcam(model, x, target_mask_logits=None)  # recompute inside
+            img_cam = overlay_heatmap_on_image(img_rs, cam, alpha=0.45)
+
+            # concat and save
+            vis = concat3_horiz(img_rs, img_overlay, img_cam)
+            # add simple text info using cv2 if available
+            if _HAS_CV2:
+                txt = f"id={img_id} det={det_prob:.5f} fg_thr={fg_thr:.2f}"
+                cv2.putText(vis, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                cv2.putText(vis, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
+
+            out_path = vis_dir / f"vis__{k:06d}__{img_id.replace('/', '_')}.jpg"
+            Image.fromarray(vis).save(str(out_path), quality=92)
+            vis_count += 1
+
+        if (k + 1) % 500 == 0:
+            log(f"[infer:{tag}] {k+1}/{len(iter_ids)} done ...")
+
+    # Write CSV
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id, rle in rows:
+            w.writerow([img_id, rle])
+
+    log(f"[infer:{tag}] saved: {out_csv}  rows={len(rows)}")
+    if save_vis:
+        log(f"[infer:{tag}] vis_dir: {vis_dir}  vis_saved={vis_count}")
+    return out_csv
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--mode", type=str, default="all", choices=["split", "train", "infer", "all"])
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--run_dir", type=str, required=True)
+    p.add_argument("--seed", type=int, default=42)
+
+    # splits
+    p.add_argument("--train_pos", type=int, default=50000)
+    p.add_argument("--val_total", type=int, default=30000)
+    p.add_argument("--val_pos_rate", type=float, default=0.221)
+    p.add_argument("--ptest_total", type=int, default=3000)
+    p.add_argument("--ptest_pos_rate", type=float, default=-1.0)  # -1 => use val_pos_rate
+
+    # training
+    p.add_argument("--phase1_epochs", type=int, default=6)
+    p.add_argument("--phase2_epochs", type=int, default=4)
+    p.add_argument("--phase1_bs", type=int, default=4)
+    p.add_argument("--phase2_bs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--max_grad_norm", type=float, default=0.0)
+    p.add_argument("--num_workers", type=int, default=4)
+
+    # loss
+    p.add_argument("--tversky_alpha", type=float, default=0.3)
+    p.add_argument("--tversky_beta", type=float, default=0.7)
+    p.add_argument("--emb_dim", type=int, default=16)
+    p.add_argument("--emb_weight", type=float, default=1.0)
+    p.add_argument("--near_mode", type=str, default="soft", choices=["soft", "hard"])
+    p.add_argument("--near_sigma_px", type=float, default=140.0)
+    p.add_argument("--near_min_weight", type=float, default=0.05)
+
+    # phase2 multi-scale
+    p.add_argument("--ms_sizes", type=str, default="640,704,768,832,896")
+
+    # detector
+    p.add_argument("--detector_ckpt", type=str, default="")
+    p.add_argument("--detector_expected_sha1_first1mb", type=str, default="")
+    p.add_argument("--det_gate", type=int, default=1)
+    p.add_argument("--det_thr", type=float, default=0.004130961839109659)
+
+    # inference
+    p.add_argument("--infer_size", type=int, default=768)
+    p.add_argument("--tta_hflip", type=int, default=1)
+    p.add_argument("--tta_vflip", type=int, default=0)
+    p.add_argument("--fg_thr", type=float, default=0.05)
+    p.add_argument("--min_area", type=int, default=50)
+    p.add_argument("--big_cc_area", type=int, default=600)
+
+    p.add_argument("--dbscan_eps", type=float, default=0.6)
+    p.add_argument("--dbscan_min_samples", type=int, default=30)
+    p.add_argument("--spatial_weight", type=float, default=0.02)
+
+    p.add_argument("--nms_iou_thr", type=float, default=0.50)
+    p.add_argument("--max_instances_per_image", type=int, default=15)
+
+    # vis
+    p.add_argument("--save_vis", type=int, default=1)
+    p.add_argument("--vis_max_images", type=int, default=200)
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    seed_all(args.seed)
+
+    data_dir = Path(args.data_dir)
+    run_dir = Path(args.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # open log
+    global _GLOBAL_LOG_F
+    _GLOBAL_LOG_F = open(str(run_dir / "log_global.txt"), "a", encoding="utf-8")
+
+    log("==== START ====")
+    log(f"args = {vars(args)}")
+
+    # env checks
+    if not _HAS_SKLEARN:
+        raise RuntimeError("scikit-learn is required for DBSCAN. Please install it in the environment.")
+    if not (_HAS_CV2 or _HAS_SCIPY):
+        raise RuntimeError("Either opencv-python-headless (cv2) or scipy is required for connected components/morphology.")
+
+    train_img_dir = data_dir / "train_v2"
+    test_img_dir = data_dir / "test_v2"
+    train_csv = data_dir / "train_ship_segmentations_v2.csv"
+    sample_csv = data_dir / "sample_submission_v2.csv"
+
+    if not train_img_dir.exists():
+        raise FileNotFoundError(f"Missing train_v2 dir: {train_img_dir}")
+    if not test_img_dir.exists():
+        raise FileNotFoundError(f"Missing test_v2 dir: {test_img_dir}")
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Missing train_ship_segmentations_v2.csv: {train_csv}")
+    if not sample_csv.exists():
+        raise FileNotFoundError(f"Missing sample_submission_v2.csv: {sample_csv}")
+
+    # device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"device = {device}")
+
+    # load id2rles
+    log("Loading CSV id2rles ...")
+    id2rles = load_id2rles(train_csv)
+    log(f"train images in csv (pos only) = {len(id2rles)}")
+
+    # list all train ids from directory (critical)
+    all_train_ids = sorted([p.name for p in train_img_dir.glob("*.jpg")])
+    log(f"train images (dir-based) = {len(all_train_ids)}")
+
+    # make / load splits
+    splits_path = run_dir / "splits.json"
+    if args.mode in ["split", "train", "infer", "all"]:
+        if args.mode == "split" or (not splits_path.exists()):
+            log("Creating splits ...")
+            ptest_pos_rate = None if args.ptest_pos_rate < 0 else float(args.ptest_pos_rate)
+            splits = make_splits(
+                all_train_ids=all_train_ids,
+                id2rles=id2rles,
+                seed=args.seed,
+                train_pos=int(args.train_pos),
+                val_total=int(args.val_total),
+                val_pos_rate=float(args.val_pos_rate),
+                ptest_total=int(args.ptest_total),
+                ptest_pos_rate=ptest_pos_rate
+            )
+            with open(splits_path, "w", encoding="utf-8") as f:
+                json.dump(splits, f, indent=2)
+            log(f"Saved splits: {splits_path} ({splits_path.stat().st_size/1e6:.2f}MB)")
+            log(f"[Split Summary] {splits['counts']}")
+        else:
+            log(f"Loading existing splits: {splits_path}")
+            with open(splits_path, "r", encoding="utf-8") as f:
+                splits = json.load(f)
+            log(f"[Split Summary] {splits['counts']}")
+
+    if args.mode == "split":
+        log("Split-only mode done.")
+        log("==== END ====")
+        return
+
+    # build datasets
+    ms_sizes = [int(x) for x in args.ms_sizes.split(",") if x.strip() != ""]
+    train_ids = splits["ids"]["train"]
+    val_ids = splits["ids"]["val"]
+    ptest_ids = splits["ids"]["ptest"]
+
+    # Phase1 datasets (fixed 768)
+    ds_train_p1 = AirbusDataset(train_img_dir, train_ids, id2rles, out_size=768, multi_scale=False, augment=True)
+    ds_val = AirbusDataset(train_img_dir, val_ids, id2rles, out_size=768, multi_scale=False, augment=False)
+    ds_ptest = AirbusDataset(train_img_dir, ptest_ids, id2rles, out_size=768, multi_scale=False, augment=False)
+
+    dl_train_p1 = DataLoader(ds_train_p1, batch_size=args.phase1_bs, shuffle=True,
+                             num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+    dl_val = DataLoader(ds_val, batch_size=2, shuffle=False,
+                        num_workers=max(1, args.num_workers//2), pin_memory=True, collate_fn=collate_fn)
+    dl_ptest = DataLoader(ds_ptest, batch_size=1, shuffle=False,
+                          num_workers=max(1, args.num_workers//2), pin_memory=True, collate_fn=collate_fn)
+
+    # Phase2 datasets (multi-scale)
+    ds_train_p2 = AirbusDataset(train_img_dir, train_ids, id2rles, out_size=768, multi_scale=True, ms_sizes=ms_sizes, augment=True)
+    dl_train_p2 = DataLoader(ds_train_p2, batch_size=args.phase2_bs, shuffle=True,
+                             num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+
+    # model
+    model = UNetResNet34(emb_dim=args.emb_dim, pretrained=True).to(device)
+
+    # optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # detector (optional but recommended)
+    detector = None
+    det_gate = bool(int(args.det_gate))
+    if args.detector_ckpt and args.detector_ckpt.strip() != "":
+        detector = load_detector_checked(
+            detector_ckpt_path=args.detector_ckpt,
+            device=device,
+            expected_sha1_first1mb=args.detector_expected_sha1_first1mb
+        )
+    else:
+        log("[WARN] detector_ckpt not provided. det_gate will be disabled.")
+        det_gate = False
+
+    # train
+    ckpt_path = run_dir / "best_model.pt"
+    meta_path = run_dir / "meta.json"
+
+    best_val_f2 = -1.0
+    best_epoch = -1
+    best_phase = "none"
+
+    if args.mode in ["train", "all"]:
+        log("==== TRAIN PHASE1 (fixed 768) ====")
+        for ep in range(args.phase1_epochs):
+            log(f"Phase1 epoch {ep+1}/{args.phase1_epochs}")
+            tr = train_one_epoch(
+                model=model, loader=dl_train_p1, optimizer=optimizer, device=device,
+                tversky_alpha=args.tversky_alpha, tversky_beta=args.tversky_beta,
+                emb_dim=args.emb_dim,
+                near_mode=args.near_mode, near_sigma_px=args.near_sigma_px, near_min_weight=args.near_min_weight,
+                emb_weight=args.emb_weight, max_grad_norm=args.max_grad_norm
+            )
+            log(f"[Phase1][train] {tr}")
+
+            # eval (union pixel metrics for sanity)
+            ev = eval_union_metrics(model, dl_val, device, fg_thr=args.fg_thr)
+            log(f"[Phase1][val] {ev}")
+
+            if ev["f2"] > best_val_f2:
+                best_val_f2 = ev["f2"]
+                best_epoch = ep + 1
+                best_phase = "phase1"
+                torch.save({
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "best_val_f2": best_val_f2,
+                    "best_epoch": best_epoch,
+                    "best_phase": best_phase,
+                    "args": vars(args),
+                    "splits": splits
+                }, ckpt_path)
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "best_val_f2": best_val_f2,
+                        "best_epoch": best_epoch,
+                        "best_phase": best_phase,
+                        "fg_thr": args.fg_thr
+                    }, f, indent=2)
+                log(f"[CKPT] saved best_model.pt (best_val_f2={best_val_f2:.6f})")
+
+        log("==== TRAIN PHASE2 (multi-scale) ====")
+        for ep in range(args.phase2_epochs):
+            log(f"Phase2 epoch {ep+1}/{args.phase2_epochs}")
+            tr = train_one_epoch(
+                model=model, loader=dl_train_p2, optimizer=optimizer, device=device,
+                tversky_alpha=args.tversky_alpha, tversky_beta=args.tversky_beta,
+                emb_dim=args.emb_dim,
+                near_mode=args.near_mode, near_sigma_px=args.near_sigma_px, near_min_weight=args.near_min_weight,
+                emb_weight=args.emb_weight, max_grad_norm=args.max_grad_norm
+            )
+            log(f"[Phase2][train] {tr}")
+
+            ev = eval_union_metrics(model, dl_val, device, fg_thr=args.fg_thr)
+            log(f"[Phase2][val] {ev}")
+
+            if ev["f2"] > best_val_f2:
+                best_val_f2 = ev["f2"]
+                best_epoch = ep + 1
+                best_phase = "phase2"
+                torch.save({
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "best_val_f2": best_val_f2,
+                    "best_epoch": best_epoch,
+                    "best_phase": best_phase,
+                    "args": vars(args),
+                    "splits": splits
+                }, ckpt_path)
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "best_val_f2": best_val_f2,
+                        "best_epoch": best_epoch,
+                        "best_phase": best_phase,
+                        "fg_thr": args.fg_thr
+                    }, f, indent=2)
+                log(f"[CKPT] saved best_model.pt (best_val_f2={best_val_f2:.6f})")
+
+    # load best checkpoint for inference
+    if ckpt_path.exists():
+        log(f"Loading best model ckpt: {ckpt_path}")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        model.load_state_dict(sd, strict=True)
+    else:
+        log("[WARN] best_model.pt not found. Using current in-memory weights for inference.")
+
+    # inference
+    if args.mode in ["infer", "all"]:
+        infer_dir = run_dir / "inference"
+        infer_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- ptest inference (RLE saved + vis) ---
+        log("==== INFER on PTEST (holdout) ====")
+        out_ptest = run_inference_on_ids(
+            model=model, detector=detector,
+            img_dir=train_img_dir,
+            ids=ptest_ids,
+            out_dir=infer_dir,
+            device=device,
+            infer_size=args.infer_size,
+            tta_hflip=bool(args.tta_hflip),
+            tta_vflip=bool(args.tta_vflip),
+            det_gate=det_gate,
+            det_thr=args.det_thr,
+            fg_thr=args.fg_thr,
+            min_area=args.min_area,
+            big_cc_area=args.big_cc_area,
+            dbscan_eps=args.dbscan_eps,
+            dbscan_min_samples=args.dbscan_min_samples,
+            spatial_weight=args.spatial_weight,
+            nms_iou_thr=args.nms_iou_thr,
+            max_instances_per_image=args.max_instances_per_image,
+            save_vis=bool(args.save_vis),
+            vis_max_images=args.vis_max_images,
+            tag="ptest",
+            use_template_order=None
+        )
+
+        # --- Kaggle test inference using sample_submission order ---
+        log("==== INFER on TEST_V2 (Kaggle) ====")
+        template_ids: List[str] = []
+        with open(sample_csv, "r", newline="") as f:
+            rr = csv.DictReader(f)
+            for row in rr:
+                template_ids.append(row["ImageId"])
+        log(f"sample_submission template rows = {len(template_ids)}")
+
+        out_test = run_inference_on_ids(
+            model=model, detector=detector,
+            img_dir=test_img_dir,
+            ids=[],
+            out_dir=infer_dir,
+            device=device,
+            infer_size=args.infer_size,
+            tta_hflip=bool(args.tta_hflip),
+            tta_vflip=bool(args.tta_vflip),
+            det_gate=det_gate,
+            det_thr=args.det_thr,
+            fg_thr=args.fg_thr,
+            min_area=args.min_area,
+            big_cc_area=args.big_cc_area,
+            dbscan_eps=args.dbscan_eps,
+            dbscan_min_samples=args.dbscan_min_samples,
+            spatial_weight=args.spatial_weight,
+            nms_iou_thr=args.nms_iou_thr,
+            max_instances_per_image=args.max_instances_per_image,
+            save_vis=bool(args.save_vis),
+            vis_max_images=args.vis_max_images,
+            tag="testv2",
+            use_template_order=template_ids
+        )
+
+        log(f"[DONE] ptest_submission = {out_ptest}")
+        log(f"[DONE] test_submission  = {out_test}")
+
+    log("==== END ====")
+
+
+if __name__ == "__main__":
+    main()
