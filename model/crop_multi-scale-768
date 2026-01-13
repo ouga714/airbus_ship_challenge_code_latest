@@ -1,0 +1,1329 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_airbus_unet_crop_curriculum_hades.py
+
+Airbus Ship Detection (Kaggle) — HADES environment
+U-Net binary segmentation with:
+- Mixture-of-Crops (POS ship-centered / NEG ship-free / CONTEXT)
+- Curriculum over epochs (Phase1 fixed-size -> Phase2 multi-scale -> Phase3 distribution return)
+- FP32 only (NO AMP)
+- Single GPU / single process (NO DDP)
+- Robust handling for corrupted images
+- End-to-end: split -> train -> val threshold tune -> (optional) infer test_v2 -> submission.csv
+- Optional Grad-CAM visualization (original + pred overlay + grad-cam overlay concat JPEG)
+
+Embedding loss:
+- NOT applied in this version (as requested).
+- Scaffolding hooks are left so you can add embedding head/loss later without rewriting everything.
+
+Dependencies:
+- torch, torchvision, numpy, pillow
+- Optional: opencv-python(-headless) OR scipy (for connected components / morphology)
+
+Notes:
+- IMPORTANT: ALL_TRAIN_IDS must be built from train_v2 directory (CSV contains only positives).
+- Mask resize uses NEAREST.
+- Image resize uses BILINEAR.
+
+Authoring constraints from user:
+- HADES paths under /workspace
+- Copy-paste runnable, no omissions
+"""
+
+import os
+import sys
+import math
+import time
+import json
+import csv
+import random
+import argparse
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------------
+# Optional CC/morph backends
+# -----------------------------
+_HAS_CV2 = False
+_HAS_SCIPY = False
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+if not _HAS_CV2:
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        _HAS_SCIPY = True
+    except Exception:
+        _HAS_SCIPY = False
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def sha1_first_1mb(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(1024 * 1024))
+    return h.hexdigest()
+
+
+def read_csv_rows(path: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+    return rows
+
+
+def rle_decode(rle: str, shape_hw: Tuple[int, int]) -> np.ndarray:
+    """
+    Airbus RLE: runs are 1-indexed, column-major order.
+    shape_hw: (H,W)
+    """
+    if rle is None or rle == "" or (isinstance(rle, float) and math.isnan(rle)):
+        return np.zeros(shape_hw, dtype=np.uint8)
+    s = rle.strip().split()
+    if len(s) < 2:
+        return np.zeros(shape_hw, dtype=np.uint8)
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    H, W = shape_hw
+    img = np.zeros(H * W, dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        if lo < 0:
+            lo = 0
+        if hi > img.size:
+            hi = img.size
+        img[lo:hi] = 1
+    # column-major -> reshape (W,H) then transpose to (H,W)
+    return img.reshape((W, H)).T
+
+
+def mask_to_bbox(mask_u8: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(mask_u8 > 0)
+    if xs.size == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return x0, y0, x1, y1
+
+
+def clip_int(v: int, lo: int, hi: int) -> int:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+# -----------------------------
+# Postprocess: CC + min_area + optional morph
+# -----------------------------
+def binary_open_close(mask01: np.ndarray, k: int = 3, do_open: bool = True, do_close: bool = True) -> np.ndarray:
+    """
+    mask01: uint8 {0,1}
+    """
+    if k <= 1:
+        return mask01
+    if _HAS_CV2:
+        ker = np.ones((k, k), np.uint8)
+        m = (mask01 * 255).astype(np.uint8)
+        if do_open:
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker)
+        if do_close:
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker)
+        return (m > 0).astype(np.uint8)
+    if _HAS_SCIPY:
+        # approximate open/close via binary erosion/dilation
+        structure = np.ones((k, k), dtype=bool)
+        m = mask01.astype(bool)
+        if do_open:
+            m = ndi.binary_opening(m, structure=structure)
+        if do_close:
+            m = ndi.binary_closing(m, structure=structure)
+        return m.astype(np.uint8)
+    # fallback: no-op
+    return mask01
+
+
+def connected_components(mask01: np.ndarray) -> Tuple[int, np.ndarray, List[Tuple[int, int, int, int, int]]]:
+    """
+    Returns:
+      n_cc (excluding background),
+      labels (H,W) int32, background=0,
+      stats list for each component id=1..n_cc: (x,y,w,h,area)
+    """
+    H, W = mask01.shape
+    if _HAS_CV2:
+        num, labels, stats, _centroids = cv2.connectedComponentsWithStats((mask01 > 0).astype(np.uint8), connectivity=8)
+        # num includes background=0
+        out_stats: List[Tuple[int, int, int, int, int]] = []
+        for cid in range(1, num):
+            x, y, w, h, area = stats[cid].tolist()
+            out_stats.append((x, y, w, h, area))
+        return num - 1, labels.astype(np.int32), out_stats
+
+    if _HAS_SCIPY:
+        labels, num = ndi.label(mask01 > 0)
+        out_stats = []
+        for cid in range(1, num + 1):
+            ys, xs = np.where(labels == cid)
+            if xs.size == 0:
+                continue
+            x0, x1 = int(xs.min()), int(xs.max())
+            y0, y1 = int(ys.min()), int(ys.max())
+            area = int(xs.size)
+            out_stats.append((x0, y0, x1 - x0 + 1, y1 - y0 + 1, area))
+        return num, labels.astype(np.int32), out_stats
+
+    # fallback: treat whole mask as one component
+    area = int(mask01.sum())
+    labels = (mask01 > 0).astype(np.int32)
+    if area == 0:
+        return 0, labels, []
+    ys, xs = np.where(mask01 > 0)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return 1, labels, [(x0, y0, x1 - x0 + 1, y1 - y0 + 1, area)]
+
+
+def filter_min_area(mask01: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 1:
+        return mask01
+    n, labels, stats = connected_components(mask01)
+    if n == 0:
+        return mask01
+    keep = np.zeros_like(mask01, dtype=np.uint8)
+    for cid, st in enumerate(stats, start=1):
+        x, y, w, h, area = st
+        if area >= min_area:
+            keep[labels == cid] = 1
+    return keep
+
+
+# -----------------------------
+# Crop Curriculum (Mixture-of-Crops + phase schedule)
+# -----------------------------
+class CropCurriculum:
+    """
+    Phase schedule tied to total_epochs:
+      - Phase 1: fixed-size training (shape acquisition)        -> p_pos high
+      - Phase 2: multi-scale training (robustification)         -> p_neg and ctx increase
+      - Phase 3: distribution return (match inference setting)  -> ctx high, scale range narrow or fixed
+
+    This component only decides crop type + crop size + (optionally) hard-neg selection hook.
+    """
+
+    def __init__(self, total_epochs: int,
+                 phase1_frac: float = 0.25,
+                 phase2_frac: float = 0.55):
+        self.total_epochs = max(1, int(total_epochs))
+        self.phase1_frac = float(phase1_frac)
+        self.phase2_frac = float(phase2_frac)
+
+    def _phase(self, epoch: int) -> int:
+        # epoch: 0-index
+        t = epoch / max(1, self.total_epochs - 1)
+        if t < self.phase1_frac:
+            return 1
+        if t < self.phase1_frac + self.phase2_frac:
+            return 2
+        return 3
+
+    def policy(self, epoch: int) -> Dict:
+        ph = self._phase(epoch)
+        if ph == 1:
+            return dict(p_pos=0.60, p_neg=0.25, crop_sizes=(256, 384, 512),
+                        jitter=0.20, max_ship_frac=5e-4, tag=f"PH1")
+        if ph == 2:
+            return dict(p_pos=0.45, p_neg=0.30, crop_sizes=(384, 512, 768),
+                        jitter=0.20, max_ship_frac=5e-4, tag=f"PH2")
+        return dict(p_pos=0.30, p_neg=0.30, crop_sizes=(512, 768),
+                    jitter=0.15, max_ship_frac=5e-4, tag=f"PH3")
+
+
+def crop_random(img: Image.Image, mask_u8: np.ndarray, s: int) -> Tuple[Image.Image, np.ndarray]:
+    W, H = img.size
+    if W < s or H < s:
+        img2 = img.resize((s, s), Image.BILINEAR)
+        m2 = Image.fromarray(mask_u8).resize((s, s), Image.NEAREST)
+        return img2, np.array(m2, dtype=np.uint8)
+    if W == s and H == s:
+        return img, mask_u8
+    x0 = random.randint(0, W - s)
+    y0 = random.randint(0, H - s)
+    img_c = img.crop((x0, y0, x0 + s, y0 + s))
+    m_c = Image.fromarray(mask_u8).crop((x0, y0, x0 + s, y0 + s))
+    return img_c, np.array(m_c, dtype=np.uint8)
+
+
+def crop_ship_centered(img: Image.Image, mask_u8: np.ndarray, s: int, jitter: float) -> Optional[Tuple[Image.Image, np.ndarray]]:
+    bb = mask_to_bbox(mask_u8)
+    if bb is None:
+        return None
+    x0, y0, x1, y1 = bb
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    W, H = img.size
+    jx = (random.random() * 2 - 1) * (s * jitter)
+    jy = (random.random() * 2 - 1) * (s * jitter)
+    cx2, cy2 = cx + jx, cy + jy
+    x0c = int(round(cx2 - s / 2))
+    y0c = int(round(cy2 - s / 2))
+    x0c = clip_int(x0c, 0, W - s)
+    y0c = clip_int(y0c, 0, H - s)
+    img_c = img.crop((x0c, y0c, x0c + s, y0c + s))
+    m_c = Image.fromarray(mask_u8).crop((x0c, y0c, x0c + s, y0c + s))
+    m_u = np.array(m_c, dtype=np.uint8)
+    # final guard
+    if m_u.max() == 0:
+        return None
+    return img_c, m_u
+
+
+def crop_shipfree(img: Image.Image, mask_u8: np.ndarray, s: int, max_ship_frac: float, tries: int = 25) -> Tuple[Image.Image, np.ndarray]:
+    for _ in range(tries):
+        img_c, m_u = crop_random(img, mask_u8, s)
+        if float(m_u.mean()) <= float(max_ship_frac):
+            return img_c, m_u
+    return crop_random(img, mask_u8, s)
+
+
+# -----------------------------
+# Multi-scale jitter
+# -----------------------------
+def multiscale_resize(img: Image.Image, mask_u8: np.ndarray, base_size: int, scale: float) -> Tuple[Image.Image, np.ndarray]:
+    """
+    Resize (base_size, base_size) then apply scale about it (still square).
+    """
+    s = int(round(base_size * scale))
+    s = max(64, min(1024, s))  # guard
+    img2 = img.resize((s, s), Image.BILINEAR)
+    m2 = Image.fromarray(mask_u8).resize((s, s), Image.NEAREST)
+    return img2, np.array(m2, dtype=np.uint8)
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
+class AirbusSegDataset(Dataset):
+    def __init__(self,
+                 img_dir: str,
+                 id2rles: Dict[str, List[str]],
+                 image_ids: List[str],
+                 train: bool,
+                 base_size: int,
+                 curriculum: Optional[CropCurriculum],
+                 total_epochs: int,
+                 normalize: bool = True,
+                 corrupt_ok: bool = True):
+        self.img_dir = img_dir
+        self.id2rles = id2rles
+        self.image_ids = image_ids
+        self.train = train
+        self.base_size = int(base_size)
+        self.curriculum = curriculum
+        self.total_epochs = int(total_epochs)
+        self.normalize = normalize
+        self.corrupt_ok = corrupt_ok
+        self.epoch = 0
+
+        # ImageNet mean/std (float32)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+        # stats counters (for logging)
+        self._tag_counts = {"POS": 0, "NEG": 0, "CTX": 0}
+        self._size_counts: Dict[int, int] = {}
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def reset_counters(self) -> None:
+        self._tag_counts = {"POS": 0, "NEG": 0, "CTX": 0}
+        self._size_counts = {}
+
+    def get_counters(self) -> Dict:
+        return {"tag_counts": dict(self._tag_counts), "size_counts": dict(self._size_counts)}
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+    def _load_image(self, image_id: str) -> Optional[Image.Image]:
+        p = os.path.join(self.img_dir, image_id)
+        try:
+            with Image.open(p) as im:
+                im = im.convert("RGB")
+            return im
+        except Exception:
+            if self.corrupt_ok:
+                return None
+            raise
+
+    def _build_mask(self, image_id: str, hw: Tuple[int, int]) -> np.ndarray:
+        H, W = hw
+        rles = self.id2rles.get(image_id, [])
+        if not rles:
+            return np.zeros((H, W), dtype=np.uint8)
+        m = np.zeros((H, W), dtype=np.uint8)
+        for rle in rles:
+            m |= rle_decode(rle, (H, W))
+        return m.astype(np.uint8)
+
+    def _to_tensor(self, img: Image.Image, mask_u8: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        # to float32 CHW in [0,1]
+        x = torch.from_numpy(np.array(img, dtype=np.uint8)).permute(2, 0, 1).float() / 255.0
+        y = torch.from_numpy(mask_u8.astype(np.float32)).unsqueeze(0)  # 1,H,W
+        if self.normalize:
+            x = (x - self.mean) / self.std
+        return x, y
+
+    def __getitem__(self, idx: int) -> Dict:
+        image_id = self.image_ids[idx]
+        img = self._load_image(image_id)
+        if img is None:
+            # corrupted -> return a harmless sample (all-zero)
+            # (Trainer will still work; you can also choose to skip by collate.)
+            s = self.base_size
+            dummy = Image.fromarray(np.zeros((s, s, 3), dtype=np.uint8))
+            mask = np.zeros((s, s), dtype=np.uint8)
+            x, y = self._to_tensor(dummy, mask)
+            return {"image_id": image_id, "x": x, "y": y, "tag": "CORRUPT", "crop_size": s}
+
+        # base resize (make it square at base_size for consistent crop logic)
+        img0 = img.resize((self.base_size, self.base_size), Image.BILINEAR)
+        mask0 = self._build_mask(image_id, (self.base_size, self.base_size))  # already base_size
+
+        tag = "CTX"
+        crop_size = self.base_size
+
+        if self.train and self.curriculum is not None:
+            pol = self.curriculum.policy(self.epoch)
+            crop_size = random.choice(pol["crop_sizes"])
+            ship_frac = float(mask0.mean())
+            u = random.random()
+
+            if ship_frac > 0 and u < pol["p_pos"]:
+                out = crop_ship_centered(img0, mask0, crop_size, jitter=float(pol["jitter"]))
+                if out is not None:
+                    imgc, maskc = out
+                    tag = "POS"
+                else:
+                    imgc, maskc = crop_random(img0, mask0, crop_size)
+                    tag = "CTX"
+            elif u < pol["p_pos"] + pol["p_neg"]:
+                imgc, maskc = crop_shipfree(img0, mask0, crop_size, max_ship_frac=float(pol["max_ship_frac"]))
+                tag = "NEG"
+            else:
+                imgc, maskc = crop_random(img0, mask0, crop_size)
+                tag = "CTX"
+
+            # multi-scale jitter is applied later (trainer) only for Phase2 (to keep this dataset simpler)
+
+            self._tag_counts[tag] = self._tag_counts.get(tag, 0) + 1
+            self._size_counts[crop_size] = self._size_counts.get(crop_size, 0) + 1
+        else:
+            imgc, maskc = img0, mask0
+
+        x, y = self._to_tensor(imgc, maskc)
+        return {"image_id": image_id, "x": x, "y": y, "tag": tag, "crop_size": int(crop_size)}
+
+
+def collate_skip_corrupt(batch: List[Dict]) -> Dict:
+    good = [b for b in batch if b.get("tag") != "CORRUPT"]
+    if len(good) == 0:
+        # fallback: keep one corrupt to avoid DataLoader crash
+        good = batch[:1]
+    x = torch.stack([b["x"] for b in good], dim=0)
+    y = torch.stack([b["y"] for b in good], dim=0)
+    image_ids = [b["image_id"] for b in good]
+    tags = [b.get("tag", "UNK") for b in good]
+    crop_sizes = [int(b.get("crop_size", 0)) for b in good]
+    return {"image_ids": image_ids, "x": x, "y": y, "tags": tags, "crop_sizes": crop_sizes}
+
+
+# -----------------------------
+# Simple U-Net
+# -----------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, in_ch: int = 3, base_ch: int = 32):
+        super().__init__()
+        self.enc1 = ConvBlock(in_ch, base_ch)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = ConvBlock(base_ch, base_ch * 2)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = ConvBlock(base_ch * 2, base_ch * 4)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = ConvBlock(base_ch * 4, base_ch * 8)
+        self.pool4 = nn.MaxPool2d(2)
+
+        self.bottleneck = ConvBlock(base_ch * 8, base_ch * 16)
+
+        self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, 2, stride=2)
+        self.dec4 = ConvBlock(base_ch * 16, base_ch * 8)
+        self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
+        self.dec3 = ConvBlock(base_ch * 8, base_ch * 4)
+        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.dec2 = ConvBlock(base_ch * 4, base_ch * 2)
+        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.dec1 = ConvBlock(base_ch * 2, base_ch)
+
+        self.out = nn.Conv2d(base_ch, 1, 1)
+
+        # for Grad-CAM (use last decoder conv features)
+        self._cam_feat = None
+        self.dec1.register_forward_hook(self._hook_feat)
+
+    def _hook_feat(self, module, inp, out):
+        self._cam_feat = out
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        b = self.bottleneck(self.pool4(e4))
+
+        d4 = self.up4(b)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        logits = self.out(d1)
+        return logits
+
+
+# -----------------------------
+# Losses
+# -----------------------------
+def bce_logits_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    # logits: (B,1,H,W), targets: (B,1,H,W) float 0/1
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+def tversky_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, alpha: float, beta: float, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    # flatten
+    p = prob.view(prob.size(0), -1)
+    t = targets.view(targets.size(0), -1)
+    tp = (p * t).sum(dim=1)
+    fp = (p * (1 - t)).sum(dim=1)
+    fn = ((1 - p) * t).sum(dim=1)
+    ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return (1 - ti).mean()
+
+
+def dice_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    p = prob.view(prob.size(0), -1)
+    t = targets.view(targets.size(0), -1)
+    inter = (p * t).sum(dim=1)
+    denom = p.sum(dim=1) + t.sum(dim=1)
+    dice = (2 * inter + eps) / (denom + eps)
+    return dice.mean()
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+def binarize_prob(prob: np.ndarray, thr: float) -> np.ndarray:
+    return (prob >= thr).astype(np.uint8)
+
+
+def pixel_metrics(pred01: np.ndarray, gt01: np.ndarray) -> Dict[str, float]:
+    pred = pred01.astype(np.uint8)
+    gt = gt01.astype(np.uint8)
+    tp = int(((pred == 1) & (gt == 1)).sum())
+    fp = int(((pred == 1) & (gt == 0)).sum())
+    fn = int(((pred == 0) & (gt == 1)).sum())
+    tn = int(((pred == 0) & (gt == 0)).sum())
+
+    prec = tp / (tp + fp + 1e-9)
+    rec = tp / (tp + fn + 1e-9)
+    f1 = (2 * prec * rec) / (prec + rec + 1e-9)
+    iou = tp / (tp + fp + fn + 1e-9)
+    return {
+        "tp": float(tp), "fp": float(fp), "fn": float(fn), "tn": float(tn),
+        "precision": float(prec), "recall": float(rec), "f1": float(f1), "iou": float(iou),
+        "pred_pos": float(pred.sum()), "gt_pos": float(gt.sum())
+    }
+
+
+def fbeta(prec: float, rec: float, beta: float) -> float:
+    b2 = beta * beta
+    return (1 + b2) * prec * rec / (b2 * prec + rec + 1e-9)
+
+
+# -----------------------------
+# Grad-CAM (simple)
+# -----------------------------
+@torch.no_grad()
+def to_uint8_img(arr01: np.ndarray) -> Image.Image:
+    arr = np.clip(arr01 * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def gradcam_for_unet(model: UNet, x: torch.Tensor, device: torch.device, target_mask01: Optional[torch.Tensor] = None) -> np.ndarray:
+    """
+    Compute Grad-CAM heatmap from model.dec1 feature map.
+    target: mean logit over (target_mask==1) if provided, else over predicted positive pixels.
+    Returns: heatmap in [0,1], shape (H,W)
+    """
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    x = x.to(device)
+    logits = model(x)  # (1,1,H,W)
+    feat = model._cam_feat  # (1,C,h,w) at same res as logits (after dec1) typically
+    if feat is None:
+        return np.zeros((x.shape[-2], x.shape[-1]), dtype=np.float32)
+    feat.retain_grad()
+
+    with torch.no_grad():
+        prob = torch.sigmoid(logits)
+        if target_mask01 is None:
+            tmask = (prob >= 0.5).float()
+        else:
+            tmask = target_mask01.float().to(device)
+        # avoid empty target
+        if tmask.sum() < 1:
+            tmask = torch.ones_like(tmask)
+
+    # scalar target: mean logit on target region
+    target = (logits * tmask).sum() / (tmask.sum() + 1e-6)
+
+    model.zero_grad(set_to_none=True)
+    target.backward(retain_graph=False)
+
+    grad = feat.grad  # (1,C,H,W)
+    w = grad.mean(dim=(2, 3), keepdim=True)  # (1,C,1,1)
+    cam = (w * feat).sum(dim=1, keepdim=False)  # (1,H,W)
+    cam = F.relu(cam)
+    cam = cam[0]
+    cam = cam - cam.min()
+    cam = cam / (cam.max() + 1e-9)
+    return cam.detach().cpu().numpy().astype(np.float32)
+
+
+def overlay_heatmap_on_rgb(rgb_u8: np.ndarray, heat01: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    """
+    rgb_u8: HxWx3
+    heat01: HxW in [0,1]
+    Creates a red-ish overlay without external colormap deps.
+    """
+    h = np.clip(heat01, 0, 1)
+    overlay = rgb_u8.astype(np.float32).copy()
+    red = np.zeros_like(overlay)
+    red[..., 0] = 255.0
+    overlay = (1 - alpha) * overlay + alpha * (h[..., None] * red + (1 - h[..., None]) * overlay)
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+def overlay_mask(rgb_u8: np.ndarray, mask01: np.ndarray, alpha: float = 0.35) -> np.ndarray:
+    overlay = rgb_u8.astype(np.float32).copy()
+    color = np.zeros_like(overlay)
+    color[..., 1] = 255.0  # green
+    m = (mask01 > 0).astype(np.float32)
+    overlay = (1 - alpha * m[..., None]) * overlay + (alpha * m[..., None]) * color
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+# -----------------------------
+# Train / Eval / Infer
+# -----------------------------
+def run_epoch_train(model: nn.Module,
+                    loader: DataLoader,
+                    device: torch.device,
+                    optimizer: torch.optim.Optimizer,
+                    epoch: int,
+                    total_epochs: int,
+                    base_size: int,
+                    do_multiscale: bool,
+                    ms_min: float,
+                    ms_max: float,
+                    loss_bce_w: float,
+                    loss_tversky_w: float,
+                    tv_alpha: float,
+                    tv_beta: float,
+                    log_every: int = 50) -> Dict[str, float]:
+
+    model.train()
+    t0 = time.time()
+    losses = []
+
+    # decide multi-scale policy
+    # Phase2: do_multiscale True; Phase3: you may still do narrow scale or fixed; controlled by caller.
+    for it, batch in enumerate(loader):
+        x = batch["x"]  # (B,3,H,W) H varies by crop_size
+        y = batch["y"]  # (B,1,H,W)
+
+        # optional multi-scale: resize batch to scaled size then random-crop/pad to base_size if needed
+        # Here: we will resize each sample to a new square size (s = base_size*scale), then center-crop/pad to base_size.
+        if do_multiscale:
+            scale = random.uniform(ms_min, ms_max)
+            s = int(round(base_size * scale))
+            s = max(128, min(1024, s))
+            # resize each sample to s then random crop to base_size
+            xs = []
+            ys = []
+            for i in range(x.size(0)):
+                xi = x[i:i+1]  # 1,3,h,w
+                yi = y[i:i+1]
+                xi2 = F.interpolate(xi, size=(s, s), mode="bilinear", align_corners=False)
+                yi2 = F.interpolate(yi, size=(s, s), mode="nearest")
+                if s > base_size:
+                    x0 = random.randint(0, s - base_size)
+                    y0 = random.randint(0, s - base_size)
+                    xi3 = xi2[:, :, y0:y0+base_size, x0:x0+base_size]
+                    yi3 = yi2[:, :, y0:y0+base_size, x0:x0+base_size]
+                elif s < base_size:
+                    pad = base_size - s
+                    p0 = random.randint(0, pad)
+                    p1 = pad - p0
+                    # pad (left,right,top,bottom)
+                    xi3 = F.pad(xi2, (p0, p1, p0, p1), mode="constant", value=0.0)
+                    yi3 = F.pad(yi2, (p0, p1, p0, p1), mode="constant", value=0.0)
+                else:
+                    xi3, yi3 = xi2, yi2
+                xs.append(xi3)
+                ys.append(yi3)
+            x = torch.cat(xs, dim=0)
+            y = torch.cat(ys, dim=0)
+
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+
+        lb = bce_logits_loss(logits, y)
+        lt = torch.tensor(0.0, device=device)
+        if loss_tversky_w > 0:
+            lt = tversky_loss_from_logits(logits, y, alpha=tv_alpha, beta=tv_beta)
+
+        loss = loss_bce_w * lb + loss_tversky_w * lt
+        loss.backward()
+        optimizer.step()
+
+        losses.append(float(loss.detach().cpu().item()))
+        if (it + 1) % log_every == 0:
+            print(f"{now_str()} [train] epoch={epoch+1}/{total_epochs} iter={it+1}/{len(loader)} "
+                  f"loss={np.mean(losses[-log_every:]):.6f} "
+                  f"(bce={float(lb.detach().cpu()):.6f}, tv={float(lt.detach().cpu()):.6f})")
+
+    dt = time.time() - t0
+    return {"loss": float(np.mean(losses)) if losses else 0.0, "sec": float(dt)}
+
+
+@torch.no_grad()
+def predict_prob_map(model: nn.Module, x: torch.Tensor, device: torch.device) -> np.ndarray:
+    model.eval()
+    x = x.to(device)
+    logits = model(x)
+    prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)
+    return prob
+
+
+@torch.no_grad()
+def evaluate_on_val(model: nn.Module,
+                    loader: DataLoader,
+                    device: torch.device,
+                    base_size: int,
+                    thr_list: List[float],
+                    morph_k: int,
+                    min_area: int,
+                    do_open: bool,
+                    do_close: bool) -> Dict:
+    """
+    Evaluate thresholds by running full inference (fixed base_size) + postprocess.
+    Returns best threshold by F2 (pixel-level) and summary metrics at best_thr.
+    """
+    model.eval()
+    # collect probs and gts per image (base_size)
+    probs: List[np.ndarray] = []
+    gts: List[np.ndarray] = []
+    image_ids: List[str] = []
+
+    for batch in loader:
+        x = batch["x"]  # may be base_size if val dataset fixed
+        y = batch["y"]
+        # force to base_size
+        if x.shape[-1] != base_size or x.shape[-2] != base_size:
+            x = F.interpolate(x, size=(base_size, base_size), mode="bilinear", align_corners=False)
+            y = F.interpolate(y, size=(base_size, base_size), mode="nearest")
+        for i in range(x.size(0)):
+            xi = x[i:i+1]
+            yi = y[i, 0].detach().cpu().numpy().astype(np.uint8)
+            prob = predict_prob_map(model, xi, device)
+            probs.append(prob)
+            gts.append(yi)
+        image_ids.extend(batch["image_ids"])
+
+    # scan thresholds
+    best = None
+    for thr in thr_list:
+        agg = {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
+        fp_cc_total = 0.0
+        for prob, gt in zip(probs, gts):
+            pred = binarize_prob(prob, thr)
+            if morph_k > 1:
+                pred = binary_open_close(pred, k=morph_k, do_open=do_open, do_close=do_close)
+            if min_area > 1:
+                pred = filter_min_area(pred, min_area=min_area)
+
+            pm = pixel_metrics(pred, gt)
+            agg["tp"] += pm["tp"]; agg["fp"] += pm["fp"]; agg["fn"] += pm["fn"]; agg["tn"] += pm["tn"]
+
+            # FP connected components count (proxy of background-texture noise)
+            fp_mask = ((pred == 1) & (gt == 0)).astype(np.uint8)
+            ncc, _lbl, _st = connected_components(fp_mask)
+            fp_cc_total += float(ncc)
+
+        prec = agg["tp"] / (agg["tp"] + agg["fp"] + 1e-9)
+        rec = agg["tp"] / (agg["tp"] + agg["fn"] + 1e-9)
+        f1 = (2 * prec * rec) / (prec + rec + 1e-9)
+        iou = agg["tp"] / (agg["tp"] + agg["fp"] + agg["fn"] + 1e-9)
+        f2 = fbeta(prec, rec, beta=2.0)
+
+        cand = {
+            "thr": float(thr),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "f2": float(f2),
+            "iou": float(iou),
+            "tp": float(agg["tp"]),
+            "fp": float(agg["fp"]),
+            "fn": float(agg["fn"]),
+            "fp_cc_avg": float(fp_cc_total / max(1, len(probs))),
+        }
+        if (best is None) or (cand["f2"] > best["f2"]):
+            best = cand
+
+    assert best is not None
+    best["n_val"] = int(len(probs))
+    best["base_size"] = int(base_size)
+    best["morph_k"] = int(morph_k)
+    best["min_area"] = int(min_area)
+    best["do_open"] = int(do_open)
+    best["do_close"] = int(do_close)
+    return best
+
+
+def rle_encode(mask01: np.ndarray) -> str:
+    """
+    Encode binary mask into Airbus RLE (column-major, 1-indexed starts).
+    mask01: HxW uint8 {0,1}
+    """
+    if mask01.sum() == 0:
+        return ""
+    # flatten in column-major
+    pixels = mask01.T.flatten()
+    # add sentinel
+    pixels = np.concatenate([[0], pixels, [0]]).astype(np.uint8)
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs.tolist())
+
+
+@torch.no_grad()
+def infer_test_and_make_submission(model: nn.Module,
+                                  device: torch.device,
+                                  test_dir: str,
+                                  out_csv: str,
+                                  base_size: int,
+                                  thr: float,
+                                  morph_k: int,
+                                  min_area: int,
+                                  do_open: bool,
+                                  do_close: bool,
+                                  tta: bool,
+                                  vis_dir: Optional[str],
+                                  gradcam: bool) -> None:
+    """
+    Produce submission.csv (variable rows: one row per instance is NOT implemented here; this is union-mask submission).
+    For your later pipeline, you can swap this to instance-per-row with splitting.
+    """
+    ensure_dir(os.path.dirname(out_csv))
+    if vis_dir is not None:
+        ensure_dir(vis_dir)
+
+    test_ids = sorted([p.name for p in Path(test_dir).glob("*.jpg")])
+    rows = [("ImageId", "EncodedPixels")]
+
+    for i, image_id in enumerate(test_ids):
+        p = os.path.join(test_dir, image_id)
+        try:
+            with Image.open(p) as im:
+                im = im.convert("RGB")
+        except Exception:
+            # corrupted -> empty
+            rows.append((image_id, ""))
+            continue
+
+        im0 = im.resize((base_size, base_size), Image.BILINEAR)
+        x = torch.from_numpy(np.array(im0, dtype=np.uint8)).permute(2, 0, 1).float() / 255.0
+        # normalize ImageNet
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+        x = (x - mean) / std
+        x = x.unsqueeze(0)
+
+        def _infer_one(xx: torch.Tensor) -> np.ndarray:
+            prob = predict_prob_map(model, xx, device)
+            return prob
+
+        prob = _infer_one(x)
+        if tta:
+            # simple H-flip TTA
+            xh = torch.flip(x, dims=[3])
+            prob_h = _infer_one(xh)
+            prob_h = np.flip(prob_h, axis=1)  # flip back W axis
+            prob = 0.5 * (prob + prob_h)
+
+        pred = binarize_prob(prob, thr)
+        if morph_k > 1:
+            pred = binary_open_close(pred, k=morph_k, do_open=do_open, do_close=do_close)
+        if min_area > 1:
+            pred = filter_min_area(pred, min_area=min_area)
+
+        # encode (base_size mask). Kaggle expects original 768? Actually the data is 768.
+        # If base_size != 768, resize back to 768 for RLE.
+        if base_size != 768:
+            pred768 = Image.fromarray((pred * 255).astype(np.uint8)).resize((768, 768), Image.NEAREST)
+            pred = (np.array(pred768, dtype=np.uint8) > 0).astype(np.uint8)
+
+        rle = rle_encode(pred)
+        rows.append((image_id, rle))
+
+        if vis_dir is not None and (i < 200):  # cap
+            rgb = np.array(im0, dtype=np.uint8)
+            ov_mask = overlay_mask(rgb, binarize_prob(prob, thr), alpha=0.35)
+            if gradcam:
+                # compute grad-cam on base_size input
+                cam = gradcam_for_unet(model, x, device=device, target_mask01=None)
+                ov_cam = overlay_heatmap_on_rgb(rgb, cam, alpha=0.45)
+            else:
+                ov_cam = rgb
+
+            # concat horizontally: original | pred overlay | cam overlay
+            cat = np.concatenate([rgb, ov_mask, ov_cam], axis=1)
+            Image.fromarray(cat).save(os.path.join(vis_dir, f"{image_id}"))
+
+        if (i + 1) % 500 == 0:
+            print(f"{now_str()} [infer] {i+1}/{len(test_ids)} done")
+
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
+    print(f"{now_str()} wrote submission: {out_csv}")
+
+
+# -----------------------------
+# Split builder
+# -----------------------------
+def build_id2rles_and_ids(train_img_dir: str, train_csv: str) -> Tuple[Dict[str, List[str]], List[str], List[str]]:
+    """
+    Returns:
+      id2rles: positives only (ImageId -> [RLE...])
+      all_ids: ALL images from directory (pos+neg)
+      pos_ids: IDs with at least one RLE
+    """
+    all_ids = sorted([p.name for p in Path(train_img_dir).glob("*.jpg")])
+    rows = read_csv_rows(train_csv)
+    id2rles: Dict[str, List[str]] = {}
+    for r in rows:
+        image_id = r["ImageId"]
+        rle = r["EncodedPixels"]
+        if rle is None:
+            continue
+        if image_id not in id2rles:
+            id2rles[image_id] = []
+        if rle != "":
+            id2rles[image_id].append(rle)
+
+    pos_set = set(id2rles.keys())
+    pos_ids = [x for x in all_ids if x in pos_set]
+    return id2rles, all_ids, pos_ids
+
+
+def stratified_sample_train_val(all_ids: List[str],
+                                pos_ids: List[str],
+                                train_total: int,
+                                val_total: int,
+                                val_pos_rate: float,
+                                seed: int) -> Tuple[List[str], List[str]]:
+    """
+    Build train and val splits without overlap.
+    - Train: sample train_total images (stratified by pos/neg, using observed pos rate in all_ids).
+    - Val: sample val_total images from remaining, with desired val_pos_rate (if <=0, use natural rate).
+    """
+    rng = random.Random(seed)
+    all_set = set(all_ids)
+    pos_set = set(pos_ids)
+    neg_ids = [x for x in all_ids if x not in pos_set]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    # Train: keep natural pos rate from ALL unless user wants to cap by providing train_total and pos exposure later in sampler.
+    n_train = min(train_total, len(all_ids))
+    n_pos_train = int(round(n_train * (len(pos_ids) / max(1, len(all_ids)))))
+    n_pos_train = min(n_pos_train, len(pos_ids))
+    n_neg_train = n_train - n_pos_train
+    n_neg_train = min(n_neg_train, len(neg_ids))
+
+    train_ids = pos_ids[:n_pos_train] + neg_ids[:n_neg_train]
+    rng.shuffle(train_ids)
+
+    remaining = [x for x in all_ids if x not in set(train_ids)]
+    rem_pos = [x for x in remaining if x in pos_set]
+    rem_neg = [x for x in remaining if x not in pos_set]
+    rng.shuffle(rem_pos)
+    rng.shuffle(rem_neg)
+
+    n_val = min(val_total, len(remaining))
+    if val_pos_rate is None or val_pos_rate <= 0:
+        n_pos_val = int(round(n_val * (len(rem_pos) / max(1, len(remaining)))))
+    else:
+        n_pos_val = int(round(n_val * float(val_pos_rate)))
+    n_pos_val = min(n_pos_val, len(rem_pos))
+    n_neg_val = n_val - n_pos_val
+    n_neg_val = min(n_neg_val, len(rem_neg))
+
+    val_ids = rem_pos[:n_pos_val] + rem_neg[:n_neg_val]
+    rng.shuffle(val_ids)
+
+    return train_ids, val_ids
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", type=str, default="all", choices=["train", "infer", "all"])
+    ap.add_argument("--data_dir", type=str, required=True,
+                    help="Dataset root. Must contain train_v2, test_v2, train_ship_segmentations_v2.csv, sample_submission_v2.csv")
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", type=str, default="cuda")
+
+    # split sizes
+    ap.add_argument("--train_total", type=int, default=50000)
+    ap.add_argument("--val_total", type=int, default=30000)
+    ap.add_argument("--val_pos_rate", type=float, default=0.221)
+
+    # training sizes / phases
+    ap.add_argument("--base_size", type=int, default=768)
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--phase1_frac", type=float, default=0.25)
+    ap.add_argument("--phase2_frac", type=float, default=0.55)
+
+    # multi-scale settings (Phase2 default)
+    ap.add_argument("--ms_min", type=float, default=0.67)
+    ap.add_argument("--ms_max", type=float, default=1.33)
+    ap.add_argument("--ms_min_phase3", type=float, default=0.90)
+    ap.add_argument("--ms_max_phase3", type=float, default=1.10)
+
+    # optimizer
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--bs", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    # loss weights
+    ap.add_argument("--loss_bce_w", type=float, default=1.0)
+    ap.add_argument("--loss_tv_w_phase1", type=float, default=0.0)
+    ap.add_argument("--loss_tv_w_phase2", type=float, default=0.3)
+    ap.add_argument("--loss_tv_w_phase3", type=float, default=0.3)
+    ap.add_argument("--tv_alpha", type=float, default=0.6)
+    ap.add_argument("--tv_beta", type=float, default=0.4)
+
+    # val tune
+    ap.add_argument("--thr_min", type=float, default=0.02)
+    ap.add_argument("--thr_max", type=float, default=0.20)
+    ap.add_argument("--thr_num", type=int, default=25)
+    ap.add_argument("--morph_k", type=int, default=3)
+    ap.add_argument("--min_area", type=int, default=50)
+    ap.add_argument("--do_open", type=int, default=1)
+    ap.add_argument("--do_close", type=int, default=1)
+
+    # infer
+    ap.add_argument("--infer_test", type=int, default=1)
+    ap.add_argument("--tta", type=int, default=1)
+    ap.add_argument("--vis", type=int, default=1)
+    ap.add_argument("--gradcam", type=int, default=1)
+    ap.add_argument("--vis_cap", type=int, default=200)
+
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+    ensure_dir(args.run_dir)
+    log_path = os.path.join(args.run_dir, "log_global.txt")
+
+    def log(s: str):
+        print(s)
+        with open(log_path, "a") as f:
+            f.write(s + "\n")
+
+    log(f"{now_str()} ==== START: Airbus UNet + Crop Curriculum (HADES) ====")
+    log(f"{now_str()} run_dir={args.run_dir}")
+    log(f"{now_str()} data_dir={args.data_dir}")
+    log(f"{now_str()} seed={args.seed}")
+    log(f"{now_str()} base_size={args.base_size} epochs={args.epochs}")
+    log(f"{now_str()} backends: cv2={_HAS_CV2} scipy={_HAS_SCIPY}")
+
+    data_dir = args.data_dir
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    for p in [train_img_dir, test_img_dir, train_csv, sample_sub]:
+        if not os.path.exists(p):
+            log(f"{now_str()} ERROR: missing path: {p}")
+            sys.exit(1)
+
+    id2rles, all_ids, pos_ids = build_id2rles_and_ids(train_img_dir, train_csv)
+    pos_rate = len(pos_ids) / max(1, len(all_ids))
+    log(f"{now_str()} ALL images={len(all_ids)} pos={len(pos_ids)} pos_rate={pos_rate:.4f}")
+
+    # split
+    train_ids, val_ids = stratified_sample_train_val(
+        all_ids=all_ids,
+        pos_ids=pos_ids,
+        train_total=args.train_total,
+        val_total=args.val_total,
+        val_pos_rate=args.val_pos_rate,
+        seed=args.seed
+    )
+    splits = {"train_ids": train_ids, "val_ids": val_ids}
+    with open(os.path.join(args.run_dir, "splits.json"), "w") as f:
+        json.dump(splits, f, indent=2)
+    log(f"{now_str()} split: train={len(train_ids)} val={len(val_ids)}")
+
+    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+
+    # model
+    model = UNet(in_ch=3, base_ch=32).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+
+    # datasets
+    curriculum = CropCurriculum(total_epochs=args.epochs, phase1_frac=args.phase1_frac, phase2_frac=args.phase2_frac)
+    ds_train = AirbusSegDataset(
+        img_dir=train_img_dir, id2rles=id2rles, image_ids=train_ids,
+        train=True, base_size=args.base_size, curriculum=curriculum, total_epochs=args.epochs,
+        normalize=True, corrupt_ok=True
+    )
+    # val is fixed-context (no crop curriculum)
+    ds_val = AirbusSegDataset(
+        img_dir=train_img_dir, id2rles=id2rles, image_ids=val_ids,
+        train=False, base_size=args.base_size, curriculum=None, total_epochs=args.epochs,
+        normalize=True, corrupt_ok=True
+    )
+
+    dl_train = DataLoader(ds_train, batch_size=args.bs, shuffle=True, num_workers=args.num_workers,
+                          pin_memory=True, drop_last=True, collate_fn=collate_skip_corrupt)
+    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, num_workers=max(1, args.num_workers // 2),
+                        pin_memory=True, drop_last=False, collate_fn=collate_skip_corrupt)
+
+    best_f2 = -1.0
+    best_thr = 0.05
+    best_epoch = -1
+    best_path = os.path.join(args.run_dir, "best_model.pt")
+    last_path = os.path.join(args.run_dir, "last_model.pt")
+    meta_path = os.path.join(args.run_dir, "meta.json")
+
+    thr_list = np.linspace(args.thr_min, args.thr_max, args.thr_num).tolist()
+
+    if args.mode in ["train", "all"]:
+        for epoch in range(args.epochs):
+            ds_train.set_epoch(epoch)
+            ds_train.reset_counters()
+
+            # decide phase / multiscale policy
+            pol = curriculum.policy(epoch)
+            tag = pol["tag"]
+            # Phase2: wide multiscale; Phase3: narrow (or you can disable by setting ms_min_phase3=ms_max_phase3=1.0)
+            # Phase1: multiscale off
+            # Determine phase id via tag
+            if tag == "PH1":
+                do_ms = False
+                ms_min, ms_max = 1.0, 1.0
+                tv_w = float(args.loss_tv_w_phase1)
+            elif tag == "PH2":
+                do_ms = True
+                ms_min, ms_max = float(args.ms_min), float(args.ms_max)
+                tv_w = float(args.loss_tv_w_phase2)
+            else:
+                # PH3
+                do_ms = True if (abs(args.ms_max_phase3 - 1.0) > 1e-6 or abs(args.ms_min_phase3 - 1.0) > 1e-6) else False
+                ms_min, ms_max = float(args.ms_min_phase3), float(args.ms_max_phase3)
+                tv_w = float(args.loss_tv_w_phase3)
+
+            log(f"{now_str()} ---- epoch {epoch+1}/{args.epochs} phase={tag} do_ms={do_ms} ms=({ms_min:.3f},{ms_max:.3f}) tv_w={tv_w:.3f}")
+
+            tr = run_epoch_train(
+                model=model, loader=dl_train, device=device, optimizer=optimizer,
+                epoch=epoch, total_epochs=args.epochs,
+                base_size=args.base_size, do_multiscale=do_ms, ms_min=ms_min, ms_max=ms_max,
+                loss_bce_w=float(args.loss_bce_w),
+                loss_tversky_w=tv_w,
+                tv_alpha=float(args.tv_alpha), tv_beta=float(args.tv_beta),
+                log_every=50
+            )
+
+            ctr = ds_train.get_counters()
+            log(f"{now_str()} [train] epoch={epoch+1} loss={tr['loss']:.6f} sec={tr['sec']:.1f} "
+                f"crop_tags={ctr['tag_counts']} crop_sizes={ctr['size_counts']}")
+
+            # val threshold tune (full pipeline)
+            val_best = evaluate_on_val(
+                model=model, loader=dl_val, device=device, base_size=args.base_size,
+                thr_list=thr_list, morph_k=int(args.morph_k), min_area=int(args.min_area),
+                do_open=bool(args.do_open), do_close=bool(args.do_close)
+            )
+            log(f"{now_str()} [val] best_thr={val_best['thr']:.4f} f2={val_best['f2']:.6f} "
+                f"f1={val_best['f1']:.6f} iou={val_best['iou']:.6f} "
+                f"prec={val_best['precision']:.6f} rec={val_best['recall']:.6f} fp_cc_avg={val_best['fp_cc_avg']:.2f}")
+
+            # save last
+            torch.save(model.state_dict(), last_path)
+
+            # update best
+            if val_best["f2"] > best_f2:
+                best_f2 = float(val_best["f2"])
+                best_thr = float(val_best["thr"])
+                best_epoch = epoch + 1
+                torch.save(model.state_dict(), best_path)
+
+            meta = {
+                "best_f2": best_f2,
+                "best_thr": best_thr,
+                "best_epoch": best_epoch,
+                "last_epoch": epoch + 1,
+                "base_size": int(args.base_size),
+                "morph_k": int(args.morph_k),
+                "min_area": int(args.min_area),
+                "do_open": int(args.do_open),
+                "do_close": int(args.do_close),
+                "tv_alpha": float(args.tv_alpha),
+                "tv_beta": float(args.tv_beta),
+                "loss_bce_w": float(args.loss_bce_w),
+                "loss_tv_w_phase1": float(args.loss_tv_w_phase1),
+                "loss_tv_w_phase2": float(args.loss_tv_w_phase2),
+                "loss_tv_w_phase3": float(args.loss_tv_w_phase3),
+                "ms_min": float(args.ms_min),
+                "ms_max": float(args.ms_max),
+                "ms_min_phase3": float(args.ms_min_phase3),
+                "ms_max_phase3": float(args.ms_max_phase3),
+            }
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+        log(f"{now_str()} ==== TRAIN DONE ====")
+        log(f"{now_str()} best_epoch={best_epoch} best_f2={best_f2:.6f} best_thr={best_thr:.6f}")
+        log(f"{now_str()} best_path={best_path}")
+        log(f"{now_str()} last_path={last_path}")
+
+    # inference
+    if args.mode in ["infer", "all"] and int(args.infer_test) == 1:
+        # load best
+        if os.path.exists(best_path):
+            model.load_state_dict(torch.load(best_path, map_location=device))
+            log(f"{now_str()} loaded best model: {best_path}")
+        else:
+            log(f"{now_str()} WARNING: best_model not found, using current weights")
+
+        # read meta thr if exists
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            thr = float(meta.get("best_thr", best_thr))
+        else:
+            thr = best_thr
+
+        vis_dir = os.path.join(args.run_dir, "inference", "vis_testv2") if int(args.vis) == 1 else None
+        out_csv = os.path.join(args.run_dir, "submission.csv")
+
+        infer_test_and_make_submission(
+            model=model, device=device,
+            test_dir=test_img_dir,
+            out_csv=out_csv,
+            base_size=int(args.base_size),
+            thr=float(thr),
+            morph_k=int(args.morph_k),
+            min_area=int(args.min_area),
+            do_open=bool(args.do_open),
+            do_close=bool(args.do_close),
+            tta=bool(args.tta),
+            vis_dir=vis_dir,
+            gradcam=bool(args.gradcam)
+        )
+        log(f"{now_str()} ==== INFER DONE ====")
+
+    log(f"{now_str()} ==== END ====")
+
+
+if __name__ == "__main__":
+    main()
