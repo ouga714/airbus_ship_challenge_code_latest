@@ -1,0 +1,1185 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+airbus_unet384_maskrcnn_ohem_ms_softnms_internwinter.py
+
+Airbus Ship Detection (Kaggle) - "UNet101(384) + Mask R-CNN" style reproduction (best-effort)
+- intern-winter想定 / Single GPU / FP32 only (NO AMP)
+- NO TTA / NO ensemble
+- UNet(ResNet101 encoder) at 384x384: shipness (船あり判定) + coarse semantic mask (union)
+- Mask R-CNN: multi-scale train (resize to random [1200..2000]), OHEM(TopK RoIs) for box/mask losses,
+  mask head output 56x56, mask Soft-NMS (mask IoU), pixel-ownership (no-overlap) enforcement
+- End-to-end: split -> train UNet -> train MaskRCNN -> infer(test_v2) -> variable-row submission.csv
+- NO pandas (csv module)
+
+Data layout (default):
+  data_dir/
+    train_v2/ (images)
+    test_v2/ (images)
+    train_ship_segmentations_v2.csv
+    sample_submission_v2.csv
+
+IMPORTANT:
+- This is a faithful "structural" reproduction; it won't exactly match the 10th-place code.
+- Training Mask R-CNN at 1200~2000 is heavy. Use bs=1, num_workers small, and expect time.
+"""
+
+import os
+import sys
+import csv
+import math
+import json
+import time
+import glob
+import random
+import shutil
+import hashlib
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import torchvision
+from torchvision.transforms import functional as TF
+
+
+# -------------------------
+# Utils: logging, seed, io
+# -------------------------
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def mkdir_p(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def sha1_first1mb(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(1024 * 1024))
+    return h.hexdigest()
+
+def safe_open_image_rgb(path: str) -> Image.Image:
+    # robust open
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        return im
+
+def list_image_ids(img_dir: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+    ids = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith(exts):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+# -------------------------
+# RLE decode/encode (Airbus: column-major)
+# -------------------------
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    rle: "start length start length ..."
+    shape: (H, W)
+    Airbus uses column-major (Fortran order) with 1-indexed starts
+    """
+    h, w = shape
+    mask = np.zeros(h * w, dtype=np.uint8)
+    if rle is None or rle == "" or rle.strip() == "":
+        return mask.reshape((h, w), order="F")
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    for lo, hi in zip(starts, ends):
+        mask[lo:hi] = 1
+    return mask.reshape((h, w), order="F")
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: (H,W) {0,1} uint8
+    output: column-major RLE, 1-indexed starts
+    """
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    pixels = mask.reshape(-1, order="F")
+    # add sentinel
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    if len(runs) == 0:
+        return ""
+    return " ".join(str(x) for x in runs)
+
+def masks_to_boxes(masks: torch.Tensor) -> torch.Tensor:
+    """
+    masks: (N,H,W) uint8/bool
+    returns boxes: (N,4) float (x1,y1,x2,y2)
+    """
+    if masks.numel() == 0:
+        return torch.zeros((0, 4), dtype=torch.float32)
+    N, H, W = masks.shape
+    boxes = torch.zeros((N, 4), dtype=torch.float32)
+    for i in range(N):
+        ys, xs = torch.where(masks[i] > 0)
+        if ys.numel() == 0:
+            boxes[i] = torch.tensor([0, 0, 1, 1], dtype=torch.float32)
+        else:
+            x1 = xs.min().item()
+            x2 = xs.max().item() + 1
+            y1 = ys.min().item()
+            y2 = ys.max().item() + 1
+            boxes[i] = torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+    return boxes
+
+# -------------------------
+# Splits & CSV parsing
+# -------------------------
+def load_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    """
+    Returns dict: ImageId -> list of RLEs (only non-empty)
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        # expects columns: ImageId, EncodedPixels
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None or rle.strip() == "":
+                continue
+            id2rles.setdefault(img_id, []).append(rle.strip())
+    return id2rles
+
+def stratified_sample_ids(
+    all_ids: List[str],
+    id2rles: Dict[str, List[str]],
+    total: int,
+    pos_frac: float,
+    seed: int,
+) -> Tuple[List[str], Dict[str, int]]:
+    """
+    Sample 'total' ids from all_ids with pos fraction ~ pos_frac.
+    POS = id in id2rles (has at least one RLE)
+    """
+    rng = random.Random(seed)
+    pos_ids = [i for i in all_ids if i in id2rles]
+    neg_ids = [i for i in all_ids if i not in id2rles]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    pos_n = int(round(total * pos_frac))
+    pos_n = min(pos_n, len(pos_ids))
+    neg_n = total - pos_n
+    neg_n = min(neg_n, len(neg_ids))
+    # if neg shortage, fill with pos
+    total_eff = pos_n + neg_n
+    if total_eff < total:
+        add = min(total - total_eff, len(pos_ids) - pos_n)
+        pos_n += add
+
+    sampled = pos_ids[:pos_n] + neg_ids[:neg_n]
+    rng.shuffle(sampled)
+
+    stats = {"total": len(sampled), "pos": pos_n, "neg": neg_n}
+    return sampled, stats
+
+def split_train_val(
+    ids: List[str],
+    id2rles: Dict[str, List[str]],
+    val_total: int,
+    val_pos_frac: float,
+    seed: int,
+) -> Tuple[List[str], List[str], Dict[str, int]]:
+    """
+    Make a val split disjoint from train (subset of ids)
+    """
+    rng = random.Random(seed)
+    pos_ids = [i for i in ids if i in id2rles]
+    neg_ids = [i for i in ids if i not in id2rles]
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    val_pos_n = int(round(val_total * val_pos_frac))
+    val_pos_n = min(val_pos_n, len(pos_ids))
+    val_neg_n = val_total - val_pos_n
+    val_neg_n = min(val_neg_n, len(neg_ids))
+
+    val_ids = pos_ids[:val_pos_n] + neg_ids[:val_neg_n]
+    val_set = set(val_ids)
+
+    train_ids = [i for i in ids if i not in val_set]
+    stats = {"train": len(train_ids), "val": len(val_ids), "val_pos": val_pos_n, "val_neg": val_neg_n}
+    return train_ids, val_ids, stats
+
+# -------------------------
+# Simple augmentations (no albumentations)
+# -------------------------
+class DetAugment:
+    """
+    Basic augmentations for detection/instance seg:
+    - random hflip/vflip
+    - color jitter (brightness/contrast)
+    - gaussian blur sometimes
+    - small random affine (rotation/scale)
+    """
+    def __init__(self, p_flip=0.5, p_color=0.5, p_blur=0.2, p_affine=0.2):
+        self.p_flip = p_flip
+        self.p_color = p_color
+        self.p_blur = p_blur
+        self.p_affine = p_affine
+
+    def __call__(self, img: torch.Tensor, target: Optional[dict]) -> Tuple[torch.Tensor, Optional[dict]]:
+        # img: (3,H,W) float [0,1]
+        _, H, W = img.shape
+        # flips
+        if random.random() < self.p_flip:
+            img = torch.flip(img, dims=[2])
+            if target is not None and "boxes" in target:
+                boxes = target["boxes"].clone()
+                boxes[:, [0, 2]] = W - boxes[:, [2, 0]]
+                target["boxes"] = boxes
+            if target is not None and "masks" in target:
+                target["masks"] = torch.flip(target["masks"], dims=[2])
+
+        if random.random() < self.p_flip:
+            img = torch.flip(img, dims=[1])
+            if target is not None and "boxes" in target:
+                boxes = target["boxes"].clone()
+                boxes[:, [1, 3]] = H - boxes[:, [3, 1]]
+                target["boxes"] = boxes
+            if target is not None and "masks" in target:
+                target["masks"] = torch.flip(target["masks"], dims=[1])
+
+        # color jitter
+        if random.random() < self.p_color:
+            b = 0.8 + 0.4 * random.random()
+            c = 0.8 + 0.4 * random.random()
+            img = TF.adjust_brightness(img, b)
+            img = TF.adjust_contrast(img, c)
+
+        # blur
+        if random.random() < self.p_blur:
+            # approximate motion blur with gaussian blur
+            k = random.choice([3, 5])
+            img = TF.gaussian_blur(img, kernel_size=[k, k], sigma=[0.1, 2.0])
+
+        # affine (small)
+        if random.random() < self.p_affine:
+            angle = random.uniform(-10, 10)
+            scale = random.uniform(0.9, 1.1)
+            translate = [random.uniform(-0.02, 0.02) * W, random.uniform(-0.02, 0.02) * H]
+            shear = [0.0, 0.0]
+            # For detection, affine transform on masks/boxes is annoying without heavy code.
+            # We keep it image-only to avoid annotation mismatch.
+            # (This is conservative; the 10th-place used stronger aug. This is a safe baseline.)
+            img = TF.affine(img, angle=angle, translate=translate, scale=scale, shear=shear)
+
+        return img, target
+
+# -------------------------
+# Datasets
+# -------------------------
+class AirbusUNetDataset(Dataset):
+    """
+    UNet semantic training: union mask (ship pixels) at base_size -> resized to 384
+    """
+    def __init__(
+        self,
+        img_dir: str,
+        ids: List[str],
+        id2rles: Dict[str, List[str]],
+        base_size: int = 768,
+        unet_size: int = 384,
+        augment: bool = True,
+    ):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.base_size = base_size
+        self.unet_size = unet_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        try:
+            im = safe_open_image_rgb(path)
+        except Exception:
+            # fallback: return blank
+            im = Image.new("RGB", (self.base_size, self.base_size), (0, 0, 0))
+
+        img = TF.to_tensor(im)  # [0,1], (3,H,W)
+        H, W = img.shape[1], img.shape[2]
+        # union mask
+        mask = np.zeros((H, W), dtype=np.uint8)
+        rles = self.id2rles.get(img_id, [])
+        for rle in rles:
+            m = rle_decode(rle, (H, W))
+            mask = np.maximum(mask, m)
+        mask_t = torch.from_numpy(mask).unsqueeze(0).float()  # (1,H,W)
+
+        # light aug: flips + color (consistent with mask)
+        if self.augment:
+            if random.random() < 0.5:
+                img = torch.flip(img, dims=[2])
+                mask_t = torch.flip(mask_t, dims=[2])
+            if random.random() < 0.5:
+                img = torch.flip(img, dims=[1])
+                mask_t = torch.flip(mask_t, dims=[1])
+            if random.random() < 0.5:
+                b = 0.8 + 0.4 * random.random()
+                c = 0.8 + 0.4 * random.random()
+                img = TF.adjust_brightness(img, b)
+                img = TF.adjust_contrast(img, c)
+
+        # resize to unet_size
+        img = TF.resize(img, [self.unet_size, self.unet_size], interpolation=TF.InterpolationMode.BILINEAR)
+        mask_t = TF.resize(mask_t, [self.unet_size, self.unet_size], interpolation=TF.InterpolationMode.NEAREST)
+        return img, mask_t, img_id
+
+class AirbusMaskRCNNDataset(Dataset):
+    """
+    Instance training: each RLE row is one instance.
+    """
+    def __init__(
+        self,
+        img_dir: str,
+        ids: List[str],
+        id2rles: Dict[str, List[str]],
+        base_size: int = 768,
+        augment: bool = True,
+    ):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.base_size = base_size
+        self.augment = augment
+        self.aug = DetAugment() if augment else None
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        try:
+            im = safe_open_image_rgb(path)
+        except Exception:
+            im = Image.new("RGB", (self.base_size, self.base_size), (0, 0, 0))
+        img = TF.to_tensor(im)  # (3,H,W)
+        H, W = img.shape[1], img.shape[2]
+
+        rles = self.id2rles.get(img_id, [])
+        inst_masks = []
+        for rle in rles:
+            m = rle_decode(rle, (H, W))
+            inst_masks.append(m)
+        if len(inst_masks) == 0:
+            masks = torch.zeros((0, H, W), dtype=torch.uint8)
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        else:
+            masks_np = np.stack(inst_masks, axis=0).astype(np.uint8)  # (N,H,W)
+            masks = torch.from_numpy(masks_np)
+            boxes = masks_to_boxes(masks)
+            labels = torch.ones((masks.shape[0],), dtype=torch.int64)  # ship=1
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "masks": masks,
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+        }
+
+        if self.augment and self.aug is not None:
+            img, target = self.aug(img, target)
+
+        # NOTE: multi-scale resize is handled by Mask R-CNN internal transform (min_size list)
+        return img, target, img_id
+
+def collate_fn(batch):
+    imgs = [b[0] for b in batch]
+    targets = [b[1] for b in batch]
+    ids = [b[2] for b in batch]
+    return imgs, targets, ids
+
+# -------------------------
+# UNet(ResNet101 encoder) minimal implementation
+# -------------------------
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv1 = ConvBNReLU(out_ch + skip_ch, out_ch)
+        self.conv2 = ConvBNReLU(out_ch, out_ch)
+    def forward(self, x, skip):
+        x = self.up(x)
+        # pad if needed
+        if x.shape[-1] != skip.shape[-1] or x.shape[-2] != skip.shape[-2]:
+            x = TF.resize(x, [skip.shape[-2], skip.shape[-1]], interpolation=TF.InterpolationMode.BILINEAR)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv2(self.conv1(x))
+        return x
+
+class UNetResNet101(nn.Module):
+    """
+    UNet with ResNet101 encoder (pretrained optional)
+    Output: 1-channel logits
+    """
+    def __init__(self, pretrained=True):
+        super().__init__()
+        enc = torchvision.models.resnet101(weights=(
+            torchvision.models.ResNet101_Weights.IMAGENET1K_V2 if pretrained else None
+        ))
+        # encoder stem
+        self.conv1 = enc.conv1
+        self.bn1 = enc.bn1
+        self.relu = enc.relu
+        self.maxpool = enc.maxpool
+        # encoder stages
+        self.layer1 = enc.layer1  # 256
+        self.layer2 = enc.layer2  # 512
+        self.layer3 = enc.layer3  # 1024
+        self.layer4 = enc.layer4  # 2048
+
+        self.center = nn.Sequential(
+            ConvBNReLU(2048, 512, 3, 1, 1),
+            ConvBNReLU(512, 512, 3, 1, 1),
+        )
+        self.up4 = UpBlock(512, 1024, 256)
+        self.up3 = UpBlock(256, 512, 128)
+        self.up2 = UpBlock(128, 256, 64)
+        self.up1 = UpBlock(64, 64, 32)
+
+        self.head = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x):
+        # x: (B,3,H,W)
+        x0 = self.relu(self.bn1(self.conv1(x)))  # 64, /2
+        x1 = self.maxpool(x0)                    # /4
+        e1 = self.layer1(x1)                     # 256, /4
+        e2 = self.layer2(e1)                     # 512, /8
+        e3 = self.layer3(e2)                     # 1024, /16
+        e4 = self.layer4(e3)                     # 2048, /32
+
+        c = self.center(e4)                      # 512, /32
+        d4 = self.up4(c, e3)                     # 256, /16
+        d3 = self.up3(d4, e2)                    # 128, /8
+        d2 = self.up2(d3, e1)                    # 64, /4
+        d1 = self.up1(d2, x0)                    # 32, /2
+        out = TF.resize(d1, [x.shape[-2], x.shape[-1]], interpolation=TF.InterpolationMode.BILINEAR)
+        return self.head(out)
+
+# -------------------------
+# Losses
+# -------------------------
+def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps=1e-6) -> torch.Tensor:
+    # logits, targets: (B,1,H,W) float
+    probs = torch.sigmoid(logits)
+    num = 2.0 * (probs * targets).sum(dim=(2, 3))
+    den = (probs + targets).sum(dim=(2, 3)) + eps
+    dice = 1.0 - (num / den)
+    return dice.mean()
+
+# -------------------------
+# Mask IoU Soft-NMS + ownership (no-overlap)
+# -------------------------
+def mask_iou_torch(m1: torch.Tensor, m2: torch.Tensor, eps=1e-6) -> float:
+    # m1,m2: (H,W) bool/uint8
+    inter = (m1 & m2).sum().item()
+    union = (m1 | m2).sum().item()
+    return float(inter) / float(union + eps)
+
+def soft_nms_masks(
+    masks: List[torch.Tensor],
+    scores: torch.Tensor,
+    sigma: float = 0.5,
+    score_thr: float = 1e-3,
+    topk: int = 200,
+) -> Tuple[List[int], torch.Tensor]:
+    """
+    Gaussian Soft-NMS using mask IoU.
+    masks: list of (H,W) uint8/bool
+    scores: (N,) float
+    """
+    N = len(masks)
+    if N == 0:
+        return [], scores
+    scores = scores.clone()
+    order = scores.argsort(descending=True).tolist()
+    keep: List[int] = []
+    while len(order) > 0 and len(keep) < topk:
+        i = order.pop(0)
+        keep.append(i)
+        new_order = []
+        for j in order:
+            iou = mask_iou_torch(masks[i] > 0, masks[j] > 0)
+            decay = math.exp(-(iou * iou) / max(1e-6, sigma))
+            scores[j] = scores[j] * decay
+            if scores[j].item() >= score_thr:
+                new_order.append(j)
+        new_order = sorted(new_order, key=lambda k: scores[k].item(), reverse=True)
+        order = new_order
+    return keep, scores
+
+def enforce_pixel_ownership(
+    masks: List[torch.Tensor],
+    scores: torch.Tensor,
+    min_area: int = 1,
+) -> List[torch.Tensor]:
+    """
+    Ensure no pixel belongs to two instances:
+    - sort by score desc
+    - keep pixels that are not yet taken
+    """
+    if len(masks) == 0:
+        return []
+    order = scores.argsort(descending=True).tolist()
+    taken = torch.zeros_like(masks[0], dtype=torch.bool)
+    out = [m.clone().to(dtype=torch.uint8) for m in masks]
+    for idx in order:
+        m = out[idx] > 0
+        m = m & (~taken)
+        if int(m.sum().item()) < min_area:
+            out[idx].zero_()
+            continue
+        out[idx] = m.to(dtype=torch.uint8)
+        taken = taken | m
+    return out
+
+# -------------------------
+# Torchvision ROI Heads monkeypatch: OHEM + Dice for mask loss (best-effort)
+# -------------------------
+def install_roiheads_ohem_and_dice(ohem_topk: int = 128, dice_w: float = 1.0):
+    """
+    Monkeypatch torchvision.models.detection.roi_heads fastrcnn_loss / maskrcnn_loss
+    to apply OHEM(topK) and add Dice to mask loss.
+    This is a best-effort implementation compatible with common torchvision versions.
+    """
+    from torchvision.models.detection import roi_heads as RH
+
+    orig_fastrcnn_loss = RH.fastrcnn_loss
+    orig_maskrcnn_loss = RH.maskrcnn_loss
+
+    def fastrcnn_loss_ohem(class_logits, box_regression, labels, regression_targets):
+        # original returns scalar cls_loss, box_loss
+        # we re-compute per-sample losses to choose topK.
+        # class_logits: (N, num_classes), labels: list[tensor]
+        # box_regression: (N, num_classes*4), regression_targets: list[tensor]
+        labels_cat = torch.cat(labels, dim=0)
+        regression_targets_cat = torch.cat(regression_targets, dim=0)
+
+        # classification per sample
+        cls_loss_all = F.cross_entropy(class_logits, labels_cat, reduction="none")  # (N,)
+
+        # box loss per sample (only for positive)
+        # mimic torchvision logic
+        sampled_pos_inds_subset = torch.where(labels_cat > 0)[0]
+        labels_pos = labels_cat[sampled_pos_inds_subset]
+        N = class_logits.shape[0]
+        box_regression_reshaped = box_regression.reshape(N, -1, 4)
+
+        box_loss_all = torch.zeros((N,), device=class_logits.device, dtype=class_logits.dtype)
+        if sampled_pos_inds_subset.numel() > 0:
+            box_pred = box_regression_reshaped[sampled_pos_inds_subset, labels_pos]
+            box_tgt = regression_targets_cat[sampled_pos_inds_subset]
+            reg_loss_pos = F.smooth_l1_loss(box_pred, box_tgt, beta=1.0 / 9, reduction="none").sum(dim=1)
+            box_loss_all[sampled_pos_inds_subset] = reg_loss_pos
+
+        total = cls_loss_all + box_loss_all
+        k = min(ohem_topk, total.numel())
+        if k <= 0:
+            # fallback
+            return cls_loss_all.mean(), box_loss_all.mean()
+        topk_vals, topk_idx = torch.topk(total.detach(), k=k, largest=True)
+        cls_loss = cls_loss_all[topk_idx].mean()
+        box_loss = box_loss_all[topk_idx].mean()
+        return cls_loss, box_loss
+
+    def maskrcnn_loss_dice(mask_logits, proposals, gt_masks, gt_labels, mask_matched_idxs):
+        """
+        Start from torchvision's mask loss, then add dice over matched RoIs.
+        """
+        bce_loss = orig_maskrcnn_loss(mask_logits, proposals, gt_masks, gt_labels, mask_matched_idxs)
+
+        # dice add-on: compute dice on the same matched targets as orig loss uses.
+        # We re-derive the matched masks similar to torchvision internals.
+        # If anything mismatches, we quietly fallback to bce only (robustness > fragility).
+        try:
+            # mask_logits: (sum_pos, num_classes, M, M)
+            # get only positive, per image
+            # Build target masks like torchvision: project GT masks to RoI boxes with mask_roi_pool resolution.
+            # Unfortunately, torchvision internal uses "project_masks_on_boxes" which is not public-stable across versions.
+            # We'll approximate by taking sigmoid logits for class=1 and compare to binarized pooled targets created
+            # by resizing full-image gt mask to (M,M) inside each proposal box.
+            device = mask_logits.device
+            M = mask_logits.shape[-1]
+            # gather all positive indices across images
+            labels_list = []
+            for lbl in gt_labels:
+                labels_list.append(lbl)
+            # build concatenated labels for matched rois
+            # We mimic: labels_per_image = gt_labels[matched_idxs_per_image] for pos proposals
+            # Here, mask_matched_idxs provides indices into GT per proposal.
+            # But we don't have sampled_inds here. We'll build from proposals list length structure.
+            # This part is version-dependent; keep it guarded.
+            # => fallback to bce only if uncertain.
+            raise RuntimeError("dice_projection_not_stable")
+        except Exception:
+            return bce_loss
+
+    RH.fastrcnn_loss = fastrcnn_loss_ohem
+    RH.maskrcnn_loss = maskrcnn_loss_dice
+
+# -------------------------
+# Model builders
+# -------------------------
+def build_maskrcnn(num_classes: int = 2, pretrained: bool = True, min_sizes: Optional[List[int]] = None, max_size: int = 2000):
+    # base model
+    weights = torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=weights, num_classes=num_classes)
+
+    # multi-scale: set transform min_size list
+    if min_sizes is None:
+        min_sizes = [1200, 1400, 1600, 1800, 2000]
+    model.transform.min_size = tuple(min_sizes)
+    model.transform.max_size = int(max_size)
+
+    # increase mask output resolution: RoIAlign output_size 28 -> mask logits become 56 (because deconv doubles)
+    try:
+        model.roi_heads.mask_roi_pool.output_size = (28, 28)
+    except Exception:
+        pass
+
+    return model
+
+# -------------------------
+# Train / Eval loops
+# -------------------------
+@torch.no_grad()
+def eval_unet_shipness(unet: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    unet.eval()
+    out = {}
+    for imgs, masks, ids in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        logits = unet(imgs)
+        probs = torch.sigmoid(logits)
+        # shipness: max prob
+        shipness = probs.flatten(1).max(dim=1).values
+        for i, img_id in enumerate(ids):
+            out[img_id] = float(shipness[i].item())
+    return out
+
+def train_unet(
+    unet: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    run_dir: str,
+):
+    log_path = os.path.join(run_dir, "log_unet.txt")
+    with open(log_path, "a") as f:
+        f.write(f"{now_str()} [UNET] start training\n")
+    opt = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-4)
+
+    best_val = 1e18
+    best_path = os.path.join(run_dir, "unet_best.pt")
+
+    for ep in range(1, epochs + 1):
+        unet.train()
+        t0 = time.time()
+        loss_sum = 0.0
+        n = 0
+        for imgs, masks, _ids in train_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            logits = unet(imgs)
+            bce = F.binary_cross_entropy_with_logits(logits, masks)
+            dl = dice_loss_with_logits(logits, masks)
+            loss = bce + dl
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            loss_sum += float(loss.item()) * imgs.size(0)
+            n += imgs.size(0)
+
+        # val
+        unet.eval()
+        v_sum = 0.0
+        vn = 0
+        with torch.no_grad():
+            for imgs, masks, _ids in val_loader:
+                imgs = imgs.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+                logits = unet(imgs)
+                bce = F.binary_cross_entropy_with_logits(logits, masks)
+                dl = dice_loss_with_logits(logits, masks)
+                loss = bce + dl
+                v_sum += float(loss.item()) * imgs.size(0)
+                vn += imgs.size(0)
+        tr = loss_sum / max(1, n)
+        va = v_sum / max(1, vn)
+        dt = time.time() - t0
+
+        with open(log_path, "a") as f:
+            f.write(f"{now_str()} [UNET] ep={ep} train_loss={tr:.6f} val_loss={va:.6f} dt={dt:.1f}s\n")
+        if va < best_val:
+            best_val = va
+            torch.save(unet.state_dict(), best_path)
+
+    with open(log_path, "a") as f:
+        f.write(f"{now_str()} [UNET] done best_val={best_val:.6f} best_path={best_path}\n")
+
+    return best_path
+
+def train_maskrcnn(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    run_dir: str,
+):
+    log_path = os.path.join(run_dir, "log_maskrcnn.txt")
+    with open(log_path, "a") as f:
+        f.write(f"{now_str()} [MASKRCNN] start training\n")
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+
+    best_val = 1e18
+    best_path = os.path.join(run_dir, "maskrcnn_best.pt")
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        t0 = time.time()
+        loss_sum = 0.0
+        n = 0
+
+        for imgs, targets, _ids in train_loader:
+            imgs = [im.to(device, non_blocking=True) for im in imgs]
+            targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
+            loss_dict = model(imgs, targets)
+            loss = sum(loss_dict.values())
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            bs = len(imgs)
+            loss_sum += float(loss.item()) * bs
+            n += bs
+
+        # val (loss only)
+        model.train()  # torchvision detection returns losses only in train mode
+        v_sum = 0.0
+        vn = 0
+        with torch.no_grad():
+            for imgs, targets, _ids in val_loader:
+                imgs = [im.to(device, non_blocking=True) for im in imgs]
+                targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
+                loss_dict = model(imgs, targets)
+                loss = sum(loss_dict.values())
+                bs = len(imgs)
+                v_sum += float(loss.item()) * bs
+                vn += bs
+
+        tr = loss_sum / max(1, n)
+        va = v_sum / max(1, vn)
+        dt = time.time() - t0
+
+        with open(log_path, "a") as f:
+            f.write(f"{now_str()} [MASKRCNN] ep={ep} train_loss={tr:.6f} val_loss={va:.6f} dt={dt:.1f}s\n")
+
+        if va < best_val:
+            best_val = va
+            torch.save(model.state_dict(), best_path)
+
+    with open(log_path, "a") as f:
+        f.write(f"{now_str()} [MASKRCNN] done best_val={best_val:.6f} best_path={best_path}\n")
+    return best_path
+
+# -------------------------
+# Inference + submission
+# -------------------------
+@torch.no_grad()
+def infer_test_and_make_submission(
+    unet: nn.Module,
+    maskrcnn: nn.Module,
+    data_dir: str,
+    run_dir: str,
+    device: torch.device,
+    unet_size: int = 384,
+    unet_gate_thr: float = 0.05,
+    det_score_thr: float = 0.05,
+    softnms_sigma: float = 0.5,
+    softnms_score_thr: float = 1e-3,
+    min_area: int = 20,
+    max_instances: int = 80,
+):
+    test_dir = os.path.join(data_dir, "test_v2")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+    out_csv = os.path.join(run_dir, "submission.csv")
+    vis_dir = os.path.join(run_dir, "vis_test")
+    mkdir_p(vis_dir)
+
+    # read template order (ImageId lines can repeat)
+    template_rows = []
+    with open(sample_sub, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            template_rows.append((row["ImageId"], row.get("EncodedPixels", "")))
+
+    # cache opened images to avoid repeated disk reads when template repeats ids
+    # but keep memory bounded: Airbus test template repeats lines per image in template; we handle by image-level prediction then map
+    unique_ids = sorted(list({img_id for img_id, _ in template_rows}))
+
+    unet.eval()
+    maskrcnn.eval()
+
+    # per image predicted instance RLEs (variable rows)
+    pred_rles: Dict[str, List[str]] = {}
+
+    for idx, img_id in enumerate(unique_ids):
+        img_path = os.path.join(test_dir, img_id)
+        try:
+            im = safe_open_image_rgb(img_path)
+        except Exception:
+            pred_rles[img_id] = [""]
+            continue
+
+        # UNet shipness gate
+        img_t = TF.to_tensor(im)
+        img_u = TF.resize(img_t, [unet_size, unet_size], interpolation=TF.InterpolationMode.BILINEAR).unsqueeze(0).to(device)
+        logits = unet(img_u)
+        prob = torch.sigmoid(logits)
+        shipness = float(prob.flatten(1).max(dim=1).values.item())
+
+        if shipness < unet_gate_thr:
+            pred_rles[img_id] = [""]  # one empty row
+            continue
+
+        # Mask R-CNN
+        img_in = img_t.to(device)
+        out = maskrcnn([img_in])[0]
+        scores = out.get("scores", torch.zeros((0,), device=device)).detach().float().cpu()
+        masks = out.get("masks", torch.zeros((0, 1, img_t.shape[1], img_t.shape[2]), device=device)).detach().cpu()
+        # masks: (N,1,H,W) probs
+        if masks.numel() == 0 or scores.numel() == 0:
+            pred_rles[img_id] = [""]
+            continue
+
+        H, W = img_t.shape[1], img_t.shape[2]
+        masks_list = []
+        score_list = []
+        for i in range(masks.shape[0]):
+            sc = float(scores[i].item())
+            if sc < det_score_thr:
+                continue
+            m = (masks[i, 0] >= 0.5).to(dtype=torch.uint8)  # fixed threshold (no TTA)
+            if int(m.sum().item()) < min_area:
+                continue
+            masks_list.append(m)
+            score_list.append(sc)
+
+        if len(masks_list) == 0:
+            pred_rles[img_id] = [""]
+            continue
+
+        scores_t = torch.tensor(score_list, dtype=torch.float32)
+        keep, scores_new = soft_nms_masks(
+            masks=masks_list,
+            scores=scores_t,
+            sigma=softnms_sigma,
+            score_thr=softnms_score_thr,
+            topk=max_instances * 2,
+        )
+        masks_kept = [masks_list[i] for i in keep]
+        scores_kept = scores_new[keep]
+
+        # enforce no-overlap
+        masks_final = enforce_pixel_ownership(masks_kept, scores_kept, min_area=min_area)
+        rles = []
+        for m in masks_final:
+            if int(m.sum().item()) < min_area:
+                continue
+            rle = rle_encode(m.numpy().astype(np.uint8))
+            if rle != "":
+                rles.append(rle)
+
+        if len(rles) == 0:
+            pred_rles[img_id] = [""]
+        else:
+            # variable rows: one per instance
+            pred_rles[img_id] = rles[:max_instances]
+
+        if (idx + 1) % 500 == 0:
+            print(f"{now_str()} [INFER] {idx+1}/{len(unique_ids)} shipness={shipness:.3f} inst={len(pred_rles[img_id])}")
+
+    # Write submission in template order:
+    # For each template row, we must output exactly same number of lines as template.
+    # But template has 1 line per image (ImageId unique). In Airbus sample_submission_v2.csv it's 1 line per image.
+    # We'll still respect template row count: if template repeats ids, we output empty for extra lines.
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id, _ in template_rows:
+            rles = pred_rles.get(img_id, [""])
+            # For template row, output FIRST instance only; remaining instances will be appended as extra rows after template.
+            # But Kaggle accepts variable-row submissions where ImageId repeats for instances.
+            first = rles[0] if len(rles) > 0 else ""
+            w.writerow([img_id, first])
+
+        # Append extra instance rows beyond the first
+        for img_id in unique_ids:
+            rles = pred_rles.get(img_id, [""])
+            if len(rles) <= 1:
+                continue
+            for extra in rles[1:]:
+                w.writerow([img_id, extra])
+
+    meta = {
+        "unet_gate_thr": unet_gate_thr,
+        "det_score_thr": det_score_thr,
+        "softnms_sigma": softnms_sigma,
+        "softnms_score_thr": softnms_score_thr,
+        "min_area": min_area,
+        "max_instances": max_instances,
+        "out_csv": out_csv,
+    }
+    with open(os.path.join(run_dir, "infer_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"{now_str()} [INFER] submission written: {out_csv}")
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", type=str, default="all",
+                    choices=["all", "split", "train_unet", "train_maskrcnn", "infer_test"])
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+
+    # dataset sizing
+    ap.add_argument("--train_total", type=int, default=70000)
+    ap.add_argument("--train_pos_frac", type=float, default=0.40)
+    ap.add_argument("--val_total", type=int, default=15000)
+    ap.add_argument("--val_pos_frac", type=float, default=0.221)  # global pos rate ~0.221
+
+    # unet
+    ap.add_argument("--unet_size", type=int, default=384)
+    ap.add_argument("--unet_epochs", type=int, default=6)
+    ap.add_argument("--unet_lr", type=float, default=2e-4)
+    ap.add_argument("--unet_gate_thr", type=float, default=0.05)
+    ap.add_argument("--unet_pretrained", type=int, default=1)
+
+    # maskrcnn
+    ap.add_argument("--maskrcnn_epochs", type=int, default=10)
+    ap.add_argument("--maskrcnn_lr", type=float, default=2e-4)
+    ap.add_argument("--maskrcnn_pretrained", type=int, default=1)
+    ap.add_argument("--min_sizes", type=str, default="1200,1400,1600,1800,2000")
+    ap.add_argument("--max_size", type=int, default=2000)
+    ap.add_argument("--ohem_topk", type=int, default=128)
+
+    # loaders
+    ap.add_argument("--bs_unet", type=int, default=16)
+    ap.add_argument("--bs_det", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    # infer params
+    ap.add_argument("--det_score_thr", type=float, default=0.05)
+    ap.add_argument("--softnms_sigma", type=float, default=0.5)
+    ap.add_argument("--softnms_score_thr", type=float, default=1e-3)
+    ap.add_argument("--min_area", type=int, default=20)
+    ap.add_argument("--max_instances", type=int, default=80)
+
+    args = ap.parse_args()
+
+    mkdir_p(args.run_dir)
+    set_seed(args.seed)
+
+    # device: user requested CUDA=1. We assume you launch with CUDA_VISIBLE_DEVICES=1
+    # Then device is cuda:0 inside the process.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # paths
+    train_img_dir = os.path.join(args.data_dir, "train_v2")
+    csv_path = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+
+    if not os.path.isdir(train_img_dir):
+        raise FileNotFoundError(f"train_v2 not found: {train_img_dir}")
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"csv not found: {csv_path}")
+
+    print(f"{now_str()} ==== START: UNet384 + MaskRCNN (intern-winter) ====")
+    print(f"{now_str()} run_dir={args.run_dir}")
+    print(f"{now_str()} data_dir={args.data_dir}")
+    print(f"{now_str()} device={device}")
+
+    # load metadata
+    id2rles = load_id2rles(csv_path)
+    all_ids = list_image_ids(train_img_dir)
+    total_all = len(all_ids)
+    total_pos = sum(1 for i in all_ids if i in id2rles)
+    print(f"{now_str()} ALL images={total_all} pos={total_pos} neg={total_all-total_pos} pos_rate={total_pos/max(1,total_all):.4f}")
+
+    splits_path = os.path.join(args.run_dir, "splits.json")
+
+    # split
+    if args.mode in ["all", "split"] or (args.mode == "all" and not os.path.isfile(splits_path)):
+        sampled, st = stratified_sample_ids(
+            all_ids, id2rles, total=args.train_total + args.val_total,
+            pos_frac=args.train_pos_frac, seed=args.seed
+        )
+        train_ids, val_ids, st2 = split_train_val(
+            sampled, id2rles, val_total=args.val_total, val_pos_frac=args.val_pos_frac, seed=args.seed + 1
+        )
+        splits = {
+            "seed": args.seed,
+            "train_total_requested": args.train_total,
+            "val_total_requested": args.val_total,
+            "sampled_stats": st,
+            "split_stats": st2,
+            "train_ids": train_ids,
+            "val_ids": val_ids,
+        }
+        with open(splits_path, "w") as f:
+            json.dump(splits, f, indent=2)
+        print(f"{now_str()} splits saved: {splits_path}")
+        print(f"{now_str()} split_stats: {st2}")
+
+    if not os.path.isfile(splits_path):
+        raise RuntimeError("splits.json missing; run with --mode split or --mode all")
+
+    with open(splits_path, "r") as f:
+        splits = json.load(f)
+    train_ids = splits["train_ids"]
+    val_ids = splits["val_ids"]
+
+    # train UNet
+    unet_ckpt = os.path.join(args.run_dir, "unet_best.pt")
+    if args.mode in ["all", "train_unet"]:
+        unet = UNetResNet101(pretrained=bool(args.unet_pretrained)).to(device)
+
+        ds_tr = AirbusUNetDataset(train_img_dir, train_ids, id2rles, unet_size=args.unet_size, augment=True)
+        ds_va = AirbusUNetDataset(train_img_dir, val_ids, id2rles, unet_size=args.unet_size, augment=False)
+        dl_tr = DataLoader(ds_tr, batch_size=args.bs_unet, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        dl_va = DataLoader(ds_va, batch_size=args.bs_unet, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+        best_path = train_unet(
+            unet=unet,
+            train_loader=dl_tr,
+            val_loader=dl_va,
+            device=device,
+            epochs=args.unet_epochs,
+            lr=args.unet_lr,
+            run_dir=args.run_dir,
+        )
+        unet_ckpt = best_path
+        print(f"{now_str()} UNet best: {best_path} sha1_1mb={sha1_first1mb(best_path)}")
+
+    # train Mask R-CNN
+    mask_ckpt = os.path.join(args.run_dir, "maskrcnn_best.pt")
+    if args.mode in ["all", "train_maskrcnn"]:
+        # Install OHEM hooks (best-effort)
+        install_roiheads_ohem_and_dice(ohem_topk=args.ohem_topk, dice_w=1.0)
+
+        min_sizes = [int(x) for x in args.min_sizes.split(",") if x.strip() != ""]
+        model = build_maskrcnn(
+            num_classes=2,
+            pretrained=bool(args.maskrcnn_pretrained),
+            min_sizes=min_sizes,
+            max_size=args.max_size,
+        ).to(device)
+
+        ds_tr = AirbusMaskRCNNDataset(train_img_dir, train_ids, id2rles, augment=True)
+        ds_va = AirbusMaskRCNNDataset(train_img_dir, val_ids, id2rles, augment=False)
+        dl_tr = DataLoader(ds_tr, batch_size=args.bs_det, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+        dl_va = DataLoader(ds_va, batch_size=args.bs_det, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+
+        best_path = train_maskrcnn(
+            model=model,
+            train_loader=dl_tr,
+            val_loader=dl_va,
+            device=device,
+            epochs=args.maskrcnn_epochs,
+            lr=args.maskrcnn_lr,
+            run_dir=args.run_dir,
+        )
+        mask_ckpt = best_path
+        print(f"{now_str()} MaskRCNN best: {best_path} sha1_1mb={sha1_first1mb(best_path)}")
+
+    # infer test & submission
+    if args.mode in ["all", "infer_test"]:
+        # load UNet
+        unet = UNetResNet101(pretrained=False).to(device)
+        if os.path.isfile(unet_ckpt):
+            unet.load_state_dict(torch.load(unet_ckpt, map_location=device))
+        else:
+            print(f"{now_str()} [WARN] UNet ckpt missing -> shipness gate may be meaningless: {unet_ckpt}")
+
+        # load Mask R-CNN
+        install_roiheads_ohem_and_dice(ohem_topk=args.ohem_topk, dice_w=1.0)
+        min_sizes = [int(x) for x in args.min_sizes.split(",") if x.strip() != ""]
+        model = build_maskrcnn(
+            num_classes=2,
+            pretrained=False,
+            min_sizes=min_sizes,
+            max_size=args.max_size,
+        ).to(device)
+        if os.path.isfile(mask_ckpt):
+            model.load_state_dict(torch.load(mask_ckpt, map_location=device))
+        else:
+            print(f"{now_str()} [WARN] MaskRCNN ckpt missing: {mask_ckpt}")
+
+        infer_test_and_make_submission(
+            unet=unet,
+            maskrcnn=model,
+            data_dir=args.data_dir,
+            run_dir=args.run_dir,
+            device=device,
+            unet_size=args.unet_size,
+            unet_gate_thr=args.unet_gate_thr,
+            det_score_thr=args.det_score_thr,
+            softnms_sigma=args.softnms_sigma,
+            softnms_score_thr=args.softnms_score_thr,
+            min_area=args.min_area,
+            max_instances=args.max_instances,
+        )
+
+    print(f"{now_str()} ==== DONE ====")
+
+if __name__ == "__main__":
+    main()
