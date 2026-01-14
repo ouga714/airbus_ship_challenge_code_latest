@@ -1,0 +1,1585 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_airbus_3phase_curriculum_unet_r101_gradcam_internwinter.py
+
+Airbus Ship Detection (Kaggle) - 3-Phase Curriculum Training (intern-winter)
+Model:
+  - U-Net style decoder with ResNet101 encoder (torchvision), output 1 logit channel
+  - FP32 only (NO AMP), NO pandas (csv module)
+Grad-CAM:
+  - Grad-CAM for segmentation (target: encoder.layer4 feature map)
+  - CAM objective: mean(logits * pred_mask) where pred_mask = sigmoid(logits) > thr
+  - Saved visualization includes: original / pred mask / overlay / Grad-CAM overlay (4 panels)
+
+Phases:
+  - Phase1: ship-only crop (high occupancy) -> learn local ship features
+  - Phase2: larger img_size / lower relative occupancy -> add more context while retaining local features
+  - Phase3: full images (ship+no-ship) with stratified sampling of EXACTLY 50,000 images
+Early stopping:
+  - NOT based on best; stop when val_loss plateau (EMA + slope), per-phase params
+Saving:
+  - Save per-phase models (NO best_model.pt): last_model.pt and phase_end_model.pt + meta/log/loss_history
+After Phase3:
+  - choose inference threshold by scanning val for pixel-level F2 (does NOT affect early-stopping)
+Inference:
+  - test_v2 -> variable-row submission.csv (one RLE per connected component; empty => single empty row)
+
+Data assumptions:
+  data_dir/
+    train_v2/
+    test_v2/
+    train_ship_segmentations_v2.csv
+    sample_submission_v2.csv
+
+Run example:
+  export CUDA_VISIBLE_DEVICES=0
+  python3 train_airbus_3phase_curriculum_unet_r101_gradcam_internwinter.py \
+    --data_dir /home/ougaishibashi/kaggle_competition/dataset/airbus_ship_detection \
+    --run_dir  /home/ougaishibashi/kaggle_competition/runs_curriculum/run_001_unet_r101_cam \
+    --seed 42 \
+    --val_total 6000 --val_pos_frac 0.25 \
+    --phase1_img 512 --phase1_crop 256 --phase1_min_occ 0.06 --phase1_epochs 50 --phase1_bs 6 --phase1_lr 2e-4 \
+    --phase2_img 768 --phase2_crop 512 --phase2_min_occ 0.01 --phase2_epochs 40 --phase2_bs 2 --phase2_lr 1e-4 \
+    --phase3_img 768 --phase3_epochs 60 --phase3_bs 2 --phase3_lr 8e-5 \
+    --phase3_train_total 50000 --phase3_pos_frac 0.40 \
+    --phase3_shipcrop_ratio 0.20 --phase3_shipcrop_crop 512 --phase3_shipcrop_min_occ 0.005 \
+    --w_bce 1.0 --w_tv 1.0 --pos_weight 3.0 --tv_alpha 0.6 --tv_beta 0.4 \
+    --es_ema_alpha 0.3 \
+    --es1_min_epochs 10 --es1_window 6 --es1_slope_eps 5e-4 --es1_patience 4 \
+    --es2_min_epochs 8  --es2_window 6 --es2_slope_eps 3e-4 --es2_patience 5 \
+    --es3_min_epochs 12 --es3_window 8 --es3_slope_eps 2e-4 --es3_patience 7 \
+    --thr_scan 1 --thr_min 0.01 --thr_max 0.30 --thr_steps 30 \
+    --min_area 50 \
+    --save_vis 1 --vis_n 200 \
+    --cam_alpha 0.45 \
+    --num_workers 4 \
+    --log_every 50
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import hashlib
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from PIL import Image, ImageEnhance
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision
+from torchvision.transforms import functional as TF
+
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def sha1_first_1mb(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(1024 * 1024))
+    return h.hexdigest()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def list_image_ids(img_dir: str) -> List[str]:
+    ids = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+
+# ----------------------------
+# RLE encode/decode (Airbus format)
+# - 1-indexed starts
+# - column-major (Fortran order)
+# ----------------------------
+
+def rle_decode(rle: str, h: int, w: int) -> np.ndarray:
+    """
+    Returns mask (h, w) uint8 in {0,1}
+    """
+    if rle is None or rle == "":
+        return np.zeros((h, w), dtype=np.uint8)
+
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+
+    ends = starts + lengths
+    flat = np.zeros(h * w, dtype=np.uint8)
+    for st, en in zip(starts, ends):
+        flat[st:en] = 1
+
+    # column-major to (h, w)
+    mask = flat.reshape((w, h), order="F").T
+    return mask
+
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: (h, w) uint8/bool {0,1}
+    Returns Airbus RLE (column-major, 1-indexed)
+    """
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    h, w = mask.shape
+    # Flatten in column-major
+    flat = mask.T.reshape(-1, order="F")
+    # Pad zeros at both ends
+    padded = np.concatenate([[0], flat, [0]])
+    changes = np.where(padded[1:] != padded[:-1])[0]
+    if len(changes) == 0:
+        return ""
+    runs = changes + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+# ----------------------------
+# CSV parsing (NO pandas)
+# ----------------------------
+
+def load_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    """
+    Build mapping from ImageId -> list of RLEs (POS only; empty rle rows ignored)
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None or rle == "":
+                continue
+            id2rles.setdefault(img_id, []).append(rle)
+    return id2rles
+
+
+def build_full_mask_from_rles(rles: List[str], h: int, w: int) -> np.ndarray:
+    if not rles:
+        return np.zeros((h, w), dtype=np.uint8)
+    m = np.zeros((h, w), dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode(r, h, w)
+    m = (m > 0).astype(np.uint8)
+    return m
+
+
+# ----------------------------
+# Geometry helpers
+# ----------------------------
+
+def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """
+    mask: (H,W) {0,1}
+    returns bbox (x0,y0,x1,y1) inclusive-exclusive or None if empty
+    """
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return (x0, y0, x1, y1)
+
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def make_ship_crop(
+    img: Image.Image,
+    mask: np.ndarray,
+    crop_size: int,
+    min_occ: float,
+    max_trials: int,
+    jitter: int,
+) -> Tuple[Image.Image, np.ndarray, float]:
+    """
+    Ship-centric crop around bbox with occupancy constraint.
+    NOTE: occ here is bbox_area_in_crop / crop_area (not exact mask area).
+    If constraint can't be met, returns best attempt (highest occ).
+    """
+    w, h = img.size
+    bbox = mask_to_bbox(mask)
+    if bbox is None:
+        # fallback: random crop
+        x0 = random.randint(0, max(0, w - crop_size))
+        y0 = random.randint(0, max(0, h - crop_size))
+        crop_img = img.crop((x0, y0, x0 + crop_size, y0 + crop_size))
+        crop_mask = mask[y0:y0 + crop_size, x0:x0 + crop_size]
+        return crop_img, crop_mask, 0.0
+
+    bx0, by0, bx1, by1 = bbox
+    crop_area = float(crop_size * crop_size)
+
+    best = None
+    best_occ = -1.0
+
+    for _ in range(max_trials):
+        cx = (bx0 + bx1) // 2 + random.randint(-jitter, jitter)
+        cy = (by0 + by1) // 2 + random.randint(-jitter, jitter)
+
+        x0 = clamp(cx - crop_size // 2, 0, max(0, w - crop_size))
+        y0 = clamp(cy - crop_size // 2, 0, max(0, h - crop_size))
+
+        crop_mask = mask[y0:y0 + crop_size, x0:x0 + crop_size]
+        bb = mask_to_bbox(crop_mask)
+        if bb is None:
+            occ = 0.0
+        else:
+            x0b, y0b, x1b, y1b = bb
+            occ = float((x1b - x0b) * (y1b - y0b)) / crop_area
+
+        if occ > best_occ:
+            crop_img = img.crop((x0, y0, x0 + crop_size, y0 + crop_size))
+            best = (crop_img, crop_mask.copy(), occ)
+            best_occ = occ
+
+        if occ >= min_occ:
+            break
+
+    assert best is not None
+    return best
+
+
+# ----------------------------
+# Light augmentation (shape-safe)
+# ----------------------------
+
+def apply_augmentations(img: Image.Image, mask: np.ndarray, do_aug: bool) -> Tuple[Image.Image, np.ndarray]:
+    if not do_aug:
+        return img, mask
+
+    # Random horizontal/vertical flips
+    if random.random() < 0.5:
+        img = TF.hflip(img)
+        mask = np.ascontiguousarray(np.fliplr(mask))
+    if random.random() < 0.2:
+        img = TF.vflip(img)
+        mask = np.ascontiguousarray(np.flipud(mask))
+
+    # Mild brightness/contrast
+    if random.random() < 0.5:
+        b = 0.9 + 0.2 * random.random()
+        img = ImageEnhance.Brightness(img).enhance(b)
+    if random.random() < 0.5:
+        c = 0.9 + 0.2 * random.random()
+        img = ImageEnhance.Contrast(img).enhance(c)
+
+    return img, mask
+
+
+# ----------------------------
+# Dataset
+# ----------------------------
+
+@dataclass
+class PhaseConfig:
+    name: str
+    img_size: int
+    crop_size: Optional[int]  # if ship crop, else None
+    ship_only: bool
+    min_occ: float
+    ship_crop_ratio: float  # only used when not ship_only (Phase3 mix)
+    ship_crop_trials: int
+    ship_crop_jitter: int
+    aug: bool
+
+
+class AirbusDataset(Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        ids: List[str],
+        id2rles: Dict[str, List[str]],
+        phase: PhaseConfig,
+    ):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.phase = phase
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _load_image_and_mask(self, img_id: str) -> Tuple[Image.Image, np.ndarray]:
+        path = os.path.join(self.img_dir, img_id)
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        rles = self.id2rles.get(img_id, [])
+        mask = build_full_mask_from_rles(rles, h, w)
+        return img, mask
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_id = self.ids[idx]
+        img, mask = self._load_image_and_mask(img_id)
+        is_pos = (img_id in self.id2rles)
+
+        # Decide ship crop
+        use_ship_crop = False
+        if self.phase.ship_only:
+            use_ship_crop = True
+        else:
+            # Phase3 mix: only for pos images and with ratio
+            if is_pos and self.phase.crop_size is not None and random.random() < self.phase.ship_crop_ratio:
+                use_ship_crop = True
+
+        if use_ship_crop and self.phase.crop_size is not None:
+            img, mask, _occ = make_ship_crop(
+                img=img,
+                mask=mask,
+                crop_size=self.phase.crop_size,
+                min_occ=self.phase.min_occ,
+                max_trials=self.phase.ship_crop_trials,
+                jitter=self.phase.ship_crop_jitter,
+            )
+
+        # Augmentations (shape-safe)
+        img, mask = apply_augmentations(img, mask, self.phase.aug)
+
+        # Resize
+        img = img.resize((self.phase.img_size, self.phase.img_size), resample=Image.BILINEAR)
+        # mask resize nearest
+        mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+        mask_img = mask_img.resize((self.phase.img_size, self.phase.img_size), resample=Image.NEAREST)
+        mask = (np.array(mask_img) > 127).astype(np.float32)
+
+        # To tensor
+        x = TF.to_tensor(img)  # [0,1], float32
+        # ImageNet normalize
+        x = TF.normalize(x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        y = torch.from_numpy(mask).unsqueeze(0)  # [1,H,W]
+        return x, y
+
+
+# ----------------------------
+# Model: U-Net with ResNet101 encoder
+# ----------------------------
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, p: int = 1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = ConvBNReLU(in_ch + skip_ch, out_ch, 3, 1)
+        self.conv2 = ConvBNReLU(out_ch, out_ch, 3, 1)
+
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor]) -> torch.Tensor:
+        x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        if skip is not None:
+            # ensure same spatial size (robust)
+            if x.shape[-2:] != skip.shape[-2:]:
+                skip = torch.nn.functional.interpolate(skip, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = torch.cat([x, skip], dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResNet101_UNet(nn.Module):
+    """
+    Encoder: torchvision resnet101
+    Skips:
+      x0: after conv1+bn1+relu (1/2)
+      x2: after layer1 (1/4)
+      x3: after layer2 (1/8)
+      x4: after layer3 (1/16)
+      x5: after layer4 (1/32)
+    Decoder:
+      x5 -> (up+skip x4) -> (up+skip x3) -> (up+skip x2) -> (up+skip x0) -> up -> logits
+    """
+    def __init__(self, out_ch: int = 1):
+        super().__init__()
+        enc = torchvision.models.resnet101(weights=None)
+        self.encoder = enc  # keep as attribute for Grad-CAM target access
+
+        # Encoder parts
+        self.enc_conv1 = enc.conv1
+        self.enc_bn1 = enc.bn1
+        self.enc_relu = enc.relu
+        self.enc_maxpool = enc.maxpool
+        self.enc_layer1 = enc.layer1
+        self.enc_layer2 = enc.layer2
+        self.enc_layer3 = enc.layer3
+        self.enc_layer4 = enc.layer4
+
+        # Channel dimensions for ResNet101:
+        # x0: 64
+        # x2(layer1): 256
+        # x3(layer2): 512
+        # x4(layer3): 1024
+        # x5(layer4): 2048
+        self.center = nn.Sequential(
+            ConvBNReLU(2048, 512, 3, 1),
+            ConvBNReLU(512, 512, 3, 1),
+        )
+
+        self.dec4 = DecoderBlock(in_ch=512, skip_ch=1024, out_ch=256)  # -> 1/16
+        self.dec3 = DecoderBlock(in_ch=256, skip_ch=512, out_ch=128)   # -> 1/8
+        self.dec2 = DecoderBlock(in_ch=128, skip_ch=256, out_ch=64)    # -> 1/4
+        self.dec1 = DecoderBlock(in_ch=64, skip_ch=64, out_ch=64)      # -> 1/2 (skip x0)
+
+        # final up to 1/1
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            ConvBNReLU(64, 32, 3, 1),
+            nn.Conv2d(32, out_ch, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder forward
+        x0 = self.enc_relu(self.enc_bn1(self.enc_conv1(x)))  # 1/2, 64ch
+        x1 = self.enc_maxpool(x0)                            # 1/4, 64ch
+        x2 = self.enc_layer1(x1)                             # 1/4, 256ch
+        x3 = self.enc_layer2(x2)                             # 1/8, 512ch
+        x4 = self.enc_layer3(x3)                             # 1/16, 1024ch
+        x5 = self.enc_layer4(x4)                             # 1/32, 2048ch
+
+        c = self.center(x5)                                  # 1/32, 512ch
+
+        d4 = self.dec4(c, x4)                                # 1/16, 256ch
+        d3 = self.dec3(d4, x3)                               # 1/8, 128ch
+        d2 = self.dec2(d3, x2)                               # 1/4, 64ch
+        d1 = self.dec1(d2, x0)                               # 1/2, 64ch
+
+        logits = self.final_up(d1)                           # 1/1, out_ch
+        return logits
+
+
+def build_model() -> nn.Module:
+    # requested: ResNet101 backbone U-Net
+    return ResNet101_UNet(out_ch=1)
+
+
+# ----------------------------
+# Grad-CAM (Segmentation)
+# ----------------------------
+
+class GradCAM:
+    """
+    Minimal Grad-CAM implementation for a single target module.
+
+    For segmentation, we define a scalar objective:
+      obj = mean(logits * mask)
+    where mask is binary (predicted mask or provided mask), and does not require grad.
+    """
+    def __init__(self, model: nn.Module, target_module: nn.Module):
+        self.model = model
+        self.target_module = target_module
+        self.activations = None
+        self.gradients = None
+        self.hook_handles = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def fwd_hook(module, inp, out):
+            self.activations = out
+
+        def bwd_hook(module, grad_in, grad_out):
+            # grad_out is tuple; grad_out[0] matches out grad
+            self.gradients = grad_out[0]
+
+        self.hook_handles.append(self.target_module.register_forward_hook(fwd_hook))
+        # full_backward_hook is safer in newer torch
+        if hasattr(self.target_module, "register_full_backward_hook"):
+            self.hook_handles.append(self.target_module.register_full_backward_hook(bwd_hook))
+        else:
+            self.hook_handles.append(self.target_module.register_backward_hook(bwd_hook))
+
+    def close(self):
+        for h in self.hook_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.hook_handles = []
+
+    def __call__(self, x: torch.Tensor, thr: float, mask_override: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Returns cam in shape [B, 1, H, W] normalized to [0,1] (same spatial as input).
+        """
+        self.model.zero_grad(set_to_none=True)
+
+        logits = self.model(x)  # [B,1,H,W]
+        with torch.no_grad():
+            prob = torch.sigmoid(logits)
+            if mask_override is None:
+                m = (prob > thr).float()
+                # if empty everywhere, fall back to soft mask to keep gradients meaningful
+                empty = (m.sum(dim=(1,2,3)) <= 0.0).float().view(-1,1,1,1)
+                m = m + empty * (prob > (thr * 0.5)).float()
+                # still empty? use prob itself
+                empty2 = (m.sum(dim=(1,2,3)) <= 0.0).float().view(-1,1,1,1)
+                m = m + empty2 * prob
+            else:
+                m = mask_override.float()
+
+        obj = (logits * m).mean()
+        obj.backward(retain_graph=False)
+
+        if self.activations is None or self.gradients is None:
+            # fallback: return zeros
+            return torch.zeros_like(x[:, :1])
+
+        A = self.activations            # [B,C,h,w]
+        dYdA = self.gradients           # [B,C,h,w]
+        # weights: GAP over spatial
+        w = dYdA.mean(dim=(2, 3), keepdim=True)  # [B,C,1,1]
+        cam = (w * A).sum(dim=1, keepdim=True)   # [B,1,h,w]
+        cam = torch.relu(cam)
+
+        # upsample to input size
+        cam = torch.nn.functional.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        # normalize per-sample
+        B = cam.shape[0]
+        cam_ = cam.view(B, -1)
+        cam_min = cam_.min(dim=1)[0].view(B, 1, 1, 1)
+        cam_max = cam_.max(dim=1)[0].view(B, 1, 1, 1)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+        cam = cam.clamp(0.0, 1.0)
+        return cam
+
+
+# ----------------------------
+# Loss
+# ----------------------------
+
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.6, beta: float = 0.4, eps: float = 1e-6):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.eps = float(eps)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits: [B,1,H,W], targets: [B,1,H,W] in {0,1}
+        probs = torch.sigmoid(logits)
+        t = targets
+        p = probs
+
+        tp = (p * t).sum(dim=(0, 2, 3))
+        fp = (p * (1 - t)).sum(dim=(0, 2, 3))
+        fn = ((1 - p) * t).sum(dim=(0, 2, 3))
+
+        tversky = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+        return 1.0 - tversky.mean()
+
+
+@dataclass
+class LossConfig:
+    w_bce: float
+    w_tv: float
+    pos_weight: float
+    tv_alpha: float
+    tv_beta: float
+
+
+def compute_loss(logits: torch.Tensor, targets: torch.Tensor, cfg: LossConfig, device: torch.device) -> Tuple[torch.Tensor, Dict[str, float]]:
+    # BCE
+    pos_w = torch.tensor([cfg.pos_weight], dtype=logits.dtype, device=device)
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)(logits, targets)
+
+    # Tversky
+    tv = TverskyLoss(alpha=cfg.tv_alpha, beta=cfg.tv_beta)(logits, targets)
+
+    total = cfg.w_bce * bce + cfg.w_tv * tv
+    metrics = {
+        "loss_total": float(total.detach().cpu().item()),
+        "loss_bce": float(bce.detach().cpu().item()),
+        "loss_tversky": float(tv.detach().cpu().item()),
+    }
+    return total, metrics
+
+
+# ----------------------------
+# Metrics (for threshold scan only; NOT for early stopping)
+# ----------------------------
+
+def fbeta_from_conf(tp: int, fp: int, fn: int, beta: float) -> float:
+    b2 = beta * beta
+    denom = (1 + b2) * tp + b2 * fn + fp
+    if denom <= 0:
+        return 0.0
+    return (1 + b2) * tp / denom
+
+
+def scan_threshold_f2(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    thr_list: List[float],
+) -> Dict[str, float]:
+    """
+    Compute pixel-level F2 over val for each threshold and return best.
+    """
+    model.eval()
+    stats = {thr: {"tp": 0, "fp": 0, "fn": 0} for thr in thr_list}
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)  # [B,1,H,W]
+            prob = torch.sigmoid(logits)
+            gt = (y > 0.5)
+
+            for thr in thr_list:
+                pred = (prob > thr)
+                tp = int((pred & gt).sum().item())
+                fp = int((pred & (~gt)).sum().item())
+                fn = int(((~pred) & gt).sum().item())
+                stats[thr]["tp"] += tp
+                stats[thr]["fp"] += fp
+                stats[thr]["fn"] += fn
+
+    best_thr = thr_list[0]
+    best_f2 = -1.0
+    for thr in thr_list:
+        tp = stats[thr]["tp"]
+        fp = stats[thr]["fp"]
+        fn = stats[thr]["fn"]
+        f2 = fbeta_from_conf(tp, fp, fn, beta=2.0)
+        if f2 > best_f2:
+            best_f2 = f2
+            best_thr = thr
+
+    return {"best_thr": float(best_thr), "best_f2": float(best_f2)}
+
+
+# ----------------------------
+# Connected components (pure numpy) for binary masks
+# ----------------------------
+
+def connected_components_8(mask: np.ndarray) -> List[np.ndarray]:
+    """
+    mask: (H,W) uint8 {0,1}
+    returns list of component masks (uint8 {0,1})
+    """
+    H, W = mask.shape
+    visited = np.zeros((H, W), dtype=np.uint8)
+    comps = []
+
+    neigh = [(-1, -1), (-1, 0), (-1, 1),
+             (0, -1),          (0, 1),
+             (1, -1),  (1, 0), (1, 1)]
+
+    for y in range(H):
+        for x in range(W):
+            if mask[y, x] == 0 or visited[y, x] == 1:
+                continue
+            q = [(y, x)]
+            visited[y, x] = 1
+            pixels = [(y, x)]
+            while q:
+                cy, cx = q.pop()
+                for dy, dx in neigh:
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < H and 0 <= nx < W:
+                        if mask[ny, nx] == 1 and visited[ny, nx] == 0:
+                            visited[ny, nx] = 1
+                            q.append((ny, nx))
+                            pixels.append((ny, nx))
+            comp = np.zeros((H, W), dtype=np.uint8)
+            ys = [p[0] for p in pixels]
+            xs = [p[1] for p in pixels]
+            comp[ys, xs] = 1
+            comps.append(comp)
+    return comps
+
+
+# ----------------------------
+# Early stopping (loss plateau)
+# ----------------------------
+
+@dataclass
+class ESConfig:
+    ema_alpha: float
+    window: int
+    slope_eps: float
+    patience: int
+    min_epochs: int
+
+
+class LossPlateauES:
+    def __init__(self, cfg: ESConfig):
+        self.cfg = cfg
+        self.val_losses: List[float] = []
+        self.ema: List[float] = []
+        self.slope: List[float] = []
+        self.plateau_count = 0
+        self.stop_reason = ""
+
+    def step(self, val_loss: float, epoch: int) -> bool:
+        if (not np.isfinite(val_loss)) or math.isnan(val_loss):
+            self.stop_reason = "nan_or_inf_val_loss"
+            return True
+
+        self.val_losses.append(float(val_loss))
+
+        if len(self.ema) == 0:
+            s = float(val_loss)
+        else:
+            s = self.cfg.ema_alpha * float(val_loss) + (1.0 - self.cfg.ema_alpha) * self.ema[-1]
+        self.ema.append(float(s))
+
+        if len(self.ema) >= self.cfg.window:
+            y = np.array(self.ema[-self.cfg.window:], dtype=np.float64)
+            x = np.arange(len(y), dtype=np.float64)
+            slope = float(np.polyfit(x, y, 1)[0])
+        else:
+            slope = float("nan")
+        self.slope.append(slope)
+
+        if len(self.ema) >= self.cfg.window and epoch >= self.cfg.min_epochs:
+            if (-slope) < self.cfg.slope_eps:
+                self.plateau_count += 1
+            else:
+                self.plateau_count = 0
+
+            if self.plateau_count >= self.cfg.patience:
+                self.stop_reason = "loss_plateau"
+                return True
+
+        return False
+
+    def history(self) -> Dict[str, List[float]]:
+        return {"val_loss": self.val_losses, "ema": self.ema, "slope": self.slope}
+
+
+# ----------------------------
+# Train / Val loops
+# ----------------------------
+
+def run_one_epoch_train(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    loss_cfg: LossConfig,
+    log_every: int,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    total_bce = 0.0
+    total_tv = 0.0
+    n = 0
+
+    for it, (x, y) in enumerate(loader):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss, m = compute_loss(logits, y, loss_cfg, device)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += m["loss_total"]
+        total_bce += m["loss_bce"]
+        total_tv += m["loss_tversky"]
+        n += 1
+
+        if log_every > 0 and (it + 1) % log_every == 0:
+            print(f"{now_str()} [train] it={it+1}/{len(loader)} loss={m['loss_total']:.5f} bce={m['loss_bce']:.5f} tv={m['loss_tversky']:.5f}")
+
+    if n == 0:
+        return {"loss_total": float("nan"), "loss_bce": float("nan"), "loss_tversky": float("nan")}
+    return {"loss_total": total_loss / n, "loss_bce": total_bce / n, "loss_tversky": total_tv / n}
+
+
+@torch.no_grad()
+def run_one_epoch_val(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_cfg: LossConfig,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_bce = 0.0
+    total_tv = 0.0
+    n = 0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        loss, m = compute_loss(logits, y, loss_cfg, device)
+        total_loss += m["loss_total"]
+        total_bce += m["loss_bce"]
+        total_tv += m["loss_tversky"]
+        n += 1
+
+    if n == 0:
+        return {"loss_total": float("nan"), "loss_bce": float("nan"), "loss_tversky": float("nan")}
+    return {"loss_total": total_loss / n, "loss_bce": total_bce / n, "loss_tversky": total_tv / n}
+
+
+# ----------------------------
+# Visualization (mask + Grad-CAM)
+# ----------------------------
+
+def overlay_mask_on_image(img: Image.Image, mask: np.ndarray, alpha: float = 0.5) -> Image.Image:
+    img = img.convert("RGB")
+    H, W = mask.shape
+    m = (mask * 255).astype(np.uint8)
+    m_img = Image.fromarray(m, mode="L").resize(img.size, resample=Image.NEAREST)
+    overlay = Image.new("RGB", img.size, (255, 0, 0))
+    blended = Image.blend(img, overlay, alpha=alpha)
+    out = Image.composite(blended, img, m_img)
+    return out
+
+
+def cam_to_rgb(cam01: np.ndarray) -> np.ndarray:
+    """
+    cam01: (H,W) float in [0,1]
+    Return RGB heatmap uint8 (H,W,3) with a simple "hot" mapping.
+    """
+    cam = np.clip(cam01, 0.0, 1.0)
+    # simple hot colormap: black -> red -> yellow -> white
+    r = (np.clip(cam * 3.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    g = (np.clip((cam - 1.0/3.0) * 3.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    b = (np.clip((cam - 2.0/3.0) * 3.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb = np.stack([r, g, b], axis=-1)
+    return rgb
+
+
+def overlay_cam_on_image(img: Image.Image, cam01: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    img0 = img.convert("RGB")
+    cam_rgb = cam_to_rgb(cam01)
+    cam_img = Image.fromarray(cam_rgb, mode="RGB").resize(img0.size, resample=Image.BILINEAR)
+    out = Image.blend(img0, cam_img, alpha=alpha)
+    return out
+
+
+def save_concat_vis4(out_path: str, img: Image.Image, pred_mask: np.ndarray, cam01: Optional[np.ndarray], cam_alpha: float) -> None:
+    """
+    4 panels: original / pred mask / overlay mask / Grad-CAM overlay
+    If cam01 is None, Grad-CAM panel becomes a copy of original.
+    """
+    img0 = img.convert("RGB")
+    m = Image.fromarray((pred_mask * 255).astype(np.uint8), mode="L").resize(img0.size, resample=Image.NEAREST).convert("RGB")
+    ov = overlay_mask_on_image(img0, pred_mask, alpha=0.45)
+    if cam01 is None:
+        cam_ov = img0
+    else:
+        cam_ov = overlay_cam_on_image(img0, cam01, alpha=cam_alpha)
+
+    w, h = img0.size
+    canvas = Image.new("RGB", (w * 4, h))
+    canvas.paste(img0, (0, 0))
+    canvas.paste(m, (w, 0))
+    canvas.paste(ov, (w * 2, 0))
+    canvas.paste(cam_ov, (w * 3, 0))
+    canvas.save(out_path, quality=92)
+
+
+# ----------------------------
+# Inference + submission (+ Grad-CAM vis)
+# ----------------------------
+
+@torch.no_grad()
+def _preprocess_one(img: Image.Image, img_size: int) -> torch.Tensor:
+    img_r = img.resize((img_size, img_size), resample=Image.BILINEAR)
+    x = TF.to_tensor(img_r)
+    x = TF.normalize(x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    return x
+
+
+def infer_test_and_make_submission(
+    model: nn.Module,
+    gradcam: Optional[GradCAM],
+    test_dir: str,
+    sample_sub_path: str,
+    out_csv_path: str,
+    device: torch.device,
+    img_size: int,
+    thr: float,
+    min_area: int,
+    vis_dir: Optional[str],
+    vis_n: int,
+    cam_alpha: float,
+) -> None:
+    """
+    - Keep sample_submission_v2.csv order (unique ids in first-appearance order)
+    - Variable rows allowed: one row per connected component instance
+    - If no instance: exactly one row with empty EncodedPixels
+    - Optional vis: only for ship-positive predictions (at least one component)
+      save: original / mask / overlay / Grad-CAM overlay
+    """
+    model.eval()
+
+    template_ids = []
+    seen = set()
+    with open(sample_sub_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            img_id = row["ImageId"]
+            if img_id not in seen:
+                template_ids.append(img_id)
+                seen.add(img_id)
+
+    ensure_dir(os.path.dirname(out_csv_path))
+    if vis_dir is not None:
+        ensure_dir(vis_dir)
+
+    wrote = 0
+    vis_count = 0
+
+    with open(out_csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+
+        for img_id in template_ids:
+            img_path = os.path.join(test_dir, img_id)
+            img = Image.open(img_path).convert("RGB")
+            orig_w, orig_h = img.size
+
+            x = _preprocess_one(img, img_size).unsqueeze(0).to(device)
+
+            logits = model(x)  # [1,1,H,W]
+            prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
+
+            # back to original size (Airbus images are 768x768 typically)
+            prob_img = Image.fromarray((prob * 255).astype(np.uint8), mode="L").resize((orig_w, orig_h), resample=Image.BILINEAR)
+            prob = (np.array(prob_img).astype(np.float32) / 255.0)
+
+            binm = (prob > thr).astype(np.uint8)
+
+            comps = connected_components_8(binm)
+            comps = [c for c in comps if int(c.sum()) >= int(min_area)]
+
+            if len(comps) == 0:
+                w.writerow([img_id, ""])
+                wrote += 1
+            else:
+                for comp in comps:
+                    rle = rle_encode(comp)
+                    w.writerow([img_id, rle])
+                    wrote += 1
+
+            # vis (ship-positive only)
+            if vis_dir is not None and vis_count < vis_n and len(comps) > 0:
+                union = np.zeros((orig_h, orig_w), dtype=np.uint8)
+                for c in comps:
+                    union |= c
+
+                cam01 = None
+                if gradcam is not None:
+                    # compute CAM in model input resolution, then resize to orig
+                    # NOTE: Grad-CAM needs gradients => must run WITHOUT torch.no_grad
+                    pass
+
+                # If Grad-CAM requested, do one extra forward/backward in grad-enabled mode
+                if gradcam is not None:
+                    # recompute in grad mode
+                    with torch.enable_grad():
+                        xg = _preprocess_one(img, img_size).unsqueeze(0).to(device)
+                        cam_t = gradcam(xg, thr=thr)  # [1,1,H,W] in input resolution
+                        cam_np = cam_t[0, 0].detach().cpu().numpy().astype(np.float32)
+                        cam_img = Image.fromarray((cam_np * 255).astype(np.uint8), mode="L").resize((orig_w, orig_h), resample=Image.BILINEAR)
+                        cam01 = (np.array(cam_img).astype(np.float32) / 255.0)
+
+                save_concat_vis4(
+                    out_path=os.path.join(vis_dir, f"{vis_count:04d}__{img_id}.jpg"),
+                    img=img,
+                    pred_mask=union,
+                    cam01=cam01,
+                    cam_alpha=cam_alpha,
+                )
+                vis_count += 1
+
+    print(f"{now_str()} [infer] wrote_rows={wrote} -> {out_csv_path}")
+
+
+# ----------------------------
+# Splits (val fixed across phases)
+# ----------------------------
+
+def stratified_sample(ids: List[str], k: int, seed: int) -> List[str]:
+    rng = random.Random(seed)
+    if k >= len(ids):
+        return list(ids)
+    return rng.sample(ids, k)
+
+
+def make_val_split(
+    pos_ids: List[str],
+    neg_ids: List[str],
+    val_total: int,
+    val_pos_frac: float,
+    seed: int,
+) -> Tuple[List[str], List[str], List[str]]:
+    val_pos = int(round(val_total * val_pos_frac))
+    val_pos = min(val_pos, len(pos_ids))
+    val_neg = val_total - val_pos
+    val_neg = min(val_neg, len(neg_ids))
+    val_total = val_pos + val_neg
+
+    rng = random.Random(seed)
+
+    pos_shuf = list(pos_ids)
+    neg_shuf = list(neg_ids)
+    rng.shuffle(pos_shuf)
+    rng.shuffle(neg_shuf)
+
+    val_ids = pos_shuf[:val_pos] + neg_shuf[:val_neg]
+    rem_pos = pos_shuf[val_pos:]
+    rem_neg = neg_shuf[val_neg:]
+    rng.shuffle(val_ids)
+    return val_ids, rem_pos, rem_neg
+
+
+def write_json(path: str, obj: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+# ----------------------------
+# Phase runner
+# ----------------------------
+
+def run_phase(
+    phase_dir: str,
+    phase_name: str,
+    model: nn.Module,
+    init_ckpt_path: Optional[str],
+    train_ids: List[str],
+    val_ids: List[str],
+    img_dir: str,
+    id2rles: Dict[str, List[str]],
+    phase_cfg: PhaseConfig,
+    loss_cfg: LossConfig,
+    es_cfg: ESConfig,
+    device: torch.device,
+    lr: float,
+    weight_decay: float,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+    log_every: int,
+) -> str:
+    ensure_dir(phase_dir)
+    log_path = os.path.join(phase_dir, "log.txt")
+
+    def log(msg: str) -> None:
+        line = f"{now_str()} {msg}"
+        print(line)
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
+
+    if init_ckpt_path is not None:
+        sd = torch.load(init_ckpt_path, map_location=device)
+        model.load_state_dict(sd, strict=True)
+        log(f"[init] loaded={init_ckpt_path} sha1_1mb={sha1_first_1mb(init_ckpt_path)}")
+
+    train_ds = AirbusDataset(img_dir=img_dir, ids=train_ids, id2rles=id2rles, phase=phase_cfg)
+    val_ds = AirbusDataset(
+        img_dir=img_dir,
+        ids=val_ids,
+        id2rles=id2rles,
+        phase=PhaseConfig(
+            name="val",
+            img_size=phase_cfg.img_size,  # match phase size for val_loss stability
+            crop_size=None,               # NO ship crop on val
+            ship_only=False,
+            min_occ=0.0,
+            ship_crop_ratio=0.0,
+            ship_crop_trials=0,
+            ship_crop_jitter=0,
+            aug=False
+        )
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=max(1, batch_size), shuffle=False,
+        num_workers=num_workers, pin_memory=True, drop_last=False
+    )
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    es = LossPlateauES(es_cfg)
+
+    meta = {
+        "phase_name": phase_name,
+        "time_start": now_str(),
+        "init_ckpt_path": init_ckpt_path,
+        "phase_cfg": vars(phase_cfg),
+        "loss_cfg": vars(loss_cfg),
+        "es_cfg": vars(es_cfg),
+        "optim": {"lr": lr, "weight_decay": weight_decay},
+        "epochs_max": epochs,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "train_ids_n": len(train_ids),
+        "val_ids_n": len(val_ids),
+    }
+    write_json(os.path.join(phase_dir, "meta.json"), meta)
+
+    last_model_path = os.path.join(phase_dir, "last_model.pt")
+    phase_end_path = os.path.join(phase_dir, "phase_end_model.pt")
+
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        tr = run_one_epoch_train(model, train_loader, optimizer, device, loss_cfg, log_every=log_every)
+        va = run_one_epoch_val(model, val_loader, device, loss_cfg)
+        dt = time.time() - t0
+
+        log(f"[epoch {epoch:03d}] train_loss={tr['loss_total']:.6f} (bce={tr['loss_bce']:.6f}, tv={tr['loss_tversky']:.6f}) | "
+            f"val_loss={va['loss_total']:.6f} (bce={va['loss_bce']:.6f}, tv={va['loss_tversky']:.6f}) | time={dt:.1f}s")
+
+        torch.save(model.state_dict(), last_model_path)
+
+        stop = es.step(val_loss=float(va["loss_total"]), epoch=epoch)
+        write_json(os.path.join(phase_dir, "loss_history.json"), {
+            "history": es.history(),
+            "plateau_count": es.plateau_count,
+            "stop_reason": es.stop_reason,
+        })
+
+        if stop:
+            log(f"[early_stop] reason={es.stop_reason} epoch={epoch} plateau_count={es.plateau_count}")
+            break
+
+    torch.save(model.state_dict(), phase_end_path)
+
+    meta["time_end"] = now_str()
+    meta["stop_reason"] = es.stop_reason
+    meta["epochs_ran"] = len(es.val_losses)
+    write_json(os.path.join(phase_dir, "meta.json"), meta)
+
+    log(f"[save] last_model.pt={last_model_path} sha1_1mb={sha1_first_1mb(last_model_path)}")
+    log(f"[save] phase_end_model.pt={phase_end_path} sha1_1mb={sha1_first_1mb(phase_end_path)}")
+    return phase_end_path
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    # Splits
+    ap.add_argument("--val_total", type=int, default=6000)
+    ap.add_argument("--val_pos_frac", type=float, default=0.25)
+
+    # Phase1
+    ap.add_argument("--phase1_img", type=int, default=512)
+    ap.add_argument("--phase1_crop", type=int, default=256)
+    ap.add_argument("--phase1_min_occ", type=float, default=0.06)
+    ap.add_argument("--phase1_epochs", type=int, default=50)
+    ap.add_argument("--phase1_bs", type=int, default=6)
+    ap.add_argument("--phase1_lr", type=float, default=2e-4)
+    ap.add_argument("--phase1_wd", type=float, default=1e-4)
+
+    # Phase2
+    ap.add_argument("--phase2_img", type=int, default=768)
+    ap.add_argument("--phase2_crop", type=int, default=512)
+    ap.add_argument("--phase2_min_occ", type=float, default=0.01)
+    ap.add_argument("--phase2_epochs", type=int, default=40)
+    ap.add_argument("--phase2_bs", type=int, default=2)
+    ap.add_argument("--phase2_lr", type=float, default=1e-4)
+    ap.add_argument("--phase2_wd", type=float, default=1e-4)
+
+    # Phase3 (full 50k)
+    ap.add_argument("--phase3_img", type=int, default=768)
+    ap.add_argument("--phase3_epochs", type=int, default=60)
+    ap.add_argument("--phase3_bs", type=int, default=2)
+    ap.add_argument("--phase3_lr", type=float, default=8e-5)
+    ap.add_argument("--phase3_wd", type=float, default=1e-4)
+    ap.add_argument("--phase3_train_total", type=int, default=50000)
+    ap.add_argument("--phase3_pos_frac", type=float, default=0.40)
+    ap.add_argument("--phase3_shipcrop_ratio", type=float, default=0.20)
+    ap.add_argument("--phase3_shipcrop_crop", type=int, default=512)
+    ap.add_argument("--phase3_shipcrop_min_occ", type=float, default=0.005)
+
+    # Loss
+    ap.add_argument("--w_bce", type=float, default=1.0)
+    ap.add_argument("--w_tv", type=float, default=1.0)
+    ap.add_argument("--pos_weight", type=float, default=3.0)
+    ap.add_argument("--tv_alpha", type=float, default=0.6)
+    ap.add_argument("--tv_beta", type=float, default=0.4)
+
+    # Early stopping (loss plateau, per-phase defaults)
+    ap.add_argument("--es_ema_alpha", type=float, default=0.3)
+    ap.add_argument("--es1_min_epochs", type=int, default=10)
+    ap.add_argument("--es1_window", type=int, default=6)
+    ap.add_argument("--es1_slope_eps", type=float, default=5e-4)
+    ap.add_argument("--es1_patience", type=int, default=4)
+
+    ap.add_argument("--es2_min_epochs", type=int, default=8)
+    ap.add_argument("--es2_window", type=int, default=6)
+    ap.add_argument("--es2_slope_eps", type=float, default=3e-4)
+    ap.add_argument("--es2_patience", type=int, default=5)
+
+    ap.add_argument("--es3_min_epochs", type=int, default=12)
+    ap.add_argument("--es3_window", type=int, default=8)
+    ap.add_argument("--es3_slope_eps", type=float, default=2e-4)
+    ap.add_argument("--es3_patience", type=int, default=7)
+
+    # Inference / submission
+    ap.add_argument("--min_area", type=int, default=50)
+    ap.add_argument("--thr_scan", type=int, default=1)
+    ap.add_argument("--thr_min", type=float, default=0.01)
+    ap.add_argument("--thr_max", type=float, default=0.30)
+    ap.add_argument("--thr_steps", type=int, default=30)
+
+    # Vis + Grad-CAM
+    ap.add_argument("--save_vis", type=int, default=1)
+    ap.add_argument("--vis_n", type=int, default=200)
+    ap.add_argument("--cam_alpha", type=float, default=0.45)
+
+    ap.add_argument("--log_every", type=int, default=50)
+
+    args = ap.parse_args()
+    set_seed(args.seed)
+
+    data_dir = args.data_dir
+    run_dir = args.run_dir
+    ensure_dir(run_dir)
+
+    # Paths
+    train_dir = os.path.join(data_dir, "train_v2")
+    test_dir = os.path.join(data_dir, "test_v2")
+    csv_path = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+
+    # Validate
+    for p in [train_dir, test_dir, csv_path, sample_sub]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
+
+    # Build population
+    all_train_ids = list_image_ids(train_dir)
+    id2rles = load_id2rles(csv_path)
+    pos_ids = sorted(list(set(id2rles.keys()) & set(all_train_ids)))
+    neg_ids = sorted(list(set(all_train_ids) - set(pos_ids)))
+
+    print(f"{now_str()} ALL={len(all_train_ids)} POS={len(pos_ids)} NEG={len(neg_ids)} pos_rate={len(pos_ids)/max(1,len(all_train_ids)):.4f}")
+    write_json(os.path.join(run_dir, "dataset_stats.json"), {
+        "all": len(all_train_ids),
+        "pos": len(pos_ids),
+        "neg": len(neg_ids),
+        "pos_rate": float(len(pos_ids) / max(1, len(all_train_ids))),
+    })
+
+    # Fixed val split
+    val_ids, rem_pos, rem_neg = make_val_split(
+        pos_ids=pos_ids, neg_ids=neg_ids,
+        val_total=args.val_total, val_pos_frac=args.val_pos_frac,
+        seed=args.seed
+    )
+
+    # Phase pools
+    phase1_train_ids = list(rem_pos)  # ship-only: POS only
+    phase2_train_ids = list(rem_pos)  # ship-only: POS only
+
+    phase3_total = int(args.phase3_train_total)
+    phase3_pos = int(round(phase3_total * args.phase3_pos_frac))
+    phase3_neg = phase3_total - phase3_pos
+    phase3_pos = min(phase3_pos, len(rem_pos))
+    phase3_neg = min(phase3_neg, len(rem_neg))
+
+    if phase3_pos + phase3_neg < phase3_total:
+        deficit = phase3_total - (phase3_pos + phase3_neg)
+        extra_neg = min(deficit, len(rem_neg) - phase3_neg)
+        phase3_neg += extra_neg
+        deficit -= extra_neg
+        extra_pos = min(deficit, len(rem_pos) - phase3_pos)
+        phase3_pos += extra_pos
+        deficit -= extra_pos
+        if deficit > 0:
+            print(f"[WARN] Could not reach phase3_total={phase3_total}; using {phase3_pos+phase3_neg} due to pool limits.")
+
+    phase3_pos_ids = stratified_sample(rem_pos, phase3_pos, seed=args.seed + 1001)
+    phase3_neg_ids = stratified_sample(rem_neg, phase3_neg, seed=args.seed + 2002)
+    phase3_train_ids = phase3_pos_ids + phase3_neg_ids
+    random.Random(args.seed + 3003).shuffle(phase3_train_ids)
+
+    splits = {
+        "seed": args.seed,
+        "val_total": args.val_total,
+        "val_pos_frac": args.val_pos_frac,
+        "val_ids": val_ids,
+        "phase1_train_pos_ids": phase1_train_ids,
+        "phase2_train_pos_ids": phase2_train_ids,
+        "phase3_train_ids": phase3_train_ids,
+        "phase3_train_total": len(phase3_train_ids),
+        "phase3_pos": int(sum([1 for x in phase3_train_ids if x in id2rles])),
+        "phase3_neg": int(sum([1 for x in phase3_train_ids if x not in id2rles])),
+    }
+    write_json(os.path.join(run_dir, "splits.json"), splits)
+
+    print(f"{now_str()} VAL={len(val_ids)} | P1_train(POS)={len(phase1_train_ids)} | "
+          f"P3_train={len(phase3_train_ids)} (pos={splits['phase3_pos']}, neg={splits['phase3_neg']})")
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"{now_str()} device={device} torch={torch.__version__} torchvision={torchvision.__version__}")
+
+    # Model (U-Net r101)
+    model = build_model().to(device)
+
+    # Grad-CAM target: encoder.layer4 output (best practical target for ResNet)
+    gradcam = None
+    try:
+        gradcam = GradCAM(model=model, target_module=model.enc_layer4)
+        print(f"{now_str()} Grad-CAM enabled: target=model.enc_layer4")
+    except Exception as e:
+        print(f"{now_str()} [WARN] Grad-CAM init failed: {e}. Continue without CAM.")
+        gradcam = None
+
+    loss_cfg = LossConfig(
+        w_bce=args.w_bce, w_tv=args.w_tv,
+        pos_weight=args.pos_weight,
+        tv_alpha=args.tv_alpha, tv_beta=args.tv_beta
+    )
+
+    # ---------------- Phase 1 ----------------
+    phase1_dir = os.path.join(run_dir, "phase1_shiponly_occHigh")
+    p1 = PhaseConfig(
+        name="phase1",
+        img_size=args.phase1_img,
+        crop_size=args.phase1_crop,
+        ship_only=True,
+        min_occ=args.phase1_min_occ,
+        ship_crop_ratio=1.0,
+        ship_crop_trials=30,
+        ship_crop_jitter=16,
+        aug=True,
+    )
+    es1 = ESConfig(
+        ema_alpha=args.es_ema_alpha,
+        window=args.es1_window,
+        slope_eps=args.es1_slope_eps,
+        patience=args.es1_patience,
+        min_epochs=args.es1_min_epochs,
+    )
+    ckpt1 = run_phase(
+        phase_dir=phase1_dir,
+        phase_name="phase1",
+        model=model,
+        init_ckpt_path=None,
+        train_ids=phase1_train_ids,
+        val_ids=val_ids,
+        img_dir=train_dir,
+        id2rles=id2rles,
+        phase_cfg=p1,
+        loss_cfg=loss_cfg,
+        es_cfg=es1,
+        device=device,
+        lr=args.phase1_lr,
+        weight_decay=args.phase1_wd,
+        epochs=args.phase1_epochs,
+        batch_size=args.phase1_bs,
+        num_workers=args.num_workers,
+        log_every=args.log_every,
+    )
+
+    # ---------------- Phase 2 ----------------
+    phase2_dir = os.path.join(run_dir, "phase2_imgUp_occLow")
+    p2 = PhaseConfig(
+        name="phase2",
+        img_size=args.phase2_img,
+        crop_size=args.phase2_crop,
+        ship_only=True,
+        min_occ=args.phase2_min_occ,
+        ship_crop_ratio=1.0,
+        ship_crop_trials=25,
+        ship_crop_jitter=24,
+        aug=True,
+    )
+    es2 = ESConfig(
+        ema_alpha=args.es_ema_alpha,
+        window=args.es2_window,
+        slope_eps=args.es2_slope_eps,
+        patience=args.es2_patience,
+        min_epochs=args.es2_min_epochs,
+    )
+    ckpt2 = run_phase(
+        phase_dir=phase2_dir,
+        phase_name="phase2",
+        model=model,
+        init_ckpt_path=ckpt1,
+        train_ids=phase2_train_ids,
+        val_ids=val_ids,
+        img_dir=train_dir,
+        id2rles=id2rles,
+        phase_cfg=p2,
+        loss_cfg=loss_cfg,
+        es_cfg=es2,
+        device=device,
+        lr=args.phase2_lr,
+        weight_decay=args.phase2_wd,
+        epochs=args.phase2_epochs,
+        batch_size=args.phase2_bs,
+        num_workers=args.num_workers,
+        log_every=args.log_every,
+    )
+
+    # ---------------- Phase 3 ----------------
+    phase3_dir = os.path.join(run_dir, "phase3_full50k")
+    p3 = PhaseConfig(
+        name="phase3",
+        img_size=args.phase3_img,
+        crop_size=args.phase3_shipcrop_crop,  # used only when ship_crop_ratio > 0
+        ship_only=False,
+        min_occ=args.phase3_shipcrop_min_occ,
+        ship_crop_ratio=args.phase3_shipcrop_ratio,
+        ship_crop_trials=20,
+        ship_crop_jitter=28,
+        aug=True,
+    )
+    es3 = ESConfig(
+        ema_alpha=args.es_ema_alpha,
+        window=args.es3_window,
+        slope_eps=args.es3_slope_eps,
+        patience=args.es3_patience,
+        min_epochs=args.es3_min_epochs,
+    )
+    ckpt3 = run_phase(
+        phase_dir=phase3_dir,
+        phase_name="phase3",
+        model=model,
+        init_ckpt_path=ckpt2,
+        train_ids=phase3_train_ids,
+        val_ids=val_ids,
+        img_dir=train_dir,
+        id2rles=id2rles,
+        phase_cfg=p3,
+        loss_cfg=loss_cfg,
+        es_cfg=es3,
+        device=device,
+        lr=args.phase3_lr,
+        weight_decay=args.phase3_wd,
+        epochs=args.phase3_epochs,
+        batch_size=args.phase3_bs,
+        num_workers=args.num_workers,
+        log_every=args.log_every,
+    )
+
+    # Load phase3 end model for inference
+    model.load_state_dict(torch.load(ckpt3, map_location=device), strict=True)
+
+    # Threshold scan on val
+    thr = 0.05
+    thr_scan_result = None
+    if int(args.thr_scan) == 1:
+        thr_list = np.linspace(args.thr_min, args.thr_max, args.thr_steps).tolist()
+        val_ds_for_thr = AirbusDataset(
+            img_dir=train_dir,
+            ids=val_ids,
+            id2rles=id2rles,
+            phase=PhaseConfig(
+                name="val_thr",
+                img_size=args.phase3_img,
+                crop_size=None,
+                ship_only=False,
+                min_occ=0.0,
+                ship_crop_ratio=0.0,
+                ship_crop_trials=0,
+                ship_crop_jitter=0,
+                aug=False,
+            )
+        )
+        val_loader_thr = DataLoader(val_ds_for_thr, batch_size=1, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True)
+        thr_scan_result = scan_threshold_f2(model, val_loader_thr, device, thr_list)
+        thr = float(thr_scan_result["best_thr"])
+        write_json(os.path.join(run_dir, "thr_scan_phase3_val.json"), thr_scan_result)
+        print(f"{now_str()} [thr_scan] best_thr={thr:.5f} best_f2={thr_scan_result['best_f2']:.6f}")
+
+    # Inference + submission + vis(+Grad-CAM)
+    submission_path = os.path.join(run_dir, "submission.csv")
+    vis_dir = os.path.join(run_dir, "vis_test") if int(args.save_vis) == 1 else None
+    infer_test_and_make_submission(
+        model=model,
+        gradcam=gradcam,
+        test_dir=test_dir,
+        sample_sub_path=sample_sub,
+        out_csv_path=submission_path,
+        device=device,
+        img_size=args.phase3_img,
+        thr=thr,
+        min_area=args.min_area,
+        vis_dir=vis_dir,
+        vis_n=args.vis_n,
+        cam_alpha=float(args.cam_alpha),
+    )
+
+    # Final meta
+    final_meta = {
+        "time_end": now_str(),
+        "run_dir": run_dir,
+        "seed": args.seed,
+        "model": "UNet(ResNet101-encoder) + GradCAM(target=enc_layer4)",
+        "phase1_end_ckpt": ckpt1,
+        "phase2_end_ckpt": ckpt2,
+        "phase3_end_ckpt": ckpt3,
+        "thr_scan_result": thr_scan_result,
+        "inference_thr": float(thr),
+        "submission_path": submission_path,
+        "vis_dir": vis_dir,
+        "note": "Early stopping is loss-plateau based (EMA+slope), NOT best-based. best_model.pt is not used.",
+    }
+    write_json(os.path.join(run_dir, "final_meta.json"), final_meta)
+    print(f"{now_str()} DONE -> {run_dir}")
+
+    if gradcam is not None:
+        gradcam.close()
+
+
+if __name__ == "__main__":
+    main()
