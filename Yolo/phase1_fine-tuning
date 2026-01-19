@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_airbus_yolo26_phase1_pos10k_crop_finetune_internwinter_v2.py
+
+Airbus Ship Detection (Kaggle) - YOLO26 Instance Segmentation Phase1 ONLY (POS 10k ship-centered crop)
+- Init weights: last.pt (fine-tune)
+- Exclude broken images/labels (log + fail-fast)
+- Build crop dataset: 10k POS images -> ship-centered square crop -> resize to imgsz -> YOLO seg labels (polygons)
+- Train with Ultralytics YOLO-seg
+- Early stopping: VAL LOSS saturation (sum of val/*loss from results.csv). Ultralytics fitness-based ES disabled.
+- Evaluate on VAL crops: instance IoU matching F2 (Airbus-like), not union-pixel F2
+- Save model_paths.json with absolute paths, and create run_dir/best.pt, run_dir/last.pt shortcuts
+
+No pandas. Uses csv module.
+
+Expected Airbus dataset structure:
+  data_dir/
+    train_v2/
+    test_v2/
+    train_ship_segmentations_v2.csv
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import shutil
+import random
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import cv2
+
+from ultralytics import YOLO
+
+
+# =========================================================
+# Reproducibility
+# =========================================================
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+# =========================================================
+# RLE decode (Airbus)
+# =========================================================
+def rle_decode(rle: str, height: int, width: int) -> np.ndarray:
+    """
+    Decode Kaggle Airbus RLE to binary mask.
+    Airbus RLE is 1-indexed and column-major (Fortran order).
+    Returns uint8 mask shape (H, W) with values 0/1.
+    """
+    mask = np.zeros(height * width, dtype=np.uint8)
+    s = rle.strip().split()
+    if len(s) == 0:
+        return mask.reshape((height, width), order="F")
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    for lo, hi in zip(starts, ends):
+        if lo < 0 or hi > mask.shape[0] or hi <= lo:
+            # invalid segment
+            continue
+        mask[lo:hi] = 1
+    return mask.reshape((height, width), order="F")
+
+
+# =========================================================
+# Mask -> polygons (YOLO seg labels)
+# =========================================================
+def mask_to_polygons(mask_u8: np.ndarray, eps: float = 1.0, min_area: int = 10) -> List[np.ndarray]:
+    """
+    Convert binary mask (uint8 0/1) to list of polygons (Nx2).
+    """
+    if mask_u8.dtype != np.uint8:
+        mask_u8 = mask_u8.astype(np.uint8)
+    if mask_u8.max() == 0:
+        return []
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys: List[np.ndarray] = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < float(min_area):
+            continue
+        approx = cv2.approxPolyDP(cnt, eps, closed=True)
+        approx = approx.reshape(-1, 2)
+        if approx.shape[0] < 3:
+            continue
+        polys.append(approx)
+    return polys
+
+
+def poly_to_yolo_seg_line(poly_xy: np.ndarray, h: int, w: int, cls_id: int = 0) -> str:
+    """
+    Convert polygon (Nx2 pixel coords) -> YOLO seg format:
+      cls x1 y1 x2 y2 ... (normalized 0-1)
+    """
+    poly = poly_xy.astype(np.float32)
+    poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+    poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+    poly[:, 0] /= float(w)
+    poly[:, 1] /= float(h)
+    coords = []
+    for x, y in poly:
+        coords.append(f"{x:.6f}")
+        coords.append(f"{y:.6f}")
+    return f"{cls_id} " + " ".join(coords)
+
+
+# =========================================================
+# CSV parsing / listing
+# =========================================================
+def load_airbus_rles(csv_path: Path) -> Dict[str, List[str]]:
+    """
+    Returns dict: image_id -> list of non-empty RLE strings (instances)
+    """
+    rles: Dict[str, List[str]] = {}
+    with csv_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            enc = row["EncodedPixels"]
+            if img_id not in rles:
+                rles[img_id] = []
+            if enc is None:
+                continue
+            enc = enc.strip()
+            if enc != "":
+                rles[img_id].append(enc)
+    return rles
+
+
+def list_train_images(train_dir: Path) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png"}
+    ids: List[str] = []
+    for p in sorted(train_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in exts:
+            ids.append(p.name)
+    return ids
+
+
+def build_pos_ids(all_ids: List[str], rles: Dict[str, List[str]]) -> List[str]:
+    pos = []
+    for img_id in all_ids:
+        if len(rles.get(img_id, [])) > 0:
+            pos.append(img_id)
+    return pos
+
+
+# =========================================================
+# Broken image / label filtering
+# =========================================================
+def is_broken_image(img_bgr: Optional[np.ndarray], expect_square: bool = True) -> bool:
+    if img_bgr is None:
+        return True
+    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
+        return True
+    h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return True
+    if expect_square and h != w:
+        return True
+    if h < 256 or w < 256:
+        return True
+    return False
+
+
+def validate_rles_for_image(rle_list: List[str], h: int, w: int) -> bool:
+    """
+    Return True if label looks OK.
+    We decode at least one RLE; if all decodes end up empty, treat as invalid for POS.
+    """
+    if not rle_list:
+        return False
+    any_ok = False
+    any_nonempty = False
+    for rle in rle_list:
+        try:
+            m = rle_decode(rle, h, w)
+            any_ok = True
+            if m.max() > 0:
+                any_nonempty = True
+                break
+        except Exception:
+            continue
+    return any_ok and any_nonempty
+
+
+# =========================================================
+# Crop utilities (ship-centered)
+# =========================================================
+def bbox_from_mask(mask_u8: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Return bbox (x1,y1,x2,y2) inclusive-exclusive [x1,x2), [y1,y2) from a binary mask.
+    """
+    ys, xs = np.where(mask_u8 > 0)
+    if len(xs) == 0:
+        return None
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
+    return x1, y1, x2, y2
+
+
+def ship_centered_square_crop(
+    img_bgr: np.ndarray,
+    inst_masks_u8: List[np.ndarray],  # each (H,W) 0/1
+    crop_size: int = 512,
+    margin: float = 0.25,
+    img_pad_mode: int = cv2.BORDER_REFLECT_101,
+) -> Tuple[np.ndarray, List[np.ndarray], Dict]:
+    """
+    Choose one instance (largest area) and crop around its bbox center (square).
+    Return cropped image and cropped masks (all instances), with crop metadata.
+
+    IMPORTANT FIX:
+      - Image padding can be reflect.
+      - Mask padding MUST be constant 0 (otherwise "ghost ships" appear).
+    """
+    H, W = img_bgr.shape[:2]
+    assert H == W, "Airbus images expected square (768x768)."
+
+    areas = [int(m.sum()) for m in inst_masks_u8]
+    if len(areas) == 0 or max(areas) == 0:
+        raise RuntimeError("No non-empty instance masks for POS crop.")
+
+    # pick largest ship instance for stable crops
+    idx = int(np.argmax(np.array(areas)))
+    m_ref = inst_masks_u8[idx]
+    bb = bbox_from_mask(m_ref)
+    if bb is None:
+        raise RuntimeError("Reference instance bbox not found.")
+    x1, y1, x2, y2 = bb
+    bw = x2 - x1
+    bh = y2 - y1
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+
+    side = max(bw, bh)
+    side = int(math.ceil(side * (1.0 + 2.0 * float(margin))))
+    side = max(side, int(crop_size))
+
+    half = side * 0.5
+    left = int(round(cx - half))
+    top  = int(round(cy - half))
+    right = left + side
+    bottom = top + side
+
+    pad_left = max(0, -left)
+    pad_top = max(0, -top)
+    pad_right = max(0, right - W)
+    pad_bottom = max(0, bottom - H)
+
+    img_pad = img_bgr
+    masks_pad = inst_masks_u8
+
+    if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+        # image: reflect is OK
+        img_pad = cv2.copyMakeBorder(img_bgr, pad_top, pad_bottom, pad_left, pad_right, img_pad_mode)
+
+        # masks: MUST be 0-constant padding (no reflection!)
+        masks_pad2 = []
+        for m in inst_masks_u8:
+            mp = cv2.copyMakeBorder(
+                m.astype(np.uint8),
+                pad_top, pad_bottom, pad_left, pad_right,
+                borderType=cv2.BORDER_CONSTANT,
+                value=0
+            )
+            masks_pad2.append(mp)
+        masks_pad = masks_pad2
+
+    left2 = left + pad_left
+    top2 = top + pad_top
+    right2 = right + pad_left
+    bottom2 = bottom + pad_top
+
+    crop_img = img_pad[top2:bottom2, left2:right2].copy()
+    crop_masks = [m[top2:bottom2, left2:right2].copy().astype(np.uint8) for m in masks_pad]
+
+    meta = {
+        "ref_instance_idx": idx,
+        "orig_H": H,
+        "orig_W": W,
+        "side": side,
+        "bbox_ref": [x1, y1, x2, y2],
+        "crop_box_orig": [left, top, right, bottom],
+        "pad": [pad_left, pad_top, pad_right, pad_bottom],
+        "crop_box_padded": [left2, top2, right2, bottom2],
+    }
+    return crop_img, crop_masks, meta
+
+
+def resize_square(img: np.ndarray, size: int, is_mask: bool = False) -> np.ndarray:
+    interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
+    return cv2.resize(img, (size, size), interpolation=interp)
+
+
+# =========================================================
+# Dataset builder for Phase1 crops
+# =========================================================
+def write_yolo_data_yaml(ds_root: Path) -> Path:
+    data_yaml = ds_root / "airbus_phase1_pos10k_crop.yaml"
+    yaml_lines = [
+        f"path: {ds_root.as_posix()}",
+        "train: images/train",
+        "val: images/val",
+        "names:",
+        "  0: ship",
+    ]
+    data_yaml.write_text("\n".join(yaml_lines) + "\n")
+    return data_yaml
+
+
+def build_phase1_crop_dataset(
+    data_dir: Path,
+    run_dir: Path,
+    pos_ids: List[str],
+    rles: Dict[str, List[str]],
+    pos_total: int,
+    val_total: int,
+    seed: int,
+    crop_size: int,
+    margin: float,
+    imgsz: int,
+    poly_eps: float,
+    poly_min_area: int,
+    expect_square: bool = True,
+    fail_fast_ratio: float = 0.01,
+) -> Tuple[Path, Path, Path]:
+    """
+    Build dataset under run_dir/dataset_phase1_pos10k_crop
+    Returns (data_yaml, splits_dir, gt_val_dir)
+    - gt_val_dir stores per-sample GT instance masks (npz) for evaluation
+    """
+    train_src = data_dir / "train_v2"
+    assert train_src.exists(), f"Missing train_v2: {train_src}"
+
+    rng = random.Random(seed)
+
+    ds_root = run_dir / "dataset_phase1_pos10k_crop"
+    img_train = ds_root / "images" / "train"
+    img_val   = ds_root / "images" / "val"
+    lab_train = ds_root / "labels" / "train"
+    lab_val   = ds_root / "labels" / "val"
+    for d in [img_train, img_val, lab_train, lab_val]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    splits_dir = run_dir / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_val_dir = run_dir / "gt_val_npz"
+    gt_val_dir.mkdir(parents=True, exist_ok=True)
+
+    bad_img_path = run_dir / "bad_images.txt"
+    bad_lbl_path = run_dir / "bad_labels.txt"
+    bad_img_path.write_text("")
+    bad_lbl_path.write_text("")
+
+    # -----------------------------------------------------
+    # Filter broken images/labels first
+    # -----------------------------------------------------
+    ok_pos_ids: List[str] = []
+    bad_images: List[str] = []
+    bad_labels: List[str] = []
+
+    print("[FILTER] Checking POS images/labels integrity...")
+    t0 = time.time()
+    for i, img_id in enumerate(pos_ids):
+        p = train_src / img_id
+        img = cv2.imread(p.as_posix(), cv2.IMREAD_COLOR)
+        if is_broken_image(img, expect_square=expect_square):
+            bad_images.append(img_id)
+            continue
+        H, W = img.shape[:2]
+        rle_list = rles.get(img_id, [])
+        if not validate_rles_for_image(rle_list, H, W):
+            bad_labels.append(img_id)
+            continue
+        ok_pos_ids.append(img_id)
+        if (i + 1) % 5000 == 0:
+            print(f"  checked {i+1}/{len(pos_ids)} (ok={len(ok_pos_ids)})")
+    dt = time.time() - t0
+    print(f"[FILTER] Done. ok_pos={len(ok_pos_ids)} bad_img={len(bad_images)} bad_lbl={len(bad_labels)} elapsed={dt:.1f}s")
+
+    bad_img_path.write_text("\n".join(bad_images) + ("\n" if len(bad_images) > 0 else ""))
+    bad_lbl_path.write_text("\n".join(bad_labels) + ("\n" if len(bad_labels) > 0 else ""))
+
+    total_checked = len(pos_ids)
+    if total_checked > 0:
+        bad_ratio = (len(bad_images) + len(bad_labels)) / float(total_checked)
+        if bad_ratio > float(fail_fast_ratio):
+            raise RuntimeError(f"Too many broken samples: bad_ratio={bad_ratio:.4f} > {fail_fast_ratio:.4f}")
+
+    if len(ok_pos_ids) < pos_total:
+        raise RuntimeError(f"Not enough valid POS images: ok_pos={len(ok_pos_ids)} < pos_total={pos_total}")
+
+    # -----------------------------------------------------
+    # Sample pos_total and split pos-only train/val
+    # -----------------------------------------------------
+    rng.shuffle(ok_pos_ids)
+    selected = ok_pos_ids[:pos_total]
+    if val_total >= pos_total:
+        raise ValueError("val_total must be smaller than pos_total")
+
+    val_ids = selected[:val_total]
+    train_ids = selected[val_total:]
+
+    (splits_dir / "pos_train_ids.txt").write_text("\n".join(train_ids) + "\n")
+    (splits_dir / "pos_val_ids.txt").write_text("\n".join(val_ids) + "\n")
+
+    # -----------------------------------------------------
+    # Build crops + labels
+    # -----------------------------------------------------
+    index_csv = run_dir / "crop_index.csv"
+    with index_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "crop_id", "orig_id", "split",
+            "ref_instance_idx", "side", "crop_box_orig", "pad", "crop_box_padded"
+        ])
+
+        def process_one(img_id: str, split: str, crop_idx: int) -> str:
+            src = train_src / img_id
+            img = cv2.imread(src.as_posix(), cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError(f"Failed to read (unexpected after filter): {src}")
+
+            H, W = img.shape[:2]
+            rle_list = rles.get(img_id, [])
+            inst_masks = []
+            for rr in rle_list:
+                m = rle_decode(rr, H, W).astype(np.uint8)
+                if m.max() > 0:
+                    inst_masks.append(m)
+            if len(inst_masks) == 0:
+                raise RuntimeError(f"POS image but no decodable mask: {img_id}")
+
+            crop_img, crop_inst_masks, meta = ship_centered_square_crop(
+                img_bgr=img,
+                inst_masks_u8=inst_masks,
+                crop_size=crop_size,
+                margin=margin,
+                img_pad_mode=cv2.BORDER_REFLECT_101,
+            )
+
+            crop_img_rs = resize_square(crop_img, imgsz, is_mask=False)
+
+            lines: List[str] = []
+            gt_masks_rs: List[np.ndarray] = []
+            for m in crop_inst_masks:
+                m_rs = resize_square(m, imgsz, is_mask=True)
+                m_rs = (m_rs > 0).astype(np.uint8)
+                if m_rs.sum() == 0:
+                    continue
+                gt_masks_rs.append(m_rs)
+                polys = mask_to_polygons(m_rs, eps=poly_eps, min_area=poly_min_area)
+                for poly in polys:
+                    lines.append(poly_to_yolo_seg_line(poly, imgsz, imgsz, cls_id=0))
+
+            crop_id = f"{Path(img_id).stem}__c{crop_idx:05d}"
+
+            # POS-only Phase1 なので、空labelは警告（稀に起こる）
+            if len(lines) == 0:
+                print(f"[WARN] empty yolo-label after polygonize: orig={img_id} crop={crop_id}")
+
+            if split == "train":
+                dst_img = img_train / f"{crop_id}.jpg"
+                dst_lab = lab_train / f"{crop_id}.txt"
+            else:
+                dst_img = img_val / f"{crop_id}.jpg"
+                dst_lab = lab_val / f"{crop_id}.txt"
+
+            cv2.imwrite(dst_img.as_posix(), crop_img_rs)
+            dst_lab.write_text("\n".join(lines) + ("\n" if len(lines) > 0 else ""))
+
+            if split == "val":
+                if len(gt_masks_rs) == 0:
+                    np.savez_compressed((gt_val_dir / f"{crop_id}.npz").as_posix(),
+                                        masks=np.zeros((0, imgsz, imgsz), dtype=np.uint8))
+                else:
+                    stacked = np.stack(gt_masks_rs, axis=0).astype(np.uint8)
+                    np.savez_compressed((gt_val_dir / f"{crop_id}.npz").as_posix(), masks=stacked)
+
+            writer.writerow([
+                crop_id, img_id, split,
+                meta["ref_instance_idx"], meta["side"],
+                json.dumps(meta["crop_box_orig"]),
+                json.dumps(meta["pad"]),
+                json.dumps(meta["crop_box_padded"]),
+            ])
+            return crop_id
+
+        print("[DATA] Building Phase1 crop dataset...")
+        t1 = time.time()
+        for i, img_id in enumerate(train_ids):
+            process_one(img_id, "train", i)
+            if (i + 1) % 1000 == 0:
+                print(f"  train crops: {i+1}/{len(train_ids)}")
+        for i, img_id in enumerate(val_ids):
+            process_one(img_id, "val", i)
+            if (i + 1) % 200 == 0:
+                print(f"  val crops: {i+1}/{len(val_ids)}")
+        print(f"[DATA] Done. elapsed={time.time()-t1:.1f}s")
+        print(f"[DATA] ds_root={ds_root}")
+
+    data_yaml = write_yolo_data_yaml(ds_root)
+    return data_yaml, splits_dir, gt_val_dir
+
+
+# =========================================================
+# Early stopping callback (VAL loss saturation)
+# =========================================================
+class ValLossEarlyStopper:
+    """
+    Custom early stopper based on VAL LOSS saturation.
+    Reads trainer.csv (Ultralytics results.csv).
+    val_loss_sum = sum of 'val/*loss' columns.
+    """
+
+    def __init__(self, min_epochs: int, patience: int, min_delta: float, nan_patience: int = 3):
+        self.min_epochs = int(min_epochs)
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.nan_patience = int(nan_patience)
+
+        self.best: Optional[float] = None
+        self.bad_count = 0
+        self.nan_count = 0
+        self.history = []
+
+    def _read_last_val_loss_sum(self, csv_path: Path) -> Optional[float]:
+        if not csv_path.exists():
+            return None
+        try:
+            with csv_path.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if not rows:
+                    return None
+                last = rows[-1]
+        except Exception:
+            return None
+
+        val_loss = 0.0
+        found = False
+        for k, v in last.items():
+            if k is None or v is None:
+                continue
+            kk = k.strip()
+            vv = str(v).strip()
+            if not vv:
+                continue
+            if kk.startswith("val/") and ("loss" in kk):
+                try:
+                    val_loss += float(vv)
+                    found = True
+                except Exception:
+                    pass
+        if not found:
+            return None
+        return float(val_loss)
+
+    def __call__(self, trainer):
+        epoch1 = int(trainer.epoch) + 1
+        csv_path = Path(trainer.csv)
+
+        v = self._read_last_val_loss_sum(csv_path)
+        if v is None:
+            print(f"[ES] epoch={epoch1}: val_loss not found, skip.")
+            return
+
+        self.history.append({"epoch": epoch1, "val_loss_sum": v})
+
+        if (not np.isfinite(v)) or (isinstance(v, float) and math.isnan(v)):
+            self.nan_count += 1
+            print(f"[ES] epoch={epoch1}: val_loss_sum=NaN (nan_count={self.nan_count}/{self.nan_patience})")
+            if self.nan_count >= self.nan_patience:
+                trainer.stop = True
+                print(f"[ES] STOP (too many NaN val losses) at epoch={epoch1}")
+            return
+        else:
+            self.nan_count = 0
+
+        msg = f"[ES] epoch={epoch1}: val_loss_sum={v:.6f}"
+
+        if epoch1 < self.min_epochs:
+            print(msg + f" (min_epochs={self.min_epochs}, no-check)")
+            return
+
+        if self.best is None:
+            self.best = v
+            self.bad_count = 0
+            print(msg + " (init best)")
+            return
+
+        improve = (self.best - v) > self.min_delta
+        if improve:
+            self.best = v
+            self.bad_count = 0
+            print(msg + f" (improved, best={self.best:.6f})")
+        else:
+            self.bad_count += 1
+            print(msg + f" (no improve: best={self.best:.6f}, bad={self.bad_count}/{self.patience})")
+            if self.bad_count >= self.patience:
+                trainer.stop = True
+                print(f"[ES] STOP triggered at epoch={epoch1} (val-loss saturated).")
+
+
+def freeze_bn_callback(trainer):
+    """
+    Freeze all BatchNorm stats for small batch stability.
+    """
+    import torch.nn as nn
+    for m in trainer.model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+            m.track_running_stats = False
+
+
+# =========================================================
+# Instance IoU matching F2 evaluation (Airbus-like)
+# =========================================================
+def iou_binary(a: np.ndarray, b: np.ndarray) -> float:
+    a = (a > 0).astype(np.uint8)
+    b = (b > 0).astype(np.uint8)
+    inter = int((a & b).sum())
+    union = int((a | b).sum())
+    if union == 0:
+        return 0.0
+    return float(inter) / float(union)
+
+
+def match_instances_iou_f2(
+    gt_masks: List[np.ndarray],
+    pred_masks: List[np.ndarray],
+    match_iou: float = 0.5,
+    beta: float = 2.0,
+) -> Dict:
+    """
+    One-to-one greedy matching by max IoU.
+    """
+    n_gt = len(gt_masks)
+    n_pr = len(pred_masks)
+
+    if n_gt == 0 and n_pr == 0:
+        return {"tp": 0, "fp": 0, "fn": 0, "f2": 1.0, "precision": 1.0, "recall": 1.0}
+
+    if n_gt == 0 and n_pr > 0:
+        tp = 0
+        fp = n_pr
+        fn = 0
+    elif n_gt > 0 and n_pr == 0:
+        tp = 0
+        fp = 0
+        fn = n_gt
+    else:
+        ious = np.zeros((n_gt, n_pr), dtype=np.float32)
+        for i in range(n_gt):
+            for j in range(n_pr):
+                ious[i, j] = iou_binary(gt_masks[i], pred_masks[j])
+
+        used_gt = set()
+        used_pr = set()
+        pairs = []
+        while True:
+            best = -1.0
+            bi, bj = -1, -1
+            for i in range(n_gt):
+                if i in used_gt:
+                    continue
+                for j in range(n_pr):
+                    if j in used_pr:
+                        continue
+                    v = float(ious[i, j])
+                    if v > best:
+                        best = v
+                        bi, bj = i, j
+            if best < float(match_iou) or bi < 0 or bj < 0:
+                break
+            used_gt.add(bi)
+            used_pr.add(bj)
+            pairs.append((bi, bj, best))
+
+        tp = len(pairs)
+        fp = n_pr - tp
+        fn = n_gt - tp
+
+    beta2 = beta * beta
+    denom = (1.0 + beta2) * tp + beta2 * fn + fp
+    f2 = 0.0 if denom <= 0 else ((1.0 + beta2) * tp) / denom
+
+    precision = 0.0 if (tp + fp) == 0 else tp / float(tp + fp)
+    recall = 0.0 if (tp + fn) == 0 else tp / float(tp + fn)
+
+    return {"tp": tp, "fp": fp, "fn": fn, "f2": float(f2), "precision": float(precision), "recall": float(recall)}
+
+
+def eval_on_val_crops(
+    model_pt: Path,
+    ds_root: Path,
+    gt_val_dir: Path,
+    out_dir: Path,
+    imgsz: int,
+    conf: float,
+    iou: float,
+    match_iou: float,
+    pred_mask_thr: float,
+    min_area_pred: int,
+    seed: int = 42,
+    max_eval: int = 0,
+) -> Dict:
+    """
+    Evaluate instance IoU-matching F2 on VAL crops using saved GT masks (npz).
+    """
+    rng = random.Random(seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    val_img_dir = ds_root / "images" / "val"
+    imgs = [p for p in sorted(val_img_dir.iterdir()) if p.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+    if len(imgs) == 0:
+        raise RuntimeError(f"No val images: {val_img_dir}")
+
+    if max_eval and max_eval > 0:
+        rng.shuffle(imgs)
+        imgs = imgs[:max_eval]
+
+    print(f"[EVAL] Loading model: {model_pt}")
+    model = YOLO(model_pt.as_posix())
+
+    total_tp = total_fp = total_fn = 0
+    per_image = []
+    t0 = time.time()
+
+    for idx, img_path in enumerate(imgs, 1):
+        crop_id = img_path.stem
+
+        gt_npz = gt_val_dir / f"{crop_id}.npz"
+        if not gt_npz.exists():
+            continue
+        gt = np.load(gt_npz.as_posix())["masks"]  # (N,H,W)
+        gt_masks = [gt[i].astype(np.uint8) for i in range(gt.shape[0])]
+
+        res_list = model.predict(
+            source=img_path.as_posix(),
+            imgsz=imgsz,
+            conf=float(conf),
+            iou=float(iou),
+            device=0,  # CUDA_VISIBLE_DEVICES remap
+            verbose=False,
+        )
+
+        pred_masks: List[np.ndarray] = []
+        if len(res_list) > 0:
+            r0 = res_list[0]
+            if getattr(r0, "masks", None) is not None and r0.masks is not None:
+                m = r0.masks.data
+                try:
+                    import torch
+                    if isinstance(m, torch.Tensor):
+                        m = m.detach().cpu().numpy()
+                except Exception:
+                    pass
+
+                if isinstance(m, np.ndarray) and m.ndim == 3:
+                    for k in range(m.shape[0]):
+                        mk = m[k]
+                        # shape safety: resize to (imgsz,imgsz) if mismatch
+                        if mk.shape[0] != imgsz or mk.shape[1] != imgsz:
+                            mk = cv2.resize(mk.astype(np.float32), (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+                        mk = (mk >= float(pred_mask_thr)).astype(np.uint8)
+                        if mk.sum() < int(min_area_pred):
+                            continue
+                        pred_masks.append(mk)
+
+        met = match_instances_iou_f2(gt_masks, pred_masks, match_iou=float(match_iou), beta=2.0)
+        total_tp += int(met["tp"])
+        total_fp += int(met["fp"])
+        total_fn += int(met["fn"])
+        per_image.append({
+            "crop_id": crop_id,
+            "n_gt": len(gt_masks),
+            "n_pred": len(pred_masks),
+            "tp": int(met["tp"]),
+            "fp": int(met["fp"]),
+            "fn": int(met["fn"]),
+            "f2": float(met["f2"]),
+        })
+
+        if idx % 200 == 0:
+            print(f"[EVAL] {idx}/{len(imgs)} done...")
+
+    beta = 2.0
+    beta2 = beta * beta
+    denom = (1.0 + beta2) * total_tp + beta2 * total_fn + total_fp
+    f2 = 0.0 if denom <= 0 else ((1.0 + beta2) * total_tp) / denom
+    precision = 0.0 if (total_tp + total_fp) == 0 else total_tp / float(total_tp + total_fp)
+    recall = 0.0 if (total_tp + total_fn) == 0 else total_tp / float(total_tp + total_fn)
+
+    summary = {
+        "model_pt": model_pt.as_posix(),
+        "n_eval": len(per_image),
+        "tp": int(total_tp),
+        "fp": int(total_fp),
+        "fn": int(total_fn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f2": float(f2),
+        "conf": float(conf),
+        "iou": float(iou),
+        "match_iou": float(match_iou),
+        "pred_mask_thr": float(pred_mask_thr),
+        "min_area_pred": int(min_area_pred),
+        "elapsed_sec": float(time.time() - t0),
+    }
+
+    (out_dir / "val_eval_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (out_dir / "val_eval_per_image.json").write_text(json.dumps(per_image[:5000], indent=2) + "\n")
+
+    print(f"[EVAL] Done. F2={summary['f2']:.6f} P={summary['precision']:.4f} R={summary['recall']:.4f} "
+          f"TP={summary['tp']} FP={summary['fp']} FN={summary['fn']}")
+    return summary
+
+
+# =========================================================
+# Path utilities
+# =========================================================
+def safe_link_or_copy(src: Path, dst: Path) -> None:
+    """
+    Create symlink to src at dst if possible; fallback to copy.
+    If dst exists, replace it (important for repeated runs).
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # replace existing
+    if dst.exists() or dst.is_symlink():
+        try:
+            dst.unlink()
+        except Exception:
+            # if copy file exists but unlink failed, try remove
+            try:
+                os.remove(dst.as_posix())
+            except Exception:
+                pass
+
+    try:
+        os.symlink(src.as_posix(), dst.as_posix())
+    except Exception:
+        shutil.copy2(src.as_posix(), dst.as_posix())
+
+
+# =========================================================
+# Main
+# =========================================================
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--init_weights", type=str, required=True, help="Path to last.pt to initialize fine-tune")
+
+    ap.add_argument("--seed", type=int, default=42)
+
+    # Phase1 pos crop settings
+    ap.add_argument("--pos_total", type=int, default=10000)
+    ap.add_argument("--val_total", type=int, default=1000)
+    ap.add_argument("--crop_size", type=int, default=512)
+    ap.add_argument("--margin", type=float, default=0.25)
+    ap.add_argument("--imgsz", type=int, default=640)
+
+    # label polygons
+    ap.add_argument("--poly_eps", type=float, default=1.0)
+    ap.add_argument("--poly_min_area", type=int, default=5)
+
+    # training
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--amp", type=int, default=0, help="0=FP32 only (recommended), 1=AMP")
+    ap.add_argument("--nbs", type=int, default=16)
+    ap.add_argument("--save_period", type=int, default=1)
+    ap.add_argument("--bn_freeze", type=int, default=1)
+
+    # early stopping (val loss saturation)
+    ap.add_argument("--es_min_epochs", type=int, default=5)
+    ap.add_argument("--es_patience", type=int, default=10)
+    ap.add_argument("--es_min_delta", type=float, default=1e-4)
+    ap.add_argument("--es_nan_patience", type=int, default=3)
+
+    # evaluation settings
+    ap.add_argument("--eval_conf", type=float, default=0.01)
+    ap.add_argument("--eval_iou", type=float, default=0.7)
+    ap.add_argument("--match_iou", type=float, default=0.5)
+    ap.add_argument("--pred_mask_thr", type=float, default=0.50)
+    ap.add_argument("--min_area_pred", type=int, default=1)
+    ap.add_argument("--eval_max", type=int, default=0, help="0=all val, else evaluate first N")
+
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+
+    data_dir = Path(args.data_dir)
+    run_dir = Path(args.run_dir)
+    init_weights = Path(args.init_weights)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = data_dir / "train_ship_segmentations_v2.csv"
+    train_img_dir = data_dir / "train_v2"
+    assert csv_path.exists(), f"Missing: {csv_path}"
+    assert train_img_dir.exists(), f"Missing: {train_img_dir}"
+    assert init_weights.exists(), f"Missing init_weights: {init_weights}"
+
+    print("[INIT] Loading RLE CSV...")
+    rles = load_airbus_rles(csv_path)
+
+    print("[INIT] Listing train images...")
+    all_ids = list_train_images(train_img_dir)
+    if len(all_ids) == 0:
+        raise RuntimeError(f"No images found in: {train_img_dir}")
+
+    pos_ids = build_pos_ids(all_ids, rles)
+    pos_rate = len(pos_ids) / max(1, len(all_ids))
+    print(f"[STAT] train all={len(all_ids)} pos={len(pos_ids)} pos_rate={pos_rate:.4f}")
+
+    # 1) Build Phase1 crop dataset (POS only)
+    data_yaml, splits_dir, gt_val_dir = build_phase1_crop_dataset(
+        data_dir=data_dir,
+        run_dir=run_dir,
+        pos_ids=pos_ids,
+        rles=rles,
+        pos_total=int(args.pos_total),
+        val_total=int(args.val_total),
+        seed=int(args.seed),
+        crop_size=int(args.crop_size),
+        margin=float(args.margin),
+        imgsz=int(args.imgsz),
+        poly_eps=float(args.poly_eps),
+        poly_min_area=int(args.poly_min_area),
+        expect_square=True,
+        fail_fast_ratio=0.01,
+    )
+    print(f"[YAML] data.yaml -> {data_yaml}")
+
+    # 2) Train YOLO seg (fine-tune from init_weights=last.pt)
+    print("[TRAIN] Starting Ultralytics training...")
+    model = YOLO(init_weights.as_posix())
+
+    # callbacks
+    if int(args.bn_freeze) == 1:
+        model.add_callback("on_train_epoch_start", freeze_bn_callback)
+
+    stopper = ValLossEarlyStopper(
+        min_epochs=int(args.es_min_epochs),
+        patience=int(args.es_patience),
+        min_delta=float(args.es_min_delta),
+        nan_patience=int(args.es_nan_patience),
+    )
+    model.add_callback("on_fit_epoch_end", stopper)
+
+    # Save meta
+    meta = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "phase": "phase1_pos10k_crop_only",
+        "data_dir": data_dir.as_posix(),
+        "init_weights": init_weights.as_posix(),
+        "pos_total": int(args.pos_total),
+        "val_total": int(args.val_total),
+        "crop_size": int(args.crop_size),
+        "margin": float(args.margin),
+        "imgsz": int(args.imgsz),
+        "poly_eps": float(args.poly_eps),
+        "poly_min_area": int(args.poly_min_area),
+        "seed": int(args.seed),
+        "train": {
+            "epochs": int(args.epochs),
+            "batch": int(args.batch),
+            "workers": int(args.workers),
+            "amp": bool(int(args.amp)),
+            "nbs": int(args.nbs),
+            "save_period": int(args.save_period),
+            "bn_freeze": bool(int(args.bn_freeze)),
+        },
+        "earlystop_val_loss": {
+            "min_epochs": int(args.es_min_epochs),
+            "patience": int(args.es_patience),
+            "min_delta": float(args.es_min_delta),
+            "nan_patience": int(args.es_nan_patience),
+        },
+        "eval": {
+            "eval_conf": float(args.eval_conf),
+            "eval_iou": float(args.eval_iou),
+            "match_iou": float(args.match_iou),
+            "pred_mask_thr": float(args.pred_mask_thr),
+            "min_area_pred": int(args.min_area_pred),
+        }
+    }
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+    # Ultralytics train
+    exp_name = "yolo26_phase1_pos10k_crop"
+    results = model.train(
+        data=data_yaml.as_posix(),
+        epochs=int(args.epochs),
+        imgsz=int(args.imgsz),
+        batch=int(args.batch),
+        workers=int(args.workers),
+        device=0,  # CUDA_VISIBLE_DEVICES remap
+        amp=bool(int(args.amp)),
+        project=run_dir.as_posix(),
+        name=exp_name,
+        exist_ok=True,
+        save=True,
+        save_period=int(args.save_period),
+        nbs=int(args.nbs),
+        patience=0,  # disable built-in ES
+        verbose=True,
+    )
+
+    # 3) Locate weights
+    exp_dir = run_dir / exp_name
+    weights_dir = exp_dir / "weights"
+    best_pt = weights_dir / "best.pt"
+    last_pt = weights_dir / "last.pt"
+
+    print(f"[DONE] exp_dir={exp_dir}")
+    print(f"[DONE] best={best_pt} exists={best_pt.exists()}")
+    print(f"[DONE] last={last_pt} exists={last_pt.exists()}")
+
+    (run_dir / "earlystop_history.json").write_text(json.dumps(stopper.history, indent=2) + "\n")
+
+    # Create run_dir shortcuts (replace-safe)
+    if best_pt.exists():
+        safe_link_or_copy(best_pt, run_dir / "best.pt")
+    if last_pt.exists():
+        safe_link_or_copy(last_pt, run_dir / "last.pt")
+
+    # Save model_paths.json (absolute paths)
+    model_paths = {
+        "phase": "phase1_pos10k_crop_only",
+        "init_weights": init_weights.as_posix(),
+        "run_dir": run_dir.resolve().as_posix(),
+        "exp_dir": exp_dir.resolve().as_posix(),
+        "data_yaml": data_yaml.resolve().as_posix(),
+        "splits_dir": splits_dir.resolve().as_posix(),
+        "gt_val_dir": gt_val_dir.resolve().as_posix(),
+        "results_csv": (exp_dir / "results.csv").resolve().as_posix() if (exp_dir / "results.csv").exists() else "",
+        "best_pt": best_pt.resolve().as_posix() if best_pt.exists() else "",
+        "last_pt": last_pt.resolve().as_posix() if last_pt.exists() else "",
+        "shortcut_best_pt": (run_dir / "best.pt").resolve().as_posix() if (run_dir / "best.pt").exists() else "",
+        "shortcut_last_pt": (run_dir / "last.pt").resolve().as_posix() if (run_dir / "last.pt").exists() else "",
+    }
+    (run_dir / "model_paths.json").write_text(json.dumps(model_paths, indent=2) + "\n")
+
+    # 4) Evaluate on VAL crops
+    eval_root = run_dir / "val_eval"
+    ds_root = run_dir / "dataset_phase1_pos10k_crop"
+
+    eval_summaries = {}
+
+    if best_pt.exists():
+        eval_summaries["best"] = eval_on_val_crops(
+            model_pt=best_pt,
+            ds_root=ds_root,
+            gt_val_dir=gt_val_dir,
+            out_dir=eval_root / "best",
+            imgsz=int(args.imgsz),
+            conf=float(args.eval_conf),
+            iou=float(args.eval_iou),
+            match_iou=float(args.match_iou),
+            pred_mask_thr=float(args.pred_mask_thr),
+            min_area_pred=int(args.min_area_pred),
+            seed=int(args.seed),
+            max_eval=int(args.eval_max),
+        )
+
+    if last_pt.exists():
+        eval_summaries["last"] = eval_on_val_crops(
+            model_pt=last_pt,
+            ds_root=ds_root,
+            gt_val_dir=gt_val_dir,
+            out_dir=eval_root / "last",
+            imgsz=int(args.imgsz),
+            conf=float(args.eval_conf),
+            iou=float(args.eval_iou),
+            match_iou=float(args.match_iou),
+            pred_mask_thr=float(args.pred_mask_thr),
+            min_area_pred=int(args.min_area_pred),
+            seed=int(args.seed),
+            max_eval=int(args.eval_max),
+        )
+
+    (run_dir / "val_eval_summary_all.json").write_text(json.dumps(eval_summaries, indent=2) + "\n")
+
+    print("[FIN] Phase1 training done.")
+    print(f"  run_dir         = {run_dir}")
+    print(f"  model_paths.json= {run_dir / 'model_paths.json'}")
+    print(f"  best.pt shortcut= {run_dir / 'best.pt'}")
+    print(f"  last.pt shortcut= {run_dir / 'last.pt'}")
+    print(f"  val_eval_summary= {run_dir / 'val_eval_summary_all.json'}")
+
+
+if __name__ == "__main__":
+    main()
