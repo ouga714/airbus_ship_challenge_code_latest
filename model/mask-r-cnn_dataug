@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Airbus Ship Detection - UNet curriculum training (HADES)."""
+
+import os
+import sys
+import json
+import time
+import random
+import argparse
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.models import resnet34
+
+# ---- optional deps ----
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
+
+try:
+    import albumentations as A
+    HAS_ALB = True
+except Exception:
+    HAS_ALB = False
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def log_line(fp, s: str) -> None:
+    fp.write(s + "\n")
+    fp.flush()
+    print(s, flush=True)
+
+
+# -----------------------------
+# RLE decode (Kaggle Airbus)
+# -----------------------------
+
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Decode run-length encoding into a binary mask.
+    Airbus: 1-indexed, column-major (Fortran order).
+    shape: (H, W)
+    """
+    if rle is None or rle == "":
+        return np.zeros(shape, dtype=np.uint8)
+
+    s = rle.strip().split()
+    if len(s) < 2:
+        return np.zeros(shape, dtype=np.uint8)
+
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+
+    h, w = shape
+    img = np.zeros(h * w, dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        if lo < 0:
+            lo = 0
+        if hi > img.size:
+            hi = img.size
+        if hi > lo:
+            img[lo:hi] = 1
+
+    img = img.reshape((w, h), order="F").T
+    return img
+
+
+# -----------------------------
+# CSV parsing (no pandas)
+# -----------------------------
+
+def read_csv_ship_masks(csv_path: str) -> Dict[str, List[str]]:
+    """
+    Parse train_ship_segmentations_v2.csv without pandas.
+    Returns: ImageId -> list of non-empty RLEs
+    """
+    d: Dict[str, List[str]] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        header = f.readline()
+        if "ImageId" not in header or "EncodedPixels" not in header:
+            raise ValueError("CSV header mismatch: expected ImageId,EncodedPixels")
+        for line in f:
+            line = line.rstrip("\n")
+            if line == "":
+                continue
+            parts = line.split(",", 1)
+            if len(parts) != 2:
+                continue
+            img_id = parts[0]
+            rle = parts[1]
+            if img_id not in d:
+                d[img_id] = []
+            if rle is None or rle.strip() == "":
+                continue
+            d[img_id].append(rle)
+    return d
+
+
+def build_gt_mask(img_id: str, rle_map: Dict[str, List[str]], shape_hw=(768, 768)) -> np.ndarray:
+    rles = rle_map.get(img_id, [])
+    if len(rles) == 0:
+        return np.zeros(shape_hw, dtype=np.uint8)
+    m = np.zeros(shape_hw, dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode(r, shape_hw)
+    return (m > 0).astype(np.uint8)
+
+
+# -----------------------------
+# Kaggle-like instance F2 metric
+# -----------------------------
+
+def mask_to_instances_cc(mask01: np.ndarray, min_area: int = 10) -> List[np.ndarray]:
+    """
+    Convert binary mask to instances via connected components.
+    Returns list of boolean masks.
+    """
+    if mask01.dtype != np.uint8:
+        mask01 = mask01.astype(np.uint8)
+    if mask01.max() == 0:
+        return []
+    if not HAS_CV2:
+        raise RuntimeError("cv2 is required for connected components instance extraction.")
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask01, connectivity=8)
+    inst = []
+    for k in range(1, num_labels):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        inst.append(labels == k)
+    return inst
+
+
+def iou_mask(a: np.ndarray, b: np.ndarray) -> float:
+    inter = np.logical_and(a, b).sum()
+    if inter == 0:
+        return 0.0
+    union = np.logical_or(a, b).sum()
+    return float(inter) / float(union + 1e-9)
+
+
+def match_instances_greedy(pred_insts: List[np.ndarray], gt_insts: List[np.ndarray], iou_thr: float) -> Tuple[int, int, int]:
+    """
+    Greedy matching by IoU.
+    Returns (tp, fp, fn)
+    """
+    if len(pred_insts) == 0 and len(gt_insts) == 0:
+        return (0, 0, 0)
+    if len(pred_insts) == 0:
+        return (0, 0, len(gt_insts))
+    if len(gt_insts) == 0:
+        return (0, len(pred_insts), 0)
+
+    ious = np.zeros((len(pred_insts), len(gt_insts)), dtype=np.float32)
+    for i, pm in enumerate(pred_insts):
+        for j, gm in enumerate(gt_insts):
+            ious[i, j] = iou_mask(pm, gm)
+
+    tp = 0
+    used_p = set()
+    used_g = set()
+    while True:
+        best = -1.0
+        bi = -1
+        bj = -1
+        for i in range(ious.shape[0]):
+            if i in used_p:
+                continue
+            for j in range(ious.shape[1]):
+                if j in used_g:
+                    continue
+                v = float(ious[i, j])
+                if v > best:
+                    best = v
+                    bi = i
+                    bj = j
+        if bi < 0 or bj < 0 or best < iou_thr:
+            break
+        used_p.add(bi)
+        used_g.add(bj)
+        tp += 1
+
+    fp = len(pred_insts) - tp
+    fn = len(gt_insts) - tp
+    return (tp, fp, fn)
+
+
+def f2_from_counts(tp: int, fp: int, fn: int) -> float:
+    denom = (5 * tp + 4 * fn + fp)
+    if denom <= 0:
+        return 1.0 if (tp == 0 and fp == 0 and fn == 0) else 0.0
+    return (5.0 * tp) / float(denom)
+
+
+def kaggle_instance_f2_avg(pred_prob: np.ndarray, gt_mask01: np.ndarray, thr: float,
+                           iou_thrs: List[float], min_area: int = 10) -> float:
+    """
+    Per-image Kaggle-like instance F2 averaged over IoU thresholds.
+    """
+    pred_bin = (pred_prob >= thr).astype(np.uint8)
+    pred_insts = mask_to_instances_cc(pred_bin, min_area=min_area)
+    gt_insts = mask_to_instances_cc(gt_mask01.astype(np.uint8), min_area=min_area)
+
+    f2s = []
+    for t in iou_thrs:
+        tp, fp, fn = match_instances_greedy(pred_insts, gt_insts, iou_thr=float(t))
+        f2s.append(f2_from_counts(tp, fp, fn))
+    return float(np.mean(f2s)) if len(f2s) > 0 else 0.0
+
+
+# -----------------------------
+# Model: ResNet34-UNet
+# -----------------------------
+
+class ConvRelu(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.c1 = ConvRelu(in_ch + skip_ch, out_ch)
+        self.c2 = ConvRelu(out_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.c1(x)
+        x = self.c2(x)
+        return x
+
+
+class UNetResNet34(nn.Module):
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        weights = torchvision.models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
+        enc = resnet34(weights=weights)
+
+        self.enc0 = nn.Sequential(enc.conv1, enc.bn1, enc.relu)   # /2
+        self.pool = enc.maxpool                                   # /4
+        self.enc1 = enc.layer1                                     # /4
+        self.enc2 = enc.layer2                                     # /8
+        self.enc3 = enc.layer3                                     # /16
+        self.enc4 = enc.layer4                                     # /32
+
+        self.center = nn.Sequential(ConvRelu(512, 512), ConvRelu(512, 512))
+        self.up4 = UpBlock(512, 256, 256)
+        self.up3 = UpBlock(256, 128, 128)
+        self.up2 = UpBlock(128, 64, 64)
+        self.up1 = UpBlock(64, 64, 64)
+
+        self.head = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        x0 = self.enc0(x)              # /2
+        x1 = self.enc1(self.pool(x0))  # /4
+        x2 = self.enc2(x1)             # /8
+        x3 = self.enc3(x2)             # /16
+        x4 = self.enc4(x3)             # /32
+        c = self.center(x4)            # /32
+
+        d4 = self.up4(c, x3)
+        d3 = self.up3(d4, x2)
+        d2 = self.up2(d3, x1)
+        d1 = self.up1(d2, x0)
+
+        out = F.interpolate(d1, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return self.head(out)
+
+
+# -----------------------------
+# Loss: BCE + Dice
+# -----------------------------
+
+def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    probs = probs.view(probs.size(0), -1)
+    targets = targets.view(targets.size(0), -1)
+    inter = (probs * targets).sum(dim=1)
+    union = probs.sum(dim=1) + targets.sum(dim=1)
+    dice = (2.0 * inter + eps) / (union + eps)
+    return (1.0 - dice).mean()
+
+
+# -----------------------------
+# Dataset + curriculum
+# -----------------------------
+
+@dataclass
+class SampleItem:
+    img_id: str
+    is_pos: int  # 1 or 0
+
+
+def make_epoch_items(pos_ids: List[str], neg_ids: List[str], total: int, pos_frac: float, rng: np.random.RandomState) -> List[SampleItem]:
+    pos_n = int(round(total * pos_frac))
+    neg_n = total - pos_n
+    pos_sel = rng.choice(pos_ids, size=pos_n, replace=(len(pos_ids) < pos_n))
+    neg_sel = rng.choice(neg_ids, size=neg_n, replace=(len(neg_ids) < neg_n))
+    items = [SampleItem(img_id=x, is_pos=1) for x in pos_sel] + [SampleItem(img_id=x, is_pos=0) for x in neg_sel]
+    rng.shuffle(items)
+    return items
+
+
+class AirbusCurriculumDataset(Dataset):
+    def __init__(self,
+                 img_dir: str,
+                 rle_map: Dict[str, List[str]],
+                 items: List[SampleItem],
+                 stage: str,
+                 img_size: int,
+                 ms_sizes: Optional[List[int]],
+                 mix_ratio: Tuple[int, int, int],
+                 seed: int):
+        super().__init__()
+        if not HAS_CV2:
+            raise RuntimeError("cv2 is required.")
+        if not HAS_ALB:
+            raise RuntimeError("albumentations is required.")
+
+        self.img_dir = img_dir
+        self.rle_map = rle_map
+        self.items = items
+        self.stage = stage
+        self.img_size = img_size
+        self.ms_sizes = ms_sizes
+        self.mix_ratio = mix_ratio
+        self.seed = seed
+
+        self.crop_mode = (stage in ["stage1", "stage2"])
+        self.crop_size = img_size
+
+        a, c, n = mix_ratio
+        s = a + c + n
+        self.p_affine = a / s
+        self.p_color = c / s
+        self.p_normal = n / s
+
+        self._build_transforms()
+
+    def _build_transforms(self):
+        self.mean = (0.485, 0.456, 0.406)
+        self.std = (0.229, 0.224, 0.225)
+
+        def normalize():
+            return A.Normalize(mean=self.mean, std=self.std, max_pixel_value=255.0)
+
+        self.t_stage1 = A.Compose([
+            A.Resize(self.img_size, self.img_size, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            normalize(),
+        ])
+
+        self.t_stage2 = A.Compose([
+            A.Resize(self.img_size, self.img_size, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.8),
+            A.RandomGamma(gamma_limit=(90, 110), p=0.3),
+            A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=8, p=0.4),
+            A.ImageCompression(quality_lower=75, quality_upper=100, p=0.15),
+            normalize(),
+        ])
+
+        self.t_affine = lambda sz: A.Compose([
+            A.Resize(sz, sz, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.2),
+            A.ShiftScaleRotate(
+                shift_limit=0.05, scale_limit=0.10, rotate_limit=15,
+                border_mode=cv2.BORDER_REFLECT_101, p=1.0
+            ),
+            normalize(),
+        ])
+
+        self.t_color = lambda sz: A.Compose([
+            A.Resize(sz, sz, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.18, contrast_limit=0.18, p=0.85),
+            A.RandomGamma(gamma_limit=(85, 115), p=0.35),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=16, val_shift_limit=10, p=0.45),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.15),
+            A.ImageCompression(quality_lower=70, quality_upper=100, p=0.20),
+            normalize(),
+        ])
+
+        self.t_normal = lambda sz: A.Compose([
+            A.Resize(sz, sz, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            normalize(),
+        ])
+
+        self.t_stage4 = A.Compose([
+            A.Resize(self.img_size, self.img_size, interpolation=cv2.INTER_LINEAR),
+            A.HorizontalFlip(p=0.5),
+            normalize(),
+        ])
+
+    def set_items(self, items: List[SampleItem]) -> None:
+        self.items = items
+
+    def set_stage(self, stage: str, img_size: int, ms_sizes: Optional[List[int]] = None) -> None:
+        self.stage = stage
+        self.img_size = img_size
+        self.ms_sizes = ms_sizes
+        self.crop_mode = (stage in ["stage1", "stage2"])
+        self.crop_size = img_size
+        self._build_transforms()
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _read_image(self, img_id: str) -> np.ndarray:
+        p = os.path.join(self.img_dir, img_id)
+        img = cv2.imread(p, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Failed to read image: {p}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def _get_gt_mask(self, img_id: str) -> np.ndarray:
+        return build_gt_mask(img_id, self.rle_map, shape_hw=(768, 768))
+
+    def _random_crop_around_ship(self, img: np.ndarray, mask01: np.ndarray, out_size: int, rng: np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
+        h, w = mask01.shape
+        if mask01.max() > 0:
+            ys, xs = np.where(mask01 > 0)
+            k = rng.randint(0, len(xs))
+            cx = int(xs[k])
+            cy = int(ys[k])
+        else:
+            cx = rng.randint(0, w)
+            cy = rng.randint(0, h)
+
+        half = out_size // 2
+        x0 = cx - half
+        y0 = cy - half
+        x1 = x0 + out_size
+        y1 = y0 + out_size
+
+        if x0 < 0:
+            x1 -= x0
+            x0 = 0
+        if y0 < 0:
+            y1 -= y0
+            y0 = 0
+        if x1 > w:
+            x0 -= (x1 - w)
+            x1 = w
+        if y1 > h:
+            y0 -= (y1 - h)
+            y1 = h
+
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(w, x1)
+        y1 = min(h, y1)
+
+        crop_img = img[y0:y1, x0:x1].copy()
+        crop_m = mask01[y0:y1, x0:x1].copy()
+
+        ch, cw = crop_m.shape
+        if ch != out_size or cw != out_size:
+            pad_y = out_size - ch
+            pad_x = out_size - cw
+            top = pad_y // 2
+            bottom = pad_y - top
+            left = pad_x // 2
+            right = pad_x - left
+            crop_img = cv2.copyMakeBorder(crop_img, top, bottom, left, right, borderType=cv2.BORDER_REFLECT_101)
+            crop_m = cv2.copyMakeBorder(crop_m, top, bottom, left, right, borderType=cv2.BORDER_CONSTANT, value=0)
+
+        return crop_img, crop_m
+
+    def __getitem__(self, idx: int):
+        item = self.items[idx]
+        img = self._read_image(item.img_id)
+        gt = self._get_gt_mask(item.img_id)
+
+        rng = np.random.RandomState(self.seed + idx * 9973)
+
+        if self.crop_mode:
+            img, gt = self._random_crop_around_ship(img, gt, out_size=self.crop_size, rng=rng)
+
+        sz = self.img_size
+        if self.stage == "stage3" and self.ms_sizes and len(self.ms_sizes) > 0:
+            sz = int(self.ms_sizes[rng.randint(0, len(self.ms_sizes))])
+
+        if self.stage == "stage1":
+            aug = self.t_stage1(image=img, mask=gt)
+        elif self.stage == "stage2":
+            aug = self.t_stage2(image=img, mask=gt)
+        elif self.stage == "stage3":
+            r = float(rng.rand())
+            if r < self.p_affine:
+                aug = self.t_affine(sz)(image=img, mask=gt)
+            elif r < (self.p_affine + self.p_color):
+                aug = self.t_color(sz)(image=img, mask=gt)
+            else:
+                aug = self.t_normal(sz)(image=img, mask=gt)
+        elif self.stage == "stage4":
+            aug = self.t_stage4(image=img, mask=gt)
+        else:
+            raise ValueError(f"Unknown stage: {self.stage}")
+
+        x = aug["image"]
+        y = aug["mask"]
+
+        x = np.transpose(x, (2, 0, 1)).astype(np.float32)
+        y = (y > 0).astype(np.float32)[None, :, :]
+
+        return torch.from_numpy(x), torch.from_numpy(y), item.img_id
+
+
+# -----------------------------
+# Train/Val
+# -----------------------------
+
+@torch.no_grad()
+def validate(model: nn.Module, loader: DataLoader, device: torch.device,
+             thr_list: List[float], iou_thrs: List[float], min_area: int,
+             log_fp, max_images: int = -1) -> Dict[str, float]:
+    model.eval()
+    bce = nn.BCEWithLogitsLoss()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    thr_f2_sum = {thr: 0.0 for thr in thr_list}
+    thr_cnt = {thr: 0 for thr in thr_list}
+
+    t0 = time.time()
+    n_images_done = 0
+
+    for batch in loader:
+        x, y, _ = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        loss = bce(logits, y) + dice_loss_with_logits(logits, y)
+        total_loss += float(loss.item())
+        n_batches += 1
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        gts = y.detach().cpu().numpy()
+
+        B = probs.shape[0]
+        for i in range(B):
+            p = probs[i, 0]
+            gt01 = (gts[i, 0] > 0.5).astype(np.uint8)
+
+            for thr in thr_list:
+                f2 = kaggle_instance_f2_avg(p, gt01, thr=float(thr), iou_thrs=iou_thrs, min_area=min_area)
+                thr_f2_sum[thr] += f2
+                thr_cnt[thr] += 1
+
+            n_images_done += 1
+            if max_images > 0 and n_images_done >= max_images:
+                break
+        if max_images > 0 and n_images_done >= max_images:
+            break
+
+    val_loss = total_loss / max(1, n_batches)
+
+    best_thr = None
+    best_f2 = -1.0
+    for thr in thr_list:
+        if thr_cnt[thr] == 0:
+            continue
+        mean_f2 = thr_f2_sum[thr] / float(thr_cnt[thr])
+        if mean_f2 > best_f2:
+            best_f2 = mean_f2
+            best_thr = float(thr)
+
+    dt = time.time() - t0
+    log_line(log_fp, f"{now_str()} [VAL] images={n_images_done} val_loss={val_loss:.6f} best_thr={best_thr} best_f2={best_f2:.6f} dt={dt:.1f}s")
+
+    if best_thr is None:
+        best_thr = float(thr_list[len(thr_list)//2])
+        best_f2 = 0.0
+
+    return {
+        "val_loss": float(val_loss),
+        "best_thr": float(best_thr),
+        "best_f2": float(best_f2),
+    }
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
+                    optimizer: torch.optim.Optimizer, log_fp) -> float:
+    model.train()
+    bce = nn.BCEWithLogitsLoss()
+
+    total = 0.0
+    n = 0
+    t0 = time.time()
+
+    for it, batch in enumerate(loader):
+        x, y, _ = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = bce(logits, y) + dice_loss_with_logits(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total += float(loss.item())
+        n += 1
+
+        if (it + 1) % 50 == 0:
+            dt = time.time() - t0
+            log_line(log_fp, f"{now_str()} [TRAIN] iter={it+1}/{len(loader)} loss={total/max(1,n):.6f} dt={dt:.1f}s")
+
+    return total / max(1, n)
+
+
+def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, meta: Dict, log_fp) -> None:
+    tmp = path + ".tmp"
+    torch.save({
+        "epoch": epoch,
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "meta": meta,
+    }, tmp)
+    os.replace(tmp, path)
+    log_line(log_fp, f"{now_str()} [SAVE] checkpoint saved: {path}")
+
+
+def checkpoint_health_check(ckpt_path: str, model: nn.Module, log_fp) -> None:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    keys = list(sd.keys())
+
+    has_up4 = any(("up4" in k) for k in keys)
+    has_head = any(("head" in k) for k in keys)
+    has_center = any(("center" in k) for k in keys)
+
+    log_line(log_fp, f"{now_str()} [CKPT] health path={ckpt_path}")
+    log_line(log_fp, f"{now_str()} [CKPT] keys={len(keys)} has_center={has_center} has_up4={has_up4} has_head={has_head}")
+    log_line(log_fp, f"{now_str()} [CKPT] missing={len(missing)} unexpected={len(unexpected)}")
+
+    if not (has_up4 and has_head and has_center):
+        raise RuntimeError("Checkpoint health check failed: decoder/head keys not found (possible backbone-only save).")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--cuda_visible_devices", type=str, default="0")
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--train_total", type=int, default=50000)
+    ap.add_argument("--train_pos_frac", type=float, default=0.5)
+    ap.add_argument("--val_ratio", type=float, default=0.15)
+    ap.add_argument("--val_pos_frac", type=float, default=0.5)
+
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--stage1_epochs", type=int, default=3)
+    ap.add_argument("--stage2_epochs", type=int, default=3)
+    ap.add_argument("--stage3_epochs", type=int, default=6)
+    ap.add_argument("--stage4_epochs", type=int, default=6)
+
+    ap.add_argument("--stage1_img_size", type=int, default=384)
+    ap.add_argument("--stage2_img_size", type=int, default=384)
+    ap.add_argument("--ms_sizes", type=str, default="384,512,640,768")
+    ap.add_argument("--final_img_size", type=int, default=768)
+
+    ap.add_argument("--mix_ratio", type=str, default="2,3,5")
+    ap.add_argument("--thr_list", type=str, default="0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70")
+
+    ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--min_delta", type=float, default=1e-4)
+
+    ap.add_argument("--min_area", type=int, default=10)
+    ap.add_argument("--val_max_images", type=int, default=-1)
+
+    ap.add_argument("--pretrained_backbone", type=int, default=1)
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # GPU selection via arg (no export required by user)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+
+    if not HAS_CV2:
+        print("[FATAL] cv2 (opencv-python) is required.", file=sys.stderr)
+        sys.exit(1)
+    if not HAS_ALB:
+        print("[FATAL] albumentations is required.", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_dir(args.run_dir)
+    log_path = os.path.join(args.run_dir, "log_global.txt")
+    meta_path = os.path.join(args.run_dir, "meta.json")
+    best_thr_path = os.path.join(args.run_dir, "best_thresholds.json")
+
+    with open(log_path, "a", encoding="utf-8") as log_fp:
+        log_line(log_fp, f"{now_str()} [INIT] =========================")
+        log_line(log_fp, f"{now_str()} [INIT] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        log_line(log_fp, f"{now_str()} [INIT] HAS_CV2={HAS_CV2} HAS_ALB={HAS_ALB}")
+
+        set_seed(args.seed)
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        log_line(log_fp, f"{now_str()} [INIT] device={device}")
+
+        train_dir = os.path.join(args.data_dir, "train_v2")
+        csv_path = os.path.join(args.data_dir, "train_ship_segmentations_v2.csv")
+        if not os.path.isdir(train_dir):
+            raise FileNotFoundError(f"train_v2 not found: {train_dir}")
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+        log_line(log_fp, f"{now_str()} [DATA] reading CSV: {csv_path}")
+        rle_map = read_csv_ship_masks(csv_path)
+
+        all_ids = [fn for fn in os.listdir(train_dir) if fn.lower().endswith(".jpg")]
+        all_ids.sort()
+
+        pos_ids, neg_ids = [], []
+        for img_id in all_ids:
+            if len(rle_map.get(img_id, [])) > 0:
+                pos_ids.append(img_id)
+            else:
+                neg_ids.append(img_id)
+
+        log_line(log_fp, f"{now_str()} [DATA] all={len(all_ids)} pos={len(pos_ids)} neg={len(neg_ids)} pos_rate={len(pos_ids)/max(1,len(all_ids)):.4f}")
+        if len(pos_ids) == 0 or len(neg_ids) == 0:
+            raise RuntimeError("pos_ids or neg_ids is empty. Check CSV parsing and train_v2 listing.")
+
+        rng = np.random.RandomState(args.seed)
+
+        val_total = int(round(args.train_total * float(args.val_ratio)))
+        val_pos_n = int(round(val_total * float(args.val_pos_frac)))
+        val_neg_n = val_total - val_pos_n
+
+        val_pos_ids = rng.choice(pos_ids, size=val_pos_n, replace=(len(pos_ids) < val_pos_n))
+        val_neg_ids = rng.choice(neg_ids, size=val_neg_n, replace=(len(neg_ids) < val_neg_n))
+        val_ids_set = set(val_pos_ids.tolist()) | set(val_neg_ids.tolist())
+
+        train_pos_pool = [x for x in pos_ids if x not in val_ids_set] or pos_ids
+        train_neg_pool = [x for x in neg_ids if x not in val_ids_set] or neg_ids
+
+        log_line(log_fp, f"{now_str()} [SPLIT] train_pos_pool={len(train_pos_pool)} train_neg_pool={len(train_neg_pool)} val_total={val_total} val_pos={val_pos_n} val_neg={val_neg_n}")
+
+        val_items = [SampleItem(img_id=x, is_pos=1) for x in val_pos_ids] + [SampleItem(img_id=x, is_pos=0) for x in val_neg_ids]
+        rng.shuffle(val_items)
+
+        ms_sizes = [int(x) for x in args.ms_sizes.split(",") if x.strip() != ""]
+        mix_ratio = tuple(int(x) for x in args.mix_ratio.split(","))
+        if len(mix_ratio) != 3:
+            raise ValueError("--mix_ratio must be 3 integers: affine,color,normal")
+
+        thr_list = [float(x) for x in args.thr_list.split(",") if x.strip() != ""]
+        if len(thr_list) == 0:
+            raise ValueError("thr_list is empty")
+
+        iou_thrs = [round(x, 2) for x in np.arange(0.50, 0.96, 0.05).tolist()]
+
+        train_items = make_epoch_items(train_pos_pool, train_neg_pool, args.train_total, args.train_pos_frac, rng)
+
+        train_ds = AirbusCurriculumDataset(
+            img_dir=train_dir,
+            rle_map=rle_map,
+            items=train_items,
+            stage="stage1",
+            img_size=args.stage1_img_size,
+            ms_sizes=None,
+            mix_ratio=mix_ratio,
+            seed=args.seed,
+        )
+
+        # Validation fixed to final size for stable thresholding
+        val_ds = AirbusCurriculumDataset(
+            img_dir=train_dir,
+            rle_map=rle_map,
+            items=val_items,
+            stage="stage4",
+            img_size=args.final_img_size,
+            ms_sizes=None,
+            mix_ratio=mix_ratio,
+            seed=args.seed + 999,
+        )
+
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=max(1, args.batch_size // 2), shuffle=False,
+            num_workers=args.num_workers, pin_memory=True, drop_last=False
+        )
+
+        model = UNetResNet34(pretrained=(args.pretrained_backbone == 1)).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+        meta = vars(args).copy()
+        meta.update({
+            "created": now_str(),
+            "device": str(device),
+            "train_dir": train_dir,
+            "csv_path": csv_path,
+            "pos_ids": len(pos_ids),
+            "neg_ids": len(neg_ids),
+            "val_total": val_total,
+            "iou_thrs": iou_thrs,
+        })
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        log_line(log_fp, f"{now_str()} [INIT] meta saved: {meta_path}")
+
+        # Curriculum schedule:
+        #   stage1: crop, minimal geom
+        #   stage2: crop + color
+        #   stage3: multiscale + mixture affine/color/normal
+        #   stage4: fixed final 768
+        schedule = []
+        schedule += [("stage1", args.stage1_img_size, None)] * max(0, args.stage1_epochs)
+        schedule += [("stage2", args.stage2_img_size, None)] * max(0, args.stage2_epochs)
+        schedule += [("stage3", args.final_img_size, ms_sizes)] * max(0, args.stage3_epochs)
+        schedule += [("stage4", args.final_img_size, None)] * max(0, args.stage4_epochs)
+
+        best_val_loss = float("inf")
+        best_val_f2 = -1.0
+        best_epoch_loss = -1
+        best_epoch_f2 = -1
+
+        patience = int(args.patience)
+        min_delta = float(args.min_delta)
+        bad_epochs = 0
+
+        for epoch, (stage, stage_size, stage_ms) in enumerate(schedule, start=1):
+            # Re-sample epoch items to realize "augmentation increases effective data"
+            train_items = make_epoch_items(train_pos_pool, train_neg_pool, args.train_total, args.train_pos_frac, rng)
+            train_ds.set_items(train_items)
+
+            if stage == "stage3":
+                train_ds.set_stage(stage="stage3", img_size=stage_size, ms_sizes=stage_ms)
+            else:
+                train_ds.set_stage(stage=stage, img_size=stage_size, ms_sizes=None)
+
+            log_line(log_fp, f"{now_str()} [EPOCH] epoch={epoch}/{len(schedule)} stage={stage}")
+
+            tr_loss = train_one_epoch(model, train_loader, device, optimizer, log_fp)
+            log_line(log_fp, f"{now_str()} [EPOCH] epoch={epoch} train_loss={tr_loss:.6f}")
+
+            val_out = validate(
+                model, val_loader, device,
+                thr_list=thr_list,
+                iou_thrs=iou_thrs,
+                min_area=int(args.min_area),
+                log_fp=log_fp,
+                max_images=int(args.val_max_images),
+            )
+            val_loss = val_out["val_loss"]
+            best_thr = val_out["best_thr"]
+            val_f2 = val_out["best_f2"]
+
+            thr_payload = {
+                "epoch": epoch,
+                "stage": stage,
+                "best_thr": best_thr,
+                "best_f2": val_f2,
+                "thr_list": thr_list,
+                "iou_thrs": iou_thrs,
+                "min_area": int(args.min_area),
+                "val_max_images": int(args.val_max_images),
+                "timestamp": now_str(),
+            }
+            with open(best_thr_path, "w", encoding="utf-8") as f:
+                json.dump(thr_payload, f, indent=2, ensure_ascii=False)
+            log_line(log_fp, f"{now_str()} [SAVE] best_thresholds.json updated: {best_thr_path}")
+
+            last_ckpt = os.path.join(args.run_dir, "last.pt")
+            save_checkpoint(
+                last_ckpt, model, optimizer, epoch,
+                meta={"stage": stage, "train_loss": tr_loss, "val_loss": val_loss, "val_f2": val_f2, "best_thr": best_thr},
+                log_fp=log_fp
+            )
+            checkpoint_health_check(last_ckpt, model, log_fp)
+
+            improved = (val_loss < (best_val_loss - min_delta))
+            if improved:
+                best_val_loss = val_loss
+                best_epoch_loss = epoch
+                bad_epochs = 0
+
+                best_loss_ckpt = os.path.join(args.run_dir, "best_by_valloss.pt")
+                save_checkpoint(
+                    best_loss_ckpt, model, optimizer, epoch,
+                    meta={"stage": stage, "train_loss": tr_loss, "val_loss": val_loss, "val_f2": val_f2, "best_thr": best_thr},
+                    log_fp=log_fp
+                )
+                checkpoint_health_check(best_loss_ckpt, model, log_fp)
+                log_line(log_fp, f"{now_str()} [BEST] best_val_loss={best_val_loss:.6f} epoch={best_epoch_loss}")
+            else:
+                bad_epochs += 1
+                log_line(log_fp, f"{now_str()} [ES] no improvement bad_epochs={bad_epochs}/{patience} best_val_loss={best_val_loss:.6f} epoch={best_epoch_loss}")
+
+            if val_f2 > best_val_f2:
+                best_val_f2 = val_f2
+                best_epoch_f2 = epoch
+
+                best_f2_ckpt = os.path.join(args.run_dir, "best_by_valf2.pt")
+                save_checkpoint(
+                    best_f2_ckpt, model, optimizer, epoch,
+                    meta={"stage": stage, "train_loss": tr_loss, "val_loss": val_loss, "val_f2": val_f2, "best_thr": best_thr},
+                    log_fp=log_fp
+                )
+                checkpoint_health_check(best_f2_ckpt, model, log_fp)
+                log_line(log_fp, f"{now_str()} [BEST] best_val_f2={best_val_f2:.6f} epoch={best_epoch_f2}")
+
+            if bad_epochs >= patience:
+                log_line(log_fp, f"{now_str()} [STOP] Early-stopping: val_loss saturated. best_val_loss={best_val_loss:.6f} epoch={best_epoch_loss}")
+                break
+
+        log_line(log_fp, f"{now_str()} [DONE] best_by_valloss: epoch={best_epoch_loss} val_loss={best_val_loss:.6f}")
+        log_line(log_fp, f"{now_str()} [DONE] best_by_valf2  : epoch={best_epoch_f2} val_f2={best_val_f2:.6f}")
+        log_line(log_fp, f"{now_str()} [DONE] run_dir={args.run_dir}")
+
+
+if __name__ == "__main__":
+    main()
